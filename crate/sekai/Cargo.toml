@@ -1,0 +1,10 @@
+[package]
+name = "sekai"
+edition = "2024"
+description = "framework"
+
+[dependencies]
+
+[features]
+x86 = []
+esp32 = []

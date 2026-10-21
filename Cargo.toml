@@ -1,0 +1,8 @@
+[workspace]
+resolver = '3'
+members = [
+    "crate/sekai", "crate/sekai-build", "crate/sekai-start",
+]
+
+package.version = "0.1.0"
+package.edition = "2024"

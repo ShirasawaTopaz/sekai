@@ -1,0 +1,26 @@
+[package]
+name = "sekai-build"
+edition = "2024"
+description = "builder"
+# `cargo run -p sekai-build` 必须选中宿主驱动，而不是固件镜像。
+default-run = "sekai-build"
+
+[[bin]]
+name = "sekai-build"
+path = "src/main.rs"
+
+# 固件镜像。用 feature 做开关，这样宿主的构建
+# （`cargo build --workspace`）会完全跳过它；`src/main.rs` 中的驱动
+# 通过 `--no-default-features --features esp32` 选中它。
+[[bin]]
+name = "sekai-fw"
+path = "src/firmware.rs"
+required-features = ["esp32"]
+
+[dependencies]
+# `default-features = false` 让 `x86` 驱动不进入固件构建。
+sekai-start = { path = "../sekai-start", default-features = false, optional = true }
+
+[features]
+default = []
+esp32 = ["dep:sekai-start", "sekai-start/esp32"]

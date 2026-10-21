@@ -1,0 +1,28 @@
+[package]
+name = "sekai-start"
+edition = "2024"
+description = "starter"
+[dependencies]
+# esp 相关依赖
+esp-hal = { version = "1.2.2", features = ["esp32", "unstable"], optional = true }
+esp-rtos = { version = "0.4.0", features = ["esp-alloc", "esp-radio", "esp32"] , optional = true}
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"] , optional = true}
+bleps = { git = "ssh://git@github.com/bjoernQ/bleps", package = "bleps", features = [
+  "async",
+  "macros",
+] , optional = true}
+critical-section = { version = "1.2.0", optional = true}
+embedded-io = {version = "0.7.1", optional = true}
+esp-alloc = { version = "0.11.0", features = ["esp32"], optional = true}
+esp-radio = { version = "1.0.0-beta.1", features = [
+  "ble",
+  "esp-alloc",
+  "esp32",
+  "unstable",
+] , optional = true}
+
+[features]
+default = ["x86"]
+"x86" = []
+"esp32" = ["dep:esp-hal","dep:esp-rtos","dep:esp-radio","dep:esp-alloc","dep:esp-bootloader-esp-idf",
+"dep:bleps","dep:critical-section","dep:embedded-io"]
