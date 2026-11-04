@@ -30,12 +30,21 @@ You ─────────────▶ sekai-router ──────�
 - **Transport-agnostic**: the PC Worker uses a **direct link** (stdio subprocess
   or TCP, length-prefixed V1 frames, no broker); embedded Workers use MQTT
   topics (`{root}/dev/{id}/in|out|state`). Same frames, different carriers.
+- **Multiple Workers**: the TCP listener keeps accepting; several direct
+  Workers can be online at once and are routed by worker id (a new connection
+  with the same id replaces the old one).
+- **Cancellable / async**: serve `tool_call`/`task` accept `async:true` (returns
+  `cmd_id` immediately, then a completion notification) together with
+  `cancel {cmd_id}`; REPL `/cancel` and TUI `Ctrl-C` abort in-flight long tasks.
 - **Read-only by default**: `pc.exec`/`pc.write` and other writes, Task dispatch,
   and admin tools are gated behind explicit switches; policy is enforced *before*
   the Router publishes a Stdin frame.
 - **Prompt channel (out-of-band)**: the Worker's `pc.ask` task can hand a
   question to the LLM via the Router prompt ingress (direct, or relayed by the
   DSH plugin); JSONL out-of-band, V1 frames unchanged.
+- **Built-in HTTPS**: the Router talks to the DeepSeek API with `native-tls`
+  (Windows schannel / system OpenSSL) by default — no node or curl needed
+  (`SEKAI_HTTPS_MODE=helper` falls back to the old helper).
 - **`no_std` core**: `crate/sekai` depends only on `core` + `alloc`; the same
   protocol code compiles into host tests and ESP32 firmware alike.
 
@@ -129,12 +138,15 @@ cross-goal context is retained).
 | `SEKAI_LINK` | Link type `mqtt`/`stdio`/`tcp` | `mqtt` |
 | `SEKAI_LISTEN_ADDR` | TCP listen address | `127.0.0.1:7421` |
 | `SEKAI_PROMPT_ADDR` | Router prompt ingress address (`HOST:PORT`/`off`; interactive/serve default `127.0.0.1:7422`, batch default `off`) | see left |
+| `SEKAI_INGRESS_TOKEN` | prompt ingress auth token (required for remote peers, optional on loopback) | none |
+| `SEKAI_INGRESS_ALLOW_REMOTE` | Allow ingress to bind a non-loopback address (`1` to opt in) | off |
+| `SEKAI_HTTPS_MODE` | HTTPS backend: `native` (in-process TLS, default) / `helper` (node/curl fallback) | `native` |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` internal timeout (100..=300000) | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` internal hard timeout (1000..=300000) | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker address (mqtt link) | none |
 | `SEKAI_WORKER_BIN` | Worker binary for the stdio link | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT topic root | `sekai/v1` |
-| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent steps / DDL / command timeout / wait-for-worker | 12 / 1000ms / — / 5000ms |
+| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent steps / DDL / command timeout / wait-for-worker | 12 / 10000ms / — / 5000ms |
 | `SEKAI_ROUTER_TRACE` | Redacted JSONL trace path | off |
 
 Full list in `sekai-router --help`.

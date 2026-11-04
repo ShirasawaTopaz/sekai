@@ -408,7 +408,7 @@ Hello 由 Worker 在每次 CONNACK 后发布到 `state`（retained），也可�
 | 6 | `task_names` | 字符串 × `task_count` | 任务名列表，参考实现按原名排序 |
 | 7 | `tool_count` | `u16` | 可用工具数，≤16 |
 | 8 | `tool_names` | 字符串 × `tool_count` | 工具名列表，**包含内置工具**，参考实现排序去重 |
-| 9 | `devices` | DeviceList | 跳转目标列表，见 §5.6.1 |
+| 9 | `workers` | DeviceList | 跳转目标列表（代码字段名 `workers`），见 §5.6.1 |
 | 10 | `active_count` | `u16` | 运行中的 Task 数，≤4 |
 | 11 | `active_tasks` | ActiveTask × `active_count` | 见 §5.6.1 |
 
@@ -423,7 +423,7 @@ Hello 由 Worker 在每次 CONNACK 后发布到 `state`（retained），也可�
 
 #### 5.6.1 DeviceList 与 ActiveTask
 
-**DeviceList**（也可作为 `sekai.devices` 工具结果、`sekai.devices.set` 工具参数单独传输）：
+**DeviceList**（也可作为 `sekai.workers` 工具结果、`sekai.workers.set` 工具参数单独传输）：
 
 | 顺序 | 字段 | 类型 | 说明 |
 | --- | --- | --- | --- |
@@ -605,14 +605,14 @@ Router                                      Worker
 | `sekai.time` | 忽略 | 16 字节：`u64` 当前 Unix 毫秒（未校准为 0）+ `u64` 当前单调毫秒 | — |
 | `sekai.set_time` | 8 字节 `u64` 大端 Unix 毫秒，范围 `[1_600_000_000_000, 4_000_000_000_000]` | 8 字节 `u64` 大端：校准前的 Worker Unix 毫秒（未知为 0） | 长度不是 8 → `InvalidArgument`；时间超范围 → `InvalidArgument` |
 | `sekai.info` | 忽略 | Hello 载荷（同 §5.6） | 内部编码失败 → `Internal` |
-| `sekai.devices` | 忽略 | DeviceList 载荷（同 §5.6.1） | 内部编码失败 → `Internal` |
-| `sekai.devices.set` | DeviceList 载荷 | 空 | 参数解码失败 → `InvalidArgument`；设置成功后额外发布 retained Hello |
+| `sekai.workers` | 忽略 | DeviceList 载荷（同 §5.6.1） | 内部编码失败 → `Internal` |
+| `sekai.workers.set` | DeviceList 载荷 | 空 | 参数解码失败 → `InvalidArgument`；设置成功后额外发布 retained Hello |
 | `sekai.cancel` | 8 字节 `u64` 大端命令 id | 空 | 长度不是 8 或目标命令不存在 → `InvalidArgument` |
 
 补充：
 
 - `sekai.set_time` 是**Worker 唯一的对时入口**：Worker 时钟只在该工具被调用时校准。Router 应使用可信时间源调用它，并注意校准会让 Worker 时间向前或向后跳变。
-- `sekai.devices.set` 会替换整个 DeviceList，成功后 Worker 立即用新列表构造 Hello 并发布到 `state`（因此 Router 会先看到一帧 Hello，再看到该工具的 `Completed`）。
+- `sekai.workers.set` 会替换整个 DeviceList，成功后 Worker 立即用新列表构造 Hello 并发布到 `state`（因此 Router 会先看到一帧 Hello，再看到该工具的 `Completed`）。
 - 参考实现中用户工具数量受总上限约束：6 个内置工具 + 用户工具 ≤ 16，即用户最多注册 10 个工具。
 - 内置工具名不能被用户工具覆盖；用户注册 `sekai.` 前缀会失败。
 
@@ -692,7 +692,7 @@ Router/broker 侧注意：
 
 #### 7.3.5 Jump 期间的约定
 
-- **Worker 忽略 `in` 主题上的新命令**（不回复 `Failed`，只计入内部拒绝计数）。Router 在发送 Jump 后、收到新链路 Hello 前不要下发命令。
+- **Worker 立即拒绝 `in` 主题上的新命令**：回复 `Failed(0x0005 Busy)`（不排队、不静默丢弃），并计入内部拒绝计数。Router 在发送 Jump 后、收到新链路 Hello 前不要下发命令；收到 `Busy` 时应等待迁移结束后重试。
 - 已经进入等待队列/运行中的 Task 与已排期的命令**不会被 Jump 自动取消**；它们可能在切换期间继续执行，事件排入发件箱，最终可能在新链路上送达。若业务要求“迁移前清空”，Router 应先用 `sekai.cancel` 取消相关命令并等待最终事件。
 - Jump 期间不迁移业务状态；V1 不支持把 Task 移交到另一个 Worker（任务 handoff）。
 - Jump 的 `ddl_ms` 不参与超时控制，但仍必须满足协议上限。
@@ -822,7 +822,7 @@ Jump 另需覆盖：发件箱排空 `jump_drain_ms`（默认 1500 ms）+ 旧链�
 
 - Router 凭据泄露等价于 Worker 被完全控制，必须按 Worker/租户隔离凭据与 ACL。
 - Worker 侧只能校验协议字段，无法验证命令来源；不要向不可信 broker 暴露 Worker。
-- `sekai.devices.set`、`sekai.set_time`、`sekai.cancel` 是特权能力：`devices.set` 会改变后续 Jump 可达范围，`set_time` 影响 Worker 时间与时效判断，`cancel` 可终止业务任务。ACL 上应与其他命令同等保护。
+- `sekai.workers.set`、`sekai.set_time`、`sekai.cancel` 是特权能力：`workers.set` 会改变后续 Jump 可达范围，`set_time` 影响 Worker 时间与时效判断，`cancel` 可终止业务任务。ACL 上应与其他命令同等保护。
 
 ### 9.2 传输安全
 

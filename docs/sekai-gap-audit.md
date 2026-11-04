@@ -61,14 +61,55 @@
 
 ---
 
+## 0.4 本轮闭环结果（2026-11-04，分支 `feat/gap-closure`）
+
+> 门禁：`scripts/gate.sh` 全绿（fmt / check --all-targets / clippy / test --workspace / 插件 smoke 24 项）。
+> 下表每项都有随代码提交的测试；`P13` 与 D1/D2 仍为置后项（无实机）。
+
+| ID | 状态 | 实现要点 | 证据（测试名/命令） |
+| --- | --- | --- | --- |
+| B1 | 已修复 | 直连常驻 accept 多端点、按 Hello `worker_id` 路由、同 id 顶替、聚合 `list_workers` | `tests/direct_gateway.rs::tcp_listen_serves_two_workers_and_routes_by_id` 等 4 例 |
+| B2 | 已修复 | `CommandReceipt.cmd_id`、`submit_control`/`cancel`、serve `cancel`/`commands`/`async:true`、REPL `/cancel`、TUI Ctrl-C、agent `CancelToken` | `tests/serve.rs::async_tool_call_replies_accepted_then_notifies`、`cancel_routes_to_gateway_and_marks_known`；`tests/agent_loop.rs::cancel_during_tool_wait_dispatches_sekai_cancel` |
+| B3 | 已修复 | serve dispatcher 只分发、长方法工作线程 + 按 id 写队列；REPL/TUI 后台执行 + 事件通道；ingress 并发 4 | `tests/session.rs::background_goal_runs_through_event_channel`、`tests/serve.rs::status_exposes_diagnostics_fields` |
+| B4.1 | 已修复 | `DEFAULT_DDL_MS` 10000、`TOOL_TIMEOUT_EXTRA_MS` 5000、提示要求长任务显式 ddl | `tests/agent_loop.rs` 断言更新；`config.rs` 单测 |
+| B4.2–4.7 | 已修复 | `pc.exec` 任务化、杀进程树、stdin null、输出泵、ls/read 预算、UTF-8 lossy | `capability.rs` 单测（exec Task/DDL/进程树/stdin/pump/ls/read/lossy）、`host_flow.rs` 3 段帧 |
+| B5 | 已修复 | `max_inflight_per_worker=4`、prompt 内层可复用工具、文案说明 | `tests/serve.rs` D5 用例、`tests/control_plane.rs::submit_control_bypasses_inflight_limit` |
+| B6 | 已修复 | Hello 时钟偏差 >2s 或 0 自动 `sekai.set_time`（按 boot 去重）；serve `admin`（set_time/cancel/workers.set，allow_admin）；`clock_synced` | `tests/control_plane.rs::hello_clock_skew_triggers_automatic_set_time_once`、`tests/serve.rs::admin_methods_encode_payloads` |
+| B7 | 已修复 | `CommandKind::Jump` + `CommandRequest::jump` + serve `jump`；Worker `FallingBack` 5s 超时/幂等失败帧；跳转期 `Failed(Busy)` | `tests/control_plane.rs::jump_request_encodes_jump_body`、`tests/serve.rs::jump_requires_admin_and_dispatches_jump_kind`、`sekai/tests/sekai_runtime.rs::jump_fallback_*` |
+| B8 | 已修复 | status `link_info/inflight/counters/clock_synced/late_results`；失败结果补 cmd_id/elapsed/phases；serve 下 trace 生效；晚到终态入环形 | `tests/control_plane.rs::late_final_event_after_timeout_is_recorded_as_late_result`、`unknown_cmd_id_final_frames_are_recorded_as_late` |
+| B9 | 已修复 | 默认回环、远程需 `SEKAI_INGRESS_ALLOW_REMOTE` + token（hello 握手）、连接/速率上限、审计日志 | `tests/prompt_ingress.rs::ingress_requires_token_handshake`、`ingress_rejects_remote_bind_without_explicit_allow`、`ingress_rejects_connections_over_cap`、`ingress_stats_track_rejections` |
+| B10 | 已修复 | 默认 `native-tls` 进程内 HTTPS（`tls` feature），helper 可用 `SEKAI_HTTPS_MODE=helper` 回退 | `tests/llm_http.rs::https_backend_defaults_to_native_tls`、`https_uses_native_tls_and_reports_connect_error` |
+| B11 | 已修复 | 插件读 `addr`；serve 断链补发 `link_state` + 插件幂等兜底；任务描述提示 `ddl_ms>=60000` | `tests/serve.rs` link_state 用例、插件 smoke `router 插件：link 读 addr；…link_state…` |
+| K1 | 已修复 | 协议文档统一为 `sekai.workers` / `sekai.workers.set`、Hello 字段 `workers` | `docs/sekai-protocol.md` §5.6/§7.2.1/§10 |
+| K2 | 已修复 | 配置 `authentication_method` 时应答 AUTH（ContinueAuthentication） | `sekai/tests/sekai_runtime.rs::auth_challenge_is_answered_with_configured_data` |
+| K3 | 已修复 | `FallingBack` deadline（5s）+ 幂等 `JumpUnreachable`；跳转期 `Failed(Busy)` | `commands_during_jump_fail_busy_instead_of_silent_drop`、`jump_fallback_timeout_emits_failed_and_recovers` |
+| K4 | 已修复 | 默认 `clean_start=true` + `session_expiry=0`；拒绝可重放组合 | `clean_start_and_session_expiry_defaults_are_safe`、`every_connect_uses_clean_start` |
+| K5 | 已修复 | SUBACK 错误码入 status + 指数退避重订阅 | `suback_error_is_visible_and_retried_with_backoff` |
+| K6 | 已修复 | 每次 link_up 前重建 LWT（时间戳取本次 CONNECT） | `will_payload_timestamp_is_rebuilt_per_connect` |
+| K7 | 已修复 | Outbox 最终/非最终独立预算、不淘汰 in-flight、`dropped_events` 计数 | `outbox_keeps_final_events_under_non_final_pressure` 等 3 个单测 + `outbox_final_budget_pressure_counts_dropped_events` |
+| K8 | 已修复 | `Stdout::lwt_offline`、set_time 1s 限频、时间基准/`unsubscribe` 文档澄清 | `lwt_offline_roundtrip_and_decode`、`set_time_is_rate_limited` |
+| P1–P7 | 已修复 | 见 B4.2–4.7 | 同上 |
+| P8 | 已修复 | Router 通道按 id 过滤 + 有界缓冲 + 连接超时；`ask_cancellable` 到期退出 | `llm_channel` 单测、`capability.rs::pc_ask_*` |
+| P9 | 已修复 | PUBACK 写成功后才补；写失败保留重放 | `tests/direct_link.rs::write_failure_keeps_outgoing_event_for_replay` |
+| P10 | 已修复 | PINGREQ/PINGRESP 真实跨链路 + 双侧 1.5×keepalive 读空闲判定 | `silent_peer_triggers_read_idle_link_lost`、`healthy_idle_link_survives_keepalive_rounds`、`worker_pingreq_crosses_link_and_router_answers` |
+| P11 | 已修复 | `on_link_up` 后清 `disconnect_requested` | `host.rs` 单测（P11 路径）；已有断链/重连用例覆盖 |
+| P12 | 已修复 | `--gpio-inputs` + `VirtualGpio::with_inputs`；`gpio.read` 返回注入值 | `gpio` 单测 3 例 + `tests/tools.rs::injected_inputs_are_readable_through_tools`、bin 单测 2 例 |
+| P13 | 置后 | 无 ESP32/STM32 实机 E2E（D1/D2） | — |
+| P14 | 已修复 | `sekai-worker/README.md` 的 `host_registries` 描述已与代码一致 | 文档审阅 |
+
+**仍置后/未做**：P13（实机）、D1/D2、B11 的 Web UI 与 npm 发布、C2（tag/release/CHANGELOG 实际发布流程）、
+C4（阶段目标文档改写）。C1（CI 扩展：fmt 门禁、Windows job、real_api 可选 job）与 C3（MSRV/README）已完成。
+
+---
+
 ## 1. 闭环判定标准
 
 | 旅程 | "闭环"的最低要求 | 当前 |
 | --- | --- | --- |
 | J1 单 Worker PC 目标 | 自然语言 → 派工 → 结果可验证 → 错误可解释 | ✅ 基本闭环 |
-| J2 多 Worker 协同 | 同时连接 ≥2 个 Worker，可按 id 定向/汇总 | ❌ 主路径不可用（B1） |
-| J3 长任务 | 可观测进度、可取消、超时语义一致、进程不残留 | ❌（B2/B3/B4） |
-| J4 DSH 集成 | 工具可调用、状态真实、长任务不阻塞、可中止 | ⚠️ 可用但有 6 处缺口（B11） |
+| J2 多 Worker 协同 | 同时连接 ≥2 个 Worker，可按 id 定向/汇总 | ✅ 已闭环（B1，见 §0.4） |
+| J3 长任务 | 可观测进度、可取消、超时语义一致、进程不残留 | ✅ 已闭环（B2/B3/B4，见 §0.4） |
+| J4 DSH 集成 | 工具可调用、状态真实、长任务不阻塞、可中止 | ✅ 可用（B11 已修；Web UI/npm 发布仍置后） |
 | J5 嵌入式 MQTT | 固件 + 真 broker + 真 GPIO 端到端、时钟校准、Jump | ⚠️ 仅构建过固件（D1） |
 | J6 STM32 板级 | 板级工程 + 电气验证 | ❌ 仅交叉编译检查（D2） |
 
@@ -536,3 +577,15 @@ grep -rnE "handle_ingress_line|validate_prompt_addr|TcpListener::bind" crate/sek
 - 2026-11-04：首次审计（`main` @ `32027b4`）。覆盖主路径、核心协议、PC Worker/GPIO、
   工程闭环与置后项；同时修复 D1–D9、D11–D14、D16–D18 等文档漂移（见 §8 状态列），
   仅剩 D10（协议文档内置工具命名，需单独评审）与 D15（直连重放语义，需先定行为）。
+- 2026-11-04（实现轮，`feat/gap-closure`）：B1–B11、K1–K8、P1–P12/P14 全部落地并有测试
+  （见 §0.4）；D10 随 K1 一并修复（协议文档统一为 `sekai.workers*`），D15 随 P9 修复
+  （PUBACK 写成功后才补，失败保留重放）。同时完成：
+  - serve 协议 v1.2（`async:true` / `cancel` / `commands` / `admin` / `jump` / status 诊断字段，
+    纯 additive）；
+  - ingress 访问控制（回环默认、远程 token + hello 握手、连接/速率上限、审计日志）；
+  - Router 进程内 HTTPS（`native-tls`，`SEKAI_HTTPS_MODE=helper` 可回退）；
+  - CI 增加 fmt 门禁、Windows job、可选 real_api job；新增 `scripts/gate.sh` 统一门禁。
+  - 明确仍置后：P13 实机 E2E（D1/D2）、B11 的 Web UI/npm 发布、C2/C4。
+  - 已知取舍：`pc.exec` 线类型 Tool→Task（策略仍按名字归写操作）；Jump 活跃期命令由
+    “静默忽略”改为 `Failed(Busy)`（协议文档 §7.3.5 已同步）；直连链路 PINGREQ/PINGRESP
+    真实跨链路（Router 与 PC Worker 需同版本）；`clean_start=true` 为默认。

@@ -65,25 +65,40 @@ profile 的 `cordis.patch.yml`（用户层）：
                          # 旧键 family 兼容映射到本键）
 ```
 
-## 2. serve 模式与 JSONL 协议 v1（冻结；v1.1 追加 `prompt`）
+## 2. serve 模式与 JSONL 协议 v1（冻结；v1.1 `prompt`、v1.2 异步/取消/管理）
 
 `sekai-router --serve`：stdin 逐行读请求，stdout 只写 JSONL（人类日志全走 stderr），
 链路操作不需要 `DEEPSEEK_API_KEY`，与 `--goal/--tui/-i/--dry-run` 互斥。线程模型：主线程读行
-→ dispatcher 线程独占网关（串行）；poll 线程 200ms diff Worker 快照发通知。
+→ dispatcher 线程独占网关（只解析与分发，**不阻塞在长命令/LLM 调用上**；长方法拆到工作
+线程，结果经写队列按 id 回写，JSONL 行完整、允许乱序）；poll 线程 200ms diff Worker 快照
+发通知，并在链路 ready 由 true→false / false→true 时补发 `link_state`。
 
 - 请求：`{"id":N,"method":"...","params":{...}}`；响应：`{"id":N,"ok":true,"result":{...}}`
   或 `{"id":N,"ok":false,"error":{"code","message"}}`。
 - 通知（无 id）：`ready` / `link_state{desc,ready}` / `worker_online{worker_id,worker}` /
   `worker_offline{worker_id}`；畸形行以 `invalid_json` 通知回错（取不到 id）。
-- 方法：`link`（tcp/stdio/mqtt，tcp 的 result 含实际监听 `addr`）、`link_off`、`workers`、
-  `tool_call`、`task`、`policy.get`、`policy.set`、`status`、`shutdown`（EOF 同效，exit 0）；
+- 方法：`link`（tcp/stdio/mqtt，tcp 的 result 含实际监听 `addr`、mqtt 含 `mqtt_addr`）、
+  `link_off`、`workers`、`tool_call`、`task`、`policy.get`、`policy.set`、`status`、
+  `shutdown`（EOF 同效，exit 0）；
   **v1.1 追加（additive）**：`prompt{text,max_steps?}`——与 TCP prompt ingress 共用同一
   核心，把 prompt 交给 Router 内置 LLM 回路生成回答（需 API key；响应
   `result:{answer,status,steps,usage}`；错误码与防递归见
   [sekai-pc-agent.md](sekai-pc-agent.md) §4–§5）。
+  **v1.2 追加（additive）**：
+  - `tool_call` / `task` 支持 `async:true`：立即回
+    `result:{accepted:true,cmd_id,worker_id,kind,name,async:true}`，完成后发无 id 通知
+    `{"method":"command_result","params":{...同一 command_result_json...}}`；
+  - `cancel {cmd_id}` → 转发 `sekai.cancel`，回 `{cmd_id,cancelled,known}`；
+  - `commands` → `{count,commands[]}`（在途账本）；
+  - `jump {worker_id,target}`（需 allow_admin）；
+  - `admin {op:set_time|cancel|workers.set,...}`（需 allow_admin；set_time 为 8 字节大端）；
+  - `status` 追加 `link_info{state,workers,last_error}`、`inflight[]`、
+    `counters{late_results,dropped_events}`、`clock_synced`、`late_results[]`。
 - Router 另以 `--prompt-addr <HOST:PORT|off>`（env `SEKAI_PROMPT_ADDR`；serve/交互默认
   `127.0.0.1:7422`，批处理默认 `off`）开 **TCP prompt ingress**，协议与 serve
-  `prompt` 一致（另有 `ping` 探活）。
+  `prompt` 一致（另有 `ping` 探活）；默认仅回环，远程需
+  `SEKAI_INGRESS_ALLOW_REMOTE=1` + `SEKAI_INGRESS_TOKEN`（见
+  [sekai-pc-agent.md](sekai-pc-agent.md) §4.1）。
 - 命令结果形状 = `tools.rs::command_result_json`（`ok/worker_id/kind/name/cmd_id/elapsed_ms/
   payload/encoding/truncated?/phases` 或 `error{code,worker_code,...,retryable}`）；
   **策略拒绝与网关失败是信封 `ok:true` + `result.ok:false`**（与 LLM function result 同形），

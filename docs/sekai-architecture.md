@@ -26,13 +26,18 @@
 | --- | --- | --- | --- |
 | Router ↔ PC Worker | **直连**：stdio 子进程 或 TCP | 长度前缀（u32 大端）+ V1 Stdin/Stdout 帧，**不经 MQTT broker**，无主题路由 | 第一阶段 |
 | Router ↔ 嵌入式 Worker | MQTT 主题（`{root}/dev/{id}/in|out|state`，QoS1，state retained + LWT） | MQTT PUBLISH 载荷 = 一帧 V1 Stdin/Stdout | 置后阶段 |
-| Router ↔ LLM API | HTTPS | JSON | Router 内部 |
+| Router ↔ LLM API | HTTPS（默认进程内 TLS；`SEKAI_HTTPS_MODE=helper` 可回退 node/curl） | JSON | Router 内部 |
 | prompt ingress | TCP（`--prompt-addr`，默认 `127.0.0.1:7422`；批处理默认 `off`） | **JSONL（带外）**：`{"id":N,"method":"prompt",...}` 请求 / `ok+result` 或 `ok+error` 响应 | Worker `pc.ask`、DSH 插件中转、任意客户端 |
 
 **为什么 PC Worker 不用 MQTT**（用户决策）：点对点链路不需要主题路由、遗嘱、跨 broker 跳转这些 MQTT 语义；直连把链路降到「有界二进制帧 + 完整投递」的最小契约，进程内内存链路即可测试，部署少一个 broker 依赖。V1 帧格式两条链路完全一致（协议 §1.2 本就声明 MQTT 只是载体）：
 
 - MQTT 语义（retain、LWT、Jump、按主题订阅）**仅对嵌入式链路有意义**；直连链路上 Hello/Offline 就是普通帧，掉线由 TCP/管道关闭语义 + boot_id 变化表达。
 - 去重语义两条链路一致：Router 按 `(worker_id, boot_id, seq)` 去重 Stdout。
+- **直连链路保持活性**：PINGREQ/PINGRESP 真实跨链路（Router 与 PC Worker 双向），两端以
+  1.5×keepalive（默认 45s）读空闲判死；对端静默死亡会走既有退避重连。因此 Router 与
+  PC Worker 需**同版本配套**（旧 Worker 会吞掉对端 PINGREQ）。
+- **多 Worker**：TCP 监听常驻 accept，每条连接一个独立 ControlPlane，按 Hello 的
+  `worker_id` 路由；同一 id 的新连接顶替旧连接。
 
 ### 2.1 直连链路的命令行用法
 
@@ -133,6 +138,8 @@ PC Worker 以 **PC agent** 形态提供本机能力：工具 `pc.exec`/`pc.read`
   （见 [sekai-protocol.md](sekai-protocol.md) §0.1）。
 - **策略**：`pc.read`/`pc.ls`/`pc.info` 只读白名单默认放行；`pc.write`/`pc.exec`
   需 allow-write；Task 通道（`pc.job`/`pc.ask`/`echo`/`sleep`）需 allow-tasks；
-  ingress 只做**策略授权**（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter`），
-  **不做调用方认证**；默认仅监听回环地址，暴露到非回环前必须自行加防护（见
-  [缺口审计](sekai-gap-audit.md) B9）。分类细节见 [sekai-pc-agent.md](sekai-pc-agent.md) §5。
+  ingress 做**策略授权**（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter`）。
+- **访问控制**：ingress 默认只监听回环；绑定非回环必须显式
+  `SEKAI_INGRESS_ALLOW_REMOTE=1` 且配置 `SEKAI_INGRESS_TOKEN`（连接首行 `hello` 握手），
+  另有连接数（默认 4）与每连接 60 req/min 限制，请求记录 peer/method/outcome 审计行。
+  分类细节见 [sekai-pc-agent.md](sekai-pc-agent.md) §5、§4.1。

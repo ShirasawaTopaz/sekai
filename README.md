@@ -28,10 +28,17 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 - **承载无关**：PC Worker 走**直连链路**（stdio 子进程 / TCP，长度前缀 + V1 帧，
   不经 broker）；嵌入式 Worker 走 MQTT 主题（`{root}/dev/{id}/in|out|state`）。
   同一套帧，换载体不换协议。
+- **多 Worker**：TCP 监听常驻 accept，可按 Worker id 同时路由多个直连 Worker；
+  同名新连接顶替旧连接。
+- **可取消、可异步**：serve 的 `tool_call`/`task` 支持 `async:true`（立即返回
+  `cmd_id`，完成后发通知），配合 `cancel {cmd_id}`；REPL `/cancel`、TUI `Ctrl-C`
+  可中止在途长任务。
 - **默认只读**：`pc.exec`/`pc.write` 等写操作、Task 下发、管理工具分别由开关解锁；
   策略在 Router 侧发布 Stdin **之前**强制执行。
 - **prompt 通道（带外）**：Worker 的 `pc.ask` 任务可把问题经 Router prompt ingress
   （直连或经 DSH 插件中转）交给 LLM 取回回答；JSONL 带外传输，不改变 V1 帧。
+- **内置 HTTPS**：Router 默认用 `native-tls`（Windows schannel / 系统 OpenSSL）
+  直连 DeepSeek API，不再需要 node 或 curl（`SEKAI_HTTPS_MODE=helper` 可回退）。
 - **`no_std` 核心**：`crate/sekai` 只依赖 `core` + `alloc`，同一份协议代码同时
   编译进宿主测试与 ESP32 固件。
 
@@ -120,12 +127,15 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | `SEKAI_LINK` | 链路类型 `mqtt`/`stdio`/`tcp` | `mqtt` |
 | `SEKAI_LISTEN_ADDR` | tcp 链路监听地址 | `127.0.0.1:7421` |
 | `SEKAI_PROMPT_ADDR` | Router prompt ingress 地址（`HOST:PORT`/`off`；交互/serve 默认 `127.0.0.1:7422`，批处理默认 `off`） | 见左 |
+| `SEKAI_INGRESS_TOKEN` | prompt ingress 认证 token（远程连接必需；回环可省略） | 无 |
+| `SEKAI_INGRESS_ALLOW_REMOTE` | 允许 ingress 绑定非回环地址（`1` 显式开启） | 关闭 |
+| `SEKAI_HTTPS_MODE` | HTTPS 后端：`native`（默认，进程内 TLS）/ `helper`（node/curl 回退） | `native` |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` 内部超时（100..=300000） | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` 内部硬超时（1000..=300000） | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker 地址（mqtt 链路） | 无 |
 | `SEKAI_WORKER_BIN` | stdio 链路拉起的 Worker 程序 | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT 主题根 | `sekai/v1` |
-| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent 步数 / 执行预算 / 命令超时 / 等待上线 | 12 / 1000ms / — / 5000ms |
+| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent 步数 / 执行预算 / 命令超时 / 等待上线 | 12 / 10000ms / — / 5000ms |
 | `SEKAI_ROUTER_TRACE` | 脱敏 JSONL trace 路径 | 关闭 |
 
 完整清单见 `sekai-router --help`。
@@ -141,6 +151,10 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
   权限面最大，仅在受控环境放开。
 - **prompt 防递归**：经 prompt ingress / serve `prompt` 到达的 LLM 运行内再派
   `pc.ask` 一律拒绝（`policy_denied`「嵌套 prompt（pc.ask）」），与开关状态无关。
+- **ingress 访问控制**：prompt ingress 默认只监听回环；绑定非回环地址必须显式
+  `SEKAI_INGRESS_ALLOW_REMOTE=1`，且必须配置 `SEKAI_INGRESS_TOKEN`（连接第一行
+  需 `hello` 握手）。另有限制：并发连接默认 4、每连接 60 请求/分钟，每个请求都会
+  记录 peer/method/outcome 审计行。
 - **`--worker <ID>`**（或 `policy.worker_filter`）：把可操作范围锁定到单个 Worker。
 - 凭据只从环境变量或显式 CLI 参数读取，Debug 输出脱敏，不落盘。
 
@@ -154,7 +168,8 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent：`pc.*` 工具/任务全表、prompt JSONL 协议、三方配置与安全 | PC Worker 使用者、插件/客户端实现者 |
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO 抽象、引脚表、`gpio.*` 工具语法与 AI 调用流程（`--gpio` opt-in 后的嵌入式演示） | 板级开发者、GPIO 集成者 |
 | [docs/sekai-esp32.md](docs/sekai-esp32.md) | ESP32 固件：工具链、构建烧录、WiFi/MQTT 链路、排障 | 固件开发者 |
-| [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH 插件形态与 serve 协议概览 | DSH 使用者、插件实现者 |
+| [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH 插件形态与 serve 协议概览（v1.1 `prompt`、v1.2 异步/取消/管理） | DSH 使用者、插件实现者 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（0.2.0：B/K/P 缺口闭环、serve v1.2、ingress 安全、进程内 HTTPS） | 所有使用者 |
 | [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md) | DSH 插件配置全量说明（安装、config 键、JSONL 协议） | 插件使用者 |
 | [docs/sekai-ai.md](docs/sekai-ai.md) | 历史文档：AI 控制端设计记录（角色现由 Router 承担） | 了解演进史 |
 | [docs/sekai-ai-plan.md](docs/sekai-ai-plan.md) / [docs/sekai-gpio-plan.md](docs/sekai-gpio-plan.md) | 历史计划文档 | 按需查阅 |
@@ -172,11 +187,11 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | P0–P1.7 | 术语重构、直连链路（stdio/TCP）、REPL/TUI、连接向导 | 完成 |
-| P2 | LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | **单 Worker 闭环完成；剩余项见[缺口审计](docs/sekai-gap-audit.md)** |
+| P2 | LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | **B1–B11/K/P 已闭环（2026-11-04，见[缺口审计](docs/sekai-gap-audit.md) §0.4）；P13 实机验证置后** |
 | P3 | 嵌入式 Worker：esp32 固件构建、MQTT 链路回归 | 置后 |
 
-P2 的退出条件与待办清单以 [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) §1/§9 为准；
-在审计的 B1–B11 关闭前，不再宣称 P2 已完成。
+P2 的验收结果与仍置后项见 [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) §0.4；
+变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 开发
 
