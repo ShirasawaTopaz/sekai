@@ -901,8 +901,8 @@ bash .build/check-lib.sh
 
 | 现象 | 处理 |
 | --- | --- |
-| `cargo build/test` 报无法启动 rustc / os error 5 | 本机沙箱限制，改用 §7.2 的 `check-lib.sh`/`build.py`。 |
-| rustc 报 `could not exec the linker link.exe`（拒绝访问） | 用 `build.py` 重新链接；不要直接调用 rustc 的输出链接。 |
+| `cargo build/test` 报无法启动 rustc / os error 5 | 本机沙箱限制；`.build/` 下的 `check-lib.sh`/`build.py` 已随仓库清理移除（见 §7.2 注记），正常环境直接用 `cargo test/fmt/clippy`。 |
+| rustc 报 `could not exec the linker link.exe`（拒绝访问） | 受限环境的老问题；正常环境重跑 `cargo build`，不要手工调用 rustc 的输出链接。 |
 | `E0463: can't find crate for ...` | 给命令加 `-L dependency=.build/lib`（或对应目录）。 |
 | 测试二进制运行时 EPERM | 不要用 `Command` + 管道 stdio；重定向到文件。 |
 | `todo!()` panic | 表示对应模块尚未实现（构建可过）；先完成实现。 |

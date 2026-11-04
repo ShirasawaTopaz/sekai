@@ -1103,6 +1103,12 @@ loop {
 
 ### 12.3 宿主示例的部署参数
 
+> **历史注记**：本节记录的是 2025 重构前的 `sekai-host` 示例（已并入
+> `crate/sekai-worker`）。现行 Worker 的命令行、`--gpio` 与 `pc.*` 能力见
+> [`crate/sekai-worker/README.md`](../crate/sekai-worker/README.md) 与
+> [`docs/sekai-pc-agent.md`](sekai-pc-agent.md) §6；下面的环境变量名与工具数量
+> （"6 内置 + echo + 4 gpio = 11"）不再对应当前实现。
+
 `sekai-host`（x86 构建产物）使用环境变量：
 
 | 环境变量 | 必填 | 说明 |
@@ -1133,7 +1139,7 @@ loop {
 
 - 参数与结果都是 UTF-8 文本，对协议层不透明：参数上限 **256 字节**，结果上限 **1024 字节**（超过返回 `ResultTooLarge`）。
 - 错误码：所有参数/引脚/能力/模式错误都是 `InvalidArgument`；只有共享句柄借用失败或后端异常是 `Internal`。
-  协议保留的 `Unsupported`（0x000A）不被 GPIO 工具使用。
+  协议保留的 `Unsupported`（0x000E）不被 GPIO 工具使用；0x000A 是 `Cancelled`。
 - `gpio.info help` 是唯一非 `key=value` 的结果，内容逐字固定；AI 应先调用它获取语法，再调用
   `gpio.info` 摘要与 `gpio.info PIN` 确认引脚能力。
 - 工具通过 Hello 的 `tools` 正常通告；工具总数（含 6 个内置工具）不得超过 16。参考实现：

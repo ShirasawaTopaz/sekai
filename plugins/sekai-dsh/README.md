@@ -101,8 +101,8 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 
 ## 工具
 
-模型侧描述为英文；5 个工具都经插件串行转发（serve 端 dispatcher 本身串行执行，
-长命令会阻塞后续调用）。
+模型侧描述为英文；经 router 的 4 个工具串行转发（serve 端 dispatcher 本身串行执行，
+长命令会阻塞后续调用）；`sekai_worker_status` 是 worker 插件本地状态，不走 serve。
 
 | 工具 | 参数 | 返回 |
 | --- | --- | --- |
@@ -114,6 +114,8 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 
 约定（镜像 router `tools.rs` 的语义）：**先调 `sekai_list_workers`，worker id、工具名、任务名
 必须来自其结果**。`args` 是原始 UTF-8 文本（如 `gpio.info help`）；`ddl_ms` ∈ [1, 300000]。
+长任务（`pc.job`、`pc.ask`）请显式传 `ddl_ms`（建议 ≥60000）：不传时 Router 默认预算
+只有 1s（见[缺口审计](../../docs/sekai-gap-audit.md) B4）。
 
 错误一律以 `{error:{code, message, hint?}}` 信封返回、不向 DSH 抛异常：
 

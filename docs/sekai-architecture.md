@@ -36,7 +36,7 @@
 
 ### 2.1 直连链路的命令行用法
 
-Router 与 Worker 两侧都已提供面向使用者的入口（2025-11 起）：
+Router 与 Worker 两侧都已提供面向使用者的入口（2026-11 起）：
 
 ```text
 # 形态一：Router 监听，Worker 主动连入（两终端）
@@ -50,7 +50,7 @@ $ sekai-worker connect 127.0.0.1:7421
 sekai-worker: TCP 已连接 127.0.0.1:7421
 sekai-worker: Hello 已发布，链路已就绪
 sekai-router: Worker 已上线：pc-worker（tools=… tasks=…）           ← poll 异步通知
-sekai> 列一下当前目录有哪些文件      # 自然语言目标（pc.ls，只读默认放行），多轮可续
+sekai> 列一下当前目录有哪些文件      # 自然语言目标（pc.ls，只读默认放行）；同一会话可继续下发目标
 
 # 形态二：Router 拉起 Worker 子进程（/start 选 1，或直接 /link stdio）
 sekai> /link stdio              # 默认拉起 sekai-worker，stdin/stdout 即链路
@@ -84,8 +84,11 @@ Worker 侧 `connect` 的连接失败有可操作提示（如「连接被拒绝�
 | P1 | PC Worker 直连链路（stdio/TCP + 长度前缀帧）；Router 侧直连接入端点；router 测试全绿 | 完成 |
 | P1.5 | 直连网关接入 Router CLI：`DirectGateway`（stdio/tcp）实现 WorkerGateway；`--link` 旗标；交互 REPL（/link 建链路 + 多轮 Agent 对话）；`sekai-worker connect <ADDR>` 子命令 | 完成 |
 | P1.7 | 连接体验：`/start` 引导式建连向导 + 真实地址提示；`Session::poll` Worker 上线异步通知；`sekai-worker connect` 阶段化进度与可操作错误提示；ratatui 全屏 TUI（`--tui`，非 TTY 回退 REPL） | 完成 |
-| P2 | Router 的 LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | 进行中 |
+| P2 | Router 的 LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | **单 Worker 闭环完成；剩余项见[缺口审计](sekai-gap-audit.md)** |
 | P3 | 嵌入式 Worker：xtensa 工具链恢复、esp32 固件构建、MQTT 链路回归 | 置后 |
+
+P2 的退出条件与未闭环清单以 [sekai-gap-audit.md](sekai-gap-audit.md) 为准（§1 闭环判定、
+§9 工作包）。在审计的 B1–B11 关闭前，P2 不算完成。
 
 ## 4. 与 DSH superagent 架构的对照
 
@@ -130,4 +133,6 @@ PC Worker 以 **PC agent** 形态提供本机能力：工具 `pc.exec`/`pc.read`
   （见 [sekai-protocol.md](sekai-protocol.md) §0.1）。
 - **策略**：`pc.read`/`pc.ls`/`pc.info` 只读白名单默认放行；`pc.write`/`pc.exec`
   需 allow-write；Task 通道（`pc.job`/`pc.ask`/`echo`/`sleep`）需 allow-tasks；
-  ingress 鉴权沿用当前会话策略。分类细节见 [sekai-pc-agent.md](sekai-pc-agent.md) §5。
+  ingress 只做**策略授权**（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter`），
+  **不做调用方认证**；默认仅监听回环地址，暴露到非回环前必须自行加防护（见
+  [缺口审计](sekai-gap-audit.md) B9）。分类细节见 [sekai-pc-agent.md](sekai-pc-agent.md) §5。

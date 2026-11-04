@@ -119,7 +119,7 @@ sekai> 列一下当前目录有哪些文件          # → Router 派 pc.ls（�
 | --- | --- |
 | `link` | 直连链路传输层：`Link` trait、`StdioLink`/`TcpLink`、内存链路（测试）、`u32` 大端长度前缀帧读写、退避重连 |
 | `host` | `WorkerHost`：组装 Runtime、注册表与链路读循环 |
-| `capability` | 宿主能力声明：`host_registries()`（`pc.*` 工具/任务 + 系统 Task）、`SystemClock` |
+| `capability` | 宿主能力声明：`agent_registries*()`（`pc.*` 工具/任务 + prompt 通道）、`host_registries()`（仅测试/路由用：4 个 gpio 工具 + `echo`/`sleep`）、`SystemClock` |
 | `llm_channel` | prompt 通道客户端（router 直连 / dsh stdin/stdout JSONL） |
 
 Router 与本 crate 共用 `link` 抽象（`crate/sekai-router` 依赖本 crate 的 lib）。

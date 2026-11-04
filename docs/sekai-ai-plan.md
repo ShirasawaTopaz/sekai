@@ -579,7 +579,7 @@ docs/sekai-gpio.md                      M  §6.3 增加“可由 sekai-agent 自
 
 #### Phase 1：crate 骨架 + 控制平面连接/发现
 
-> **状态**：完成。`config`/`topic`/`host_link`/`device`/`control` 已实现并经 `check-lib.sh` 编译；`tests/control_plane.rs` 实测 25 passed / 0 failed。
+> **状态**：完成。`config`/`topic`/`host_link`/`device`/`control` 已实现并经 `.build/check-lib.sh`（临时脚本，已随仓库清理移除）编译；`tests/control_plane.rs` 实测 25 passed / 0 failed。
 
 - 新建 `sekai-ai`，实现 `config`、`topic`、`host_link`、`device`。
 - `ControlPlane`：CONNECT/CONNACK、SUBSCRIBE/SUBACK、retained Hello、设备注册表。

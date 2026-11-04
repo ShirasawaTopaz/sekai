@@ -161,3 +161,5 @@ worker stdin ◀── 原样回投（ok/result 或 ok/error 信封）
 - ~~暴露 Router 自带 LLM agent 回路给 DSH（刻意不做，避免双重大脑）~~ → v1.1 起以
   **受限问答形态**暴露：serve `prompt` 方法 / ingress 只返回单轮回答（带防递归闸），
   DSH 主会话仍是唯一的控制大脑。
+- 已核实的插件/serve 缺口（link 地址、断开通知、长任务 DDL 提示等）见
+  [sekai-gap-audit.md](sekai-gap-audit.md) B11。

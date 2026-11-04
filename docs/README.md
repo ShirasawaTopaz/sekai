@@ -9,6 +9,7 @@
 | 文档 | 一句话简介 | 状态 |
 | --- | --- | --- |
 | [sekai-architecture.md](sekai-architecture.md) | Router/Worker 总体架构：角色与 Crate 划分、通信矩阵、阶段计划、与 DSH superagent 架构的对照 | 现行 |
+| [sekai-gap-audit.md](sekai-gap-audit.md) | 缺口审计：未实现/未闭环环节、证据、优先级与建议工作包（W1–W10） | 现行（审计快照，2026-11-04） |
 | [sekai-protocol.md](sekai-protocol.md) | V1 控制平面协议全规范：编码约定、Stdin/Stdout 帧布局、命令/事件/错误码、MQTT 主题与 QoS/retain、Hello/Offline、服务端契约 | 现行（V1 冻结） |
 | [sekai-pc-agent.md](sekai-pc-agent.md) | PC agent：`pc.*` 工具/任务全表、prompt JSONL 协议（三方通用）、Router/Worker/插件配置清单、安全与防递归 | 现行 |
 | [sekai-gpio.md](sekai-gpio.md) | GPIO 抽象与 `gpio.*` 用户工具：家族引脚表、能力/保留标志、四个工具的语法、错误映射 | 现行（`--gpio` opt-in） |
@@ -32,6 +33,12 @@
 1. [根 README](../README.md) 的快速开始 —— 构建、REPL、Worker 接入。
 2. [sekai-architecture.md](sekai-architecture.md) —— 理解 Router/Worker 分工与
    直连链路；§2.1 的五种运行形态命令一览。
+
+**评估缺口 / 排期 / 验收**
+
+1. [sekai-gap-audit.md](sekai-gap-audit.md) —— 哪些没实现/没闭环、证据、优先级，
+   以及建议的工作包与顺序；P2 退出条件以该文 §1/§9 为准。
+2. [sekai-architecture.md](sekai-architecture.md) §3 —— 阶段计划与置后项。
 
 **固件 / 板级开发者**
 

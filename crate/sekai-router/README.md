@@ -6,6 +6,10 @@ Sekai **Router**：常驻路由器进程。连接/监听 Worker 链路，维护 
 结果。与 Worker 的关系见
 [docs/sekai-architecture.md](../../docs/sekai-architecture.md)。
 
+> **已知限制**：直连链路（stdio/TCP）同一时刻只支持 **1 个 Worker**（`DirectGateway`
+> 持有单个端点，TCP 监听器在连接期间不再 accept）；多 Worker 目前只在 MQTT/嵌入式
+> （置后阶段）链路成立。见[缺口审计](../../docs/sekai-gap-audit.md) B1。
+
 ```text
 sekai-router
  ├─ 链路（--link）
@@ -37,8 +41,9 @@ sekai-router
 prompt ingress**：任意客户端（Worker 的 `pc.ask --llm router`、DSH worker 插件中转、
 手工 `nc`）连上来发 `{"id":N,"method":"prompt","params":{"text":"…"}}`，Router 用内置
 LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve 模式 `127.0.0.1:7422`，
-批处理模式 `off`。鉴权沿用当前会话策略；经 prompt 通道发起的运行**拒绝再派
-`pc.ask`**（防递归）。serve JSONL 同能力以 `prompt` 方法暴露（v1.1 additive）。
+批处理模式 `off`。ingress 只做**策略授权**、**不做调用方认证**（默认仅回环监听）；
+经 prompt 通道发起的运行**拒绝再派 `pc.ask`**（防递归）。serve JSONL 同能力以
+`prompt` 方法暴露（v1.1 additive）。
 协议全量定义（请求/响应/错误码/ping）见
 [docs/sekai-pc-agent.md](../../docs/sekai-pc-agent.md) §4。
 
@@ -72,11 +77,17 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 | 码 | 含义 |
 | --- | --- |
 | 0 | 成功 |
+| 1 | 未预期的启动/线程/I/O 失败（非命令失败） |
 | 2 | 配置错误 |
 | 3 | Worker 不可用 |
 | 4 | LLM/API 错误 |
 | 5 | 达到最大步数 |
 | 6 | Worker 命令最终失败 |
+| 130 | TUI 被 Ctrl-C 中断 |
+
+> 6 的 `AgentError::Gateway` 分支目前没有构造点（命令失败走 `report_outcome`）；
+> 见[缺口审计](../../docs/sekai-gap-audit.md) B8。TUI 内部还有一个 64 的哨兵值，
+> 不会作为进程退出码暴露给正常使用。
 
 ## 模块地图
 

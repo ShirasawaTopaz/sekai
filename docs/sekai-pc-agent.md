@@ -51,6 +51,10 @@ args 与输出均为**原始 UTF-8 文本**（无 key=value 前缀；与 `gpio.*
 输出统一截断：超出上限时按 UTF-8 字符边界截断并追加 `[[truncated]]` 标记行；
 `pc.exec` 超时追加 `[[timeout after <ms>ms]]` 标记行。
 
+> 注意：上表是 **Worker 侧**输出上限。Router 回填给模型的 payload 还有一层
+> `PAYLOAD_TRUNCATE_BYTES = 3584` 字节的展示截断（`crate/sekai-router/src/tools.rs`），
+> 因此模型看到的字节数可能少于 Worker 文档上限；需要完整内容时应分块读取或写文件。
+
 ### 2.1 `pc.exec` —— 执行命令（工具）
 
 | 项 | 值 |
@@ -90,6 +94,10 @@ args 与输出均为**原始 UTF-8 文本**（无 key=value 前缀；与 `gpio.*
 | 截断 | 上限 200 行，超出追加 `[[truncated]]` |
 | 策略 | 只读，默认放行 |
 
+> 该工具只限制行数、不限制字节数；目录项较多或名字较长时，结果可能超过 V1 的
+> 4096 字节载荷上限而返回 `ResultTooLarge`（见[缺口审计](sekai-gap-audit.md) B4.5）。
+> 需要完整列表时建议分批读取或改用 `pc.exec` 重定向到文件。
+
 ### 2.5 `pc.info` —— 宿主信息（工具）
 
 无 args。多行输出：
@@ -104,6 +112,11 @@ gpio=<esp32|stm32f1|stm32f4|none>
 ```
 
 ## 3. 任务（Task）参考
+
+> **预算提醒**：Router 侧默认执行预算 `SEKAI_DDL_MS=1000`，再加 Task 余量 15s；
+> 长任务（`pc.job`、`pc.ask`）应在调用时显式给 `ddl_ms`（建议 ≥60000），否则
+> 默认 1s 预算会在 Worker 侧 `Failed(Timeout)`。见
+> [缺口审计](sekai-gap-audit.md) B4。
 
 ### 3.1 `pc.job` —— 长命令（任务）
 
@@ -146,6 +159,10 @@ gpio=<esp32|stm32f1|stm32f4|none>
 `params.text` 必填（1..=8192 字节）；可选 `params.max_steps`（1..=32）限定该次评估的
 agent 步数上限。
 
+> **注意**：8192 字节是 ingress / HTTP 类客户端的协议上限。经 Worker `pc.ask` 发出的
+> prompt 会作为 V1 Task 载荷传输，受 `MAX_PAYLOAD = 4096` 字节限制（见
+> `docs/sekai-protocol.md` §9.4）。
+
 - 成功响应（回投 Worker stdin / 客户端连接）：
 
 ```json
@@ -179,8 +196,11 @@ agent 步数上限。
 `id` 为整数，由请求方分配；响应按 `id` 匹配。一条连接上可以只承载一对请求-响应
 （DSH 插件中转即为每条 prompt 独立建连）。
 
-ingress 与 serve `prompt` 方法共用同一核心，鉴权沿用当前会话策略
-（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter` 原样继承，不新增开关）。
+ingress 与 serve `prompt` 方法共用同一核心，只做**策略授权**
+（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter` 原样继承，不新增开关），
+**不做调用方认证**：任何能连上端口的客户端都可以提交 prompt。默认仅监听回环地址；
+如需绑定非回环地址，必须自行加网络隔离或代理鉴权（见
+[缺口审计](sekai-gap-audit.md) B9）。
 
 ## 5. 安全模型与防递归
 

@@ -236,8 +236,8 @@ pub struct Config {
     /// 全屏 TUI 前端（ratatui）：蕴含 interactive；非 TTY 时回退行式 REPL。
     pub tui: bool,
     /// 无头 JSONL 服务模式：stdin 读请求、stdout 只写 JSONL（DSH 插件
-    /// 驱动）；不调用 LLM，不需要 API key，与 --goal/--goal-file/--tui/
-    /// -i/--dry-run 互斥。
+    /// 驱动）；链路操作不调用 LLM、不需要 API key（v1.1 `prompt` 方法
+    /// 需要），与 --goal/--goal-file/--tui/-i/--dry-run 互斥。
     pub serve: bool,
     /// prompt ingress 监听地址（HOST:PORT）；None = 关闭。
     ///
@@ -663,11 +663,12 @@ pub fn usage() -> String {
   sekai-router --dry-run [选项]         只连接并列出Worker，不调用 LLM
   sekai-router --serve [选项]           无头 JSONL 服务模式：stdin 读请求、
                                         stdout 只写 JSONL（DSH 插件驱动；
-                                        不调用 LLM，不需要 API key）
+                                        链路操作不调 LLM、无需 API key；
+                                        prompt 方法需要 key）
                                         --prompt-addr 另开 prompt ingress
 
 必需环境变量：
-  {ENV_API_KEY}        DeepSeek API key（--dry-run、交互会话与 --serve 除外；也接受 {ENV_API_KEY_ALT}）
+  {ENV_API_KEY}        DeepSeek API key（--dry-run、交互会话与 --serve 的链路操作除外；也接受 {ENV_API_KEY_ALT}）
   {ENV_MQTT_ADDR}      MQTT broker 地址，例如 127.0.0.1:1883（--link mqtt 批处理时必需）
 
 可选环境变量：

@@ -42,7 +42,7 @@
 
 ---
 
-> **状态注记**：嵌入式 Worker 为置后阶段：当前宿主构建保绿，固件构建由 `esp32` feature 门控；xtensa 工具链状态见该文档下文/README。
+> **状态注记**：嵌入式 Worker 为置后阶段：当前宿主构建保绿，固件构建由 `esp32` feature 门控；xtensa 工具链状态见该文档下文/README。实机端到端尚未验证，缺口见 [sekai-gap-audit.md](sekai-gap-audit.md) D1。
 
 ---
 

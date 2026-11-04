@@ -52,7 +52,7 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 
 ### 前置要求
 
-- Rust **1.85+**（workspace 为 edition 2024）；`cargo` 在 PATH 上。
+- Rust **1.88+**（workspace 为 edition 2024；代码使用 1.88 才稳定的 let-chains）；`cargo` 在 PATH 上。
 - `DEEPSEEK_API_KEY`：凡是真正调用 LLM 的形态都需要（批处理启动时校验；
   交互会话启动时不校验、输入目标时用到；`pc.ask` 与 prompt ingress 同样需要；
   `--dry-run` 与 `--serve` 的链路操作不需要）。
@@ -97,7 +97,7 @@ sekai> 帮我问一下 LLM：Rust 的 Deref 是什么   # → pc.ask（需 allow
 
 REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/workers`
 （观察注册表）、`/wait`（等 Worker 上线）、`/policy`（查看/调整策略）、`/exit`。
-非 `/` 开头的输入一律作为自然语言目标，多轮可续。
+非 `/` 开头的输入一律作为自然语言目标；同一会话可连续下发多个目标（不保留跨目标上下文）。
 
 ### 其他运行形态
 
@@ -149,6 +149,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | 文档 | 内容 | 读者 |
 | --- | --- | --- |
 | [docs/sekai-architecture.md](docs/sekai-architecture.md) | Router/Worker 总体架构、通信矩阵、PC agent 与 prompt 通道、阶段计划 | 所有贡献者，**先读这篇** |
+| [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) | 缺口审计：未实现/未闭环清单、证据、优先级与建议工作包 | 评估范围、排期与验收的人 |
 | [docs/sekai-protocol.md](docs/sekai-protocol.md) | V1 控制平面协议：帧格式、主题、QoS/retain、Hello、错误码 | 协议实现者、调试链路的工程师 |
 | [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent：`pc.*` 工具/任务全表、prompt JSONL 协议、三方配置与安全 | PC Worker 使用者、插件/客户端实现者 |
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO 抽象、引脚表、`gpio.*` 工具语法与 AI 调用流程（`--gpio` opt-in 后的嵌入式演示） | 板级开发者、GPIO 集成者 |
@@ -171,8 +172,11 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | P0–P1.7 | 术语重构、直连链路（stdio/TCP）、REPL/TUI、连接向导 | 完成 |
-| P2 | LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | **进行中** |
+| P2 | LLM 评估/派工回路吃到直连 Worker；PC agent 形态（`pc.*` 能力、`--gpio` opt-in、prompt 通道）端到端演示 | **单 Worker 闭环完成；剩余项见[缺口审计](docs/sekai-gap-audit.md)** |
 | P3 | 嵌入式 Worker：esp32 固件构建、MQTT 链路回归 | 置后 |
+
+P2 的退出条件与待办清单以 [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) §1/§9 为准；
+在审计的 B1–B11 关闭前，不再宣称 P2 已完成。
 
 ## 开发
 

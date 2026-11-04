@@ -56,7 +56,7 @@ You ─────────────▶ sekai-router ──────�
 
 ### Prerequisites
 
-- Rust **1.85+** (the workspace uses edition 2024); `cargo` on PATH.
+- Rust **1.88+** (the workspace uses edition 2024; the code relies on let-chains, stable since 1.88); `cargo` on PATH.
 - `DEEPSEEK_API_KEY`: required whenever the LLM is actually invoked (validated
   at startup in batch mode; the interactive REPL only needs it once you type a
   goal; `pc.ask` and the prompt ingress need it too; `--dry-run` and link-only
@@ -105,7 +105,8 @@ The full `pc.*` tool/task table and env knobs (`SEKAI_PC_EXEC_MS` /
 REPL commands: `/help`, `/link <mqtt|stdio|tcp>` (build/switch the link),
 `/workers` (inspect the registry), `/wait` (wait for Workers), `/policy`
 (view/adjust policy), `/exit`. Any input not starting with `/` is treated as a
-natural-language goal; conversations continue across turns.
+natural-language goal; you can issue multiple goals in one session (no
+cross-goal context is retained).
 
 ### Other run modes
 
@@ -166,6 +167,7 @@ self-explanatory.
 | Doc | Contents | Audience |
 | --- | --- | --- |
 | [docs/sekai-architecture.md](docs/sekai-architecture.md) | Router/Worker architecture, transport matrix, PC agent & prompt channel, phase plan | Every contributor — **read this first** |
+| [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) | Gap audit: what is unimplemented / not closed-loop, with evidence, priorities and suggested work packages | Anyone scoping, sequencing or accepting work |
 | [docs/sekai-protocol.md](docs/sekai-protocol.md) | V1 control-plane protocol: frames, topics, QoS/retain, Hello, error codes | Protocol implementers, link debuggers |
 | [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent: full `pc.*` tool/task table, prompt JSONL protocol, three-party config, security | PC Worker users, plugin/client implementers |
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO abstraction, pin tables, `gpio.*` tool syntax & AI call flow (embedded demo behind `--gpio`) | Board-level devs, GPIO integrators |
@@ -190,8 +192,12 @@ mainline). Phase progress (details in
 | Phase | Scope | Status |
 | --- | --- | --- |
 | P0–P1.7 | Renaming, direct links (stdio/TCP), REPL/TUI, connection wizard | Done |
-| P2 | LLM eval/dispatch loop over direct Workers; PC-agent shape (`pc.*` capabilities, `--gpio` opt-in, prompt channel) end-to-end demos | **In progress** |
+| P2 | LLM eval/dispatch loop over direct Workers; PC-agent shape (`pc.*` capabilities, `--gpio` opt-in, prompt channel) end-to-end demos | **Single-Worker loop done; remaining items in the [gap audit](docs/sekai-gap-audit.md)** |
 | P3 | Embedded Worker: esp32 firmware build, MQTT link regression | Deferred |
+
+P2's exit criteria and remaining checklist live in
+[docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) §1/§9; P2 is not declared
+complete until B1–B11 there are closed.
 
 ## Development
 

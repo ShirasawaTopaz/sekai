@@ -58,12 +58,12 @@
 
 | 项 | 家族/形态 | 交付 |
 | --- | --- | --- |
-| ESP32 classic | 真实硬件 | `esp-hal` `Flex` 后端；IO0..IO39 引脚表（表内 34 个可用引脚） |
-| STM32F103C8（Blue Pill） | 真实硬件 | `stm32f1` PAC 寄存器后端；PA0-PA15、PB0-PB15、PC13-PC15 |
-| STM32F407VG（LQFP100） | 真实硬件 | `stm32f4` PAC 寄存器后端；PA0-PE15 共 80 个引脚 |
+| ESP32 classic | 真实硬件（仅交叉编译/无实板验证） | `esp-hal` `Flex` 后端；IO0..IO39 引脚表（表内 34 个可用引脚） |
+| STM32F103C8（Blue Pill） | 真实硬件（仅交叉编译/无实板验证） | `stm32f1` PAC 寄存器后端；PA0-PA15、PB0-PB15、PC13-PC15 |
+| STM32F407VG（LQFP100） | 真实硬件（仅交叉编译/无实板验证） | `stm32f4` PAC 寄存器后端；PA0-PE15 共 80 个引脚 |
 | 宿主虚拟后端 | `VirtualGpio` | 三种引脚表；`backend=virtual` |
 | 工具层 | 四个用户工具 | 文本参数、文本结果、固定错误码映射、`gpio.info help` |
-| 运行时集成 | `sekai-worker`/`sekai-embedded`（x86/esp32） | 注册工具并通过 Hello 通告；host 默认 11 个工具 |
+| 运行时集成 | `sekai-worker`/`sekai-embedded`（x86/esp32） | 注册工具并通过 Hello 通告；Worker 默认 11 个工具（6 内置 + 5 `pc.*`），加 `--gpio` 后 15 个 |
 
 ### 1.3 非目标
 
@@ -432,7 +432,7 @@ F407VG（LQFP100）表内共 **80 个引脚**：PA0-PA15、PB0-PB15、PC0-PC15�
 | 结果超过 1024 字节 | `ResultTooLarge` | `GPIO 结果过大` |
 | 共享端口句柄借用失败 | `Internal` | `GPIO 被占用` |
 
-> 协议还有一个保留的 `Unsupported` 错误码（0x000A），GPIO 工具**不会**产生它：
+> 协议还有一个保留的 `Unsupported` 错误码（0x000E；0x000A 是 `Cancelled`），GPIO 工具**不会**产生它：
 > 参数类错误统一 `InvalidArgument`，后端异常统一 `Internal`，结果过大统一 `ResultTooLarge`。
 
 ### 4.5 配置示例
