@@ -21,18 +21,19 @@
 //! | Esc | 清空输入缓冲 |
 //! | PgUp / PgDn | 翻页滚动输出（Ctrl+U / Ctrl+D 半页，↑/↓ 单行，Home/End 首尾） |
 //! | F10 / Ctrl-Q | 退出（退出码 0，同 `/exit`） |
-//! | Ctrl-C | 干净退出（恢复终端后退出，退出码 130） |
+//! | Ctrl-C | 有后台目标时取消目标；空闲时干净退出（恢复终端后退出，退出码 130） |
 //!
 //! 上滚暂停自动跟随，滚回底部（End 或连续 PgDn）恢复跟随。
 //!
 //! ## 事件循环
 //!
-//! 每轮循环先排空 [`Session::poll`] 的异步更新（Worker 上线通知等）再
-//! 绘制；[`crossterm::event::poll`] 以 200ms 超时等待按键，超时空转触发
-//! 下一轮重绘。状态栏每帧直接读 [`Session::link_desc`] /
-//! [`Session::gateway_ready`] / [`Session::worker_count`]，始终最新。注意
-//! [`Session::execute`] 同步阻塞：自然语言目标会跑完整 Agent 回路，
-//! 期间界面冻结、按键排队，与行式 REPL 一致。
+//! 每轮循环先排空 [`Session::poll`] 的异步更新（Worker 上线、后台目标
+//! 完成事件等）再绘制；[`crossterm::event::poll`] 以 200ms 超时等待按键，
+//! 超时空转触发下一轮重绘。自然语言目标经 [`Session::submit_line`] 在
+//! 后台线程执行，因此 Agent 运行期间界面持续重绘、按键即时响应
+//! （Ctrl-C 取消）。状态栏每帧直接读 [`Session::link_desc`] /
+//! [`Session::gateway_ready`] / [`Session::worker_count`] /
+//! [`Session::goal_running`]，始终最新。
 //!
 //! ## 终端卫生与非 TTY
 //!
@@ -79,13 +80,13 @@ const MAX_LINE_CHARS: usize = 4000;
 
 /// 帮助行文本。
 const HELP_LINE: &str =
-    " Enter 提交 ｜ PgUp/PgDn·↑↓ 滚动 ｜ Esc 清空输入 ｜ End 回底 ｜ F10/Ctrl-Q 退出";
+    " Enter 提交 ｜ PgUp/PgDn·↑↓ 滚动 ｜ Esc 清空输入 ｜ Ctrl-C 取消目标 ｜ F10/Ctrl-Q 退出";
 
 /// 运行 TUI 直到退出（`/exit`、F10/Ctrl-Q 或 Ctrl-C）；返回进程退出码。
 ///
 /// stdin/stdout 任一不是终端时不进入全屏，eprintln 一行提示并返回
 /// [`EXIT_NOT_TTY`]，由调用方决定回退（行式 REPL）。
-pub fn run<C: crate::llm::ChatClient + Clone>(session: Session<C>) -> i32 {
+pub fn run<C: crate::llm::ChatClient + Clone + Send + 'static>(session: Session<C>) -> i32 {
     if !is_interactive_tty(|| io::stdin().is_terminal(), || io::stdout().is_terminal()) {
         eprintln!("标准输入/输出不是终端，无法启动 TUI");
         return EXIT_NOT_TTY;
@@ -129,7 +130,9 @@ impl Drop for TerminalGuard {
 }
 
 /// 全屏主循环（前置 tty 检查已通过）。
-fn run_fullscreen<C: crate::llm::ChatClient + Clone>(session: Session<C>) -> io::Result<i32> {
+fn run_fullscreen<C: crate::llm::ChatClient + Clone + Send + 'static>(
+    session: Session<C>,
+) -> io::Result<i32> {
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
@@ -158,7 +161,7 @@ fn run_fullscreen<C: crate::llm::ChatClient + Clone>(session: Session<C>) -> io:
 }
 
 /// TUI 应用状态：会话 + 输入缓冲 + 日志 + 滚动。
-struct App<C: crate::llm::ChatClient + Clone> {
+struct App<C: crate::llm::ChatClient + Clone + Send + 'static> {
     session: Session<C>,
     input: InputBuffer,
     log: LogBuffer,
@@ -167,7 +170,7 @@ struct App<C: crate::llm::ChatClient + Clone> {
     exit_code: Option<i32>,
 }
 
-impl<C: crate::llm::ChatClient + Clone> App<C> {
+impl<C: crate::llm::ChatClient + Clone + Send + 'static> App<C> {
     fn new(session: Session<C>) -> Self {
         Self {
             session,
@@ -204,19 +207,34 @@ impl<C: crate::llm::ChatClient + Clone> App<C> {
         }
     }
 
-    /// 提交当前输入：回显 → [`Session::execute`] → 输出进日志。
+    /// 提交当前输入：回显 → [`Session::submit_line`] → 输出进日志。
+    ///
+    /// 自然语言目标在后台线程执行（TUI 保持可响应），完成事件由
+    /// [`App::drain_poll`] 在后续帧吸收；斜杠命令与向导输入同步返回。
     fn submit(&mut self) {
         let line = self.input.take();
         if line.trim().is_empty() {
             return;
         }
         self.append_line(format!("{PROMPT}{line}"));
-        for message in self.session.execute(&line) {
+        for message in self.session.submit_line(&line) {
             self.absorb(message);
             if self.exit_code.is_some() {
                 return;
             }
         }
+    }
+
+    /// Ctrl-C：有后台目标时取消目标（界面继续，事件通道交付取消结果）；
+    /// 空闲时保持既有语义——干净退出（退出码 130）。
+    fn on_ctrl_c(&mut self) {
+        if self.session.goal_running() {
+            if self.session.cancel_goal() {
+                self.append_line("已请求取消当前目标（在途命令将下发 sekai.cancel）");
+            }
+            return;
+        }
+        self.exit_code = Some(EXIT_INTERRUPT);
     }
 
     /// 处理一次按键（Press/Repeat）。
@@ -237,7 +255,7 @@ impl<C: crate::llm::ChatClient + Clone> App<C> {
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match c.to_ascii_lowercase() {
                     'q' => self.exit_code = Some(0),
-                    'c' => self.exit_code = Some(EXIT_INTERRUPT),
+                    'c' => self.on_ctrl_c(),
                     'u' => self.scroll.up(self.scroll.page / 2),
                     'd' => self.scroll.down(self.scroll.page / 2),
                     _ => {}
@@ -404,16 +422,24 @@ fn scroll_on_append(scroll: &mut ScrollState) {
     }
 }
 
-/// 状态栏整行文本（纯函数，便于测试）：链路 + 就绪 + Worker 数 + 退出键。
-fn status_bar_text(link: &str, ready: bool, workers: usize) -> String {
+/// 状态栏整行文本（纯函数，便于测试）：链路 + 就绪 + Worker 数 +
+/// 后台目标运行时长 + 退出键。
+fn status_bar_text(link: &str, ready: bool, workers: usize, goal_ms: Option<u64>) -> String {
+    let goal = match goal_ms {
+        Some(elapsed) => format!(" ｜ 执行中 {}ms（Ctrl-C 取消）", elapsed),
+        None => String::new(),
+    };
     format!(
-        " 链路：{link} ｜ 就绪：{} ｜ Worker：{workers} ｜ F10/Ctrl-Q 退出",
+        " 链路：{link} ｜ 就绪：{} ｜ Worker：{workers}{goal} ｜ F10/Ctrl-Q 退出",
         if ready { "是" } else { "否" }
     )
 }
 
 /// 渲染一帧；返回输出窗格内部高度（行），供滚动分页用。
-fn render<C: crate::llm::ChatClient + Clone>(frame: &mut Frame, app: &App<C>) -> usize {
+fn render<C: crate::llm::ChatClient + Clone + Send + 'static>(
+    frame: &mut Frame,
+    app: &App<C>,
+) -> usize {
     let [status_area, output_area, input_area] = Layout::vertical([
         Constraint::Length(1), // 状态栏
         Constraint::Min(3),    // 输出窗格（含边框）
@@ -422,11 +448,17 @@ fn render<C: crate::llm::ChatClient + Clone>(frame: &mut Frame, app: &App<C>) ->
     .areas(frame.area());
 
     // 状态栏：反色整行（补空格铺满宽度）；每帧直读 Session，始终最新。
+    let goal_ms = if app.session.goal_running() {
+        Some(app.session.goal_elapsed_ms())
+    } else {
+        None
+    };
     let status_text = pad_to_width(
         &status_bar_text(
             app.session.link_desc(),
             app.session.gateway_ready(),
             app.session.worker_count(),
+            goal_ms,
         ),
         status_area.width as usize,
     );
@@ -688,14 +720,19 @@ mod tests {
 
     #[test]
     fn status_bar_text_shows_link_ready_workers() {
-        let text = status_bar_text("tcp 监听（127.0.0.1:7421）", true, 2);
+        let text = status_bar_text("tcp 监听（127.0.0.1:7421）", true, 2, None);
         assert!(text.contains("链路：tcp 监听"));
         assert!(text.contains("就绪：是"));
         assert!(text.contains("Worker：2"));
-        let text = status_bar_text("未连接", false, 0);
+        assert!(!text.contains("执行中"));
+        let text = status_bar_text("未连接", false, 0, None);
         assert!(text.contains("就绪：否"));
         assert!(text.contains("Worker：0"));
         assert!(text.contains("F10/Ctrl-Q 退出"));
+        // 后台目标运行中：状态栏展示时长与 Ctrl-C 提示。
+        let text = status_bar_text("未连接", false, 0, Some(1_234));
+        assert!(text.contains("执行中 1234ms"), "{text}");
+        assert!(text.contains("Ctrl-C 取消"), "{text}");
     }
 
     // ---- 非 TTY 判定 ----

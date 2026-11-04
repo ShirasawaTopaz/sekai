@@ -837,3 +837,38 @@ fn gateway_waits_ready_for_unreachable_broker_then_fails_fast() {
     assert!(started.elapsed() < Duration::from_secs(3), "Drop 不应挂起");
     drop(listener);
 }
+
+/// 取消契约（MQTT 链路）：submit 在 accepted 上限内回传 cmd_id；已结束的
+/// 命令取消返回 `unknown_command`；诊断快照可无阻塞读取。
+#[test]
+fn gateway_cancel_finished_command_reports_unknown_command() {
+    let mut broker = MiniBroker::start();
+    let _worker = spawn_fake_worker(broker.port, WorkerMode::Respond);
+    let mut gateway = MqttGateway::connect(gateway_config(broker.port)).expect("gateway connect");
+    gateway.wait_ready(5_000).expect("应就绪");
+    assert!(wait_for_worker(&mut gateway, Duration::from_secs(5)));
+
+    let receipt = gateway
+        .submit(CommandRequest::tool(WORKER_ID, "gpio.info", "IO4"))
+        .expect("submit 应成功");
+    let cmd_id = receipt.cmd_id();
+    assert!(cmd_id > 0, "submit 应回传 cmd_id：{cmd_id}");
+    let result = receipt.wait().expect("应收到最终事件");
+    assert!(result.ok());
+    assert_eq!(result.cmd_id, cmd_id);
+
+    let error = gateway.cancel(cmd_id).expect_err("已结束的命令不可取消");
+    assert_eq!(error.code, "unknown_command", "错误码：{error}");
+
+    let diagnostics = gateway.diagnostics();
+    assert!(
+        diagnostics
+            .inflight
+            .iter()
+            .all(|command| command.name != "gpio.info"),
+        "命令结束后不应仍在途：{diagnostics:?}"
+    );
+
+    drop(gateway);
+    broker.shutdown();
+}

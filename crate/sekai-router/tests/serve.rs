@@ -9,8 +9,9 @@ use std::io::{BufRead, Cursor, Read, Result as IoResult, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sekai::sekai_device_list::DeviceList;
 use sekai_router::agent::AgentConfig;
-use sekai_router::control::{CommandRequest, CommandResult};
+use sekai_router::control::{CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
 use sekai_router::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
 use sekai_router::json::Json;
@@ -25,10 +26,12 @@ use sekai_router::worker::WorkerInfo;
 
 // ---- 测试替身 ----
 
-/// 可从外部改 Worker 集合、可记录命令请求的内存网关。
+/// 可从外部改 Worker 集合、可记录命令请求/取消的内存网关。
 struct FakeGateway {
     workers: Arc<Mutex<Vec<WorkerInfo>>>,
     calls: Arc<Mutex<Vec<CommandRequest>>>,
+    /// cancel 收到的 cmd_id（B2）。
+    cancelled: Arc<Mutex<Vec<u64>>>,
 }
 
 impl WorkerGateway for FakeGateway {
@@ -50,7 +53,13 @@ impl WorkerGateway for FakeGateway {
         });
         let (sender, receiver) = std::sync::mpsc::channel();
         let _ = sender.send(result);
-        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
+        // 回执带 cmd_id=7（与 CommandResult.cmd_id 一致；取消/账本断言依赖它）。
+        Ok(CommandReceipt::with_cmd_id(receiver, 60_000, "内存", 7))
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        self.cancelled.lock().unwrap().push(cmd_id);
+        Ok(())
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
@@ -115,10 +124,36 @@ fn fake_handle(
     workers: Arc<Mutex<Vec<WorkerInfo>>>,
     calls: &Arc<Mutex<Vec<CommandRequest>>>,
 ) -> GatewayHandle {
-    Arc::new(Mutex::new(Box::new(FakeGateway {
+    fake_handle_with_cancel(workers, calls).0
+}
+
+/// 同 [`fake_handle`]，额外返回 cancel 记录的 cmd_id（B2 断言用）。
+fn fake_handle_with_cancel(
+    workers: Arc<Mutex<Vec<WorkerInfo>>>,
+    calls: &Arc<Mutex<Vec<CommandRequest>>>,
+) -> (GatewayHandle, Arc<Mutex<Vec<u64>>>) {
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let gateway = FakeGateway {
         workers,
         calls: Arc::clone(calls),
-    }) as Box<dyn WorkerGateway>))
+        cancelled: Arc::clone(&cancelled),
+    };
+    let handle: GatewayHandle = Arc::new(Mutex::new(Box::new(gateway) as Box<dyn WorkerGateway>));
+    (handle, cancelled)
+}
+
+/// 注入内存网关（`pc-1`）的 state + 请求/取消记录。
+fn linked_state() -> (
+    ServeState,
+    Arc<Mutex<Vec<CommandRequest>>>,
+    Arc<Mutex<Vec<u64>>>,
+) {
+    let mut state = state();
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let (handle, cancelled) = fake_handle_with_cancel(Arc::clone(&workers), &calls);
+    state.set_gateway(handle, "tcp", String::from("测试链路（注入）"));
+    (state, calls, cancelled)
 }
 
 fn state() -> ServeState {
@@ -1013,5 +1048,297 @@ fn prompt_hub_sees_gateway_injected_after_hub() {
             .get_path(&["result", "answer"])
             .and_then(Json::as_str),
         Some("ok")
+    );
+}
+
+// ---- v1.2：异步 / 取消 / commands / jump / admin / 诊断（B2/B6/B7/B8）----
+
+/// 参数：`async:true` 时立即回 `{accepted,cmd_id}`，完成后发无 id 的
+/// `command_result` 通知；在途期间 `commands` 能看到该命令。
+#[test]
+fn async_tool_call_replies_accepted_then_notifies() {
+    let (mut state, calls, _cancelled) = linked_state();
+
+    let (messages, exit, deferred) = state.step(
+        r#"{"id":1,"method":"tool_call","params":{"worker_id":"pc-1","tool":"gpio.info","args":"IO4","async":true}}"#,
+    );
+    assert!(!exit);
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("accepted").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("cmd_id").and_then(Json::as_u64), Some(7));
+    assert_eq!(result.get("async").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("kind").and_then(Json::as_str), Some("tool"));
+    assert_eq!(calls.lock().unwrap().len(), 1, "dispatcher 内应已完成提交");
+
+    // 完成前：commands 以标准信封列出在途命令。
+    let messages = request(&mut state, r#"{"id":2,"method":"commands","params":{}}"#);
+    assert_eq!(messages[0].get("id").and_then(Json::as_i64), Some(2));
+    assert_eq!(messages[0].get("ok").and_then(Json::as_bool), Some(true));
+    let listed = messages[0].get("result").unwrap();
+    assert_eq!(listed.get("count").and_then(Json::as_u64), Some(1));
+    let Json::Array(commands) = listed.get("commands").unwrap() else {
+        panic!("commands 应是数组");
+    };
+    assert_eq!(commands[0].get("cmd_id").and_then(Json::as_u64), Some(7));
+    assert_eq!(commands[0].get("async").and_then(Json::as_bool), Some(true));
+
+    // 后台完成后：无 id 的 command_result 通知，账本清空。
+    let notifications = deferred.expect("async 应拆出后台任务").run();
+    assert_eq!(notifications.len(), 1);
+    assert!(notifications[0].get("id").is_none(), "通知行不得带 id");
+    assert_eq!(
+        notifications[0].get("method").and_then(Json::as_str),
+        Some("command_result")
+    );
+    let params = notifications[0].get("params").unwrap();
+    assert_eq!(params.get("cmd_id").and_then(Json::as_u64), Some(7));
+    assert_eq!(params.get("ok").and_then(Json::as_bool), Some(true));
+    let messages = request(&mut state, r#"{"id":3,"method":"commands","params":{}}"#);
+    assert_eq!(
+        messages[0]
+            .get("result")
+            .unwrap()
+            .get("count")
+            .and_then(Json::as_u64),
+        Some(0)
+    );
+}
+
+/// `cancel {cmd_id}`：转发到网关并标记账本（known=true）；非法参数回错。
+#[test]
+fn cancel_routes_to_gateway_and_marks_known() {
+    let (mut state, _calls, cancelled) = linked_state();
+    let (_messages, _exit, deferred) = state.step(
+        r#"{"id":1,"method":"tool_call","params":{"worker_id":"pc-1","tool":"gpio.info","args":"IO4","async":true}}"#,
+    );
+
+    let messages = request(
+        &mut state,
+        r#"{"id":2,"method":"cancel","params":{"cmd_id":7}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("cmd_id").and_then(Json::as_u64), Some(7));
+    assert_eq!(result.get("cancelled").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("known").and_then(Json::as_bool), Some(true));
+    assert_eq!(*cancelled.lock().unwrap(), vec![7]);
+
+    let messages = request(
+        &mut state,
+        r#"{"id":3,"method":"cancel","params":{"cmd_id":0}}"#,
+    );
+    assert_eq!(
+        messages[0]
+            .get("error")
+            .unwrap()
+            .get("code")
+            .and_then(Json::as_str),
+        Some("invalid_arguments")
+    );
+
+    // 收尾后台任务：通知里带 cancelled 标记。
+    let notifications = deferred.expect("应有后台任务").run();
+    assert_eq!(
+        notifications[0]
+            .get("params")
+            .unwrap()
+            .get("cancelled")
+            .and_then(Json::as_bool),
+        Some(true)
+    );
+}
+
+/// jump：受 `--allow-admin`（policy.allow_admin）约束，按 `CommandKind::Jump`
+/// 下发；未授权时 policy_denied 且不发命令。
+#[test]
+fn jump_requires_admin_and_dispatches_jump_kind() {
+    let (mut state, calls, _cancelled) = linked_state();
+
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"jump","params":{"worker_id":"pc-1","target":"peer-1"}}"#,
+    );
+    let error = messages[0].get("error").unwrap();
+    assert_eq!(
+        error.get("code").and_then(Json::as_str),
+        Some("policy_denied")
+    );
+    assert!(calls.lock().unwrap().is_empty(), "未授权不应发命令");
+
+    let _ = request(
+        &mut state,
+        r#"{"id":2,"method":"policy.set","params":{"allow_admin":true}}"#,
+    );
+    let messages = request(
+        &mut state,
+        r#"{"id":3,"method":"jump","params":{"worker_id":"pc-1","target":"peer-1"}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("ok").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("kind").and_then(Json::as_str), Some("jump"));
+    assert_eq!(result.get("name").and_then(Json::as_str), Some("peer-1"));
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].kind, CommandKind::Jump);
+    assert_eq!(sent[0].name, "peer-1");
+
+    // 缺 target：invalid_arguments。
+    let messages = request(
+        &mut state,
+        r#"{"id":4,"method":"jump","params":{"worker_id":"pc-1"}}"#,
+    );
+    assert_eq!(
+        messages[0]
+            .get("error")
+            .unwrap()
+            .get("code")
+            .and_then(Json::as_str),
+        Some("invalid_arguments")
+    );
+}
+
+/// admin：set_time 编码 8 字节大端、workers.set 编码 DeviceList、cancel
+/// 走取消路径；未授权时全部 policy_denied。
+#[test]
+fn admin_methods_encode_payloads() {
+    let (mut state, calls, cancelled) = linked_state();
+
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"admin","params":{"op":"set_time","worker_id":"pc-1","unix_ms":123}}"#,
+    );
+    assert_eq!(
+        messages[0]
+            .get("error")
+            .unwrap()
+            .get("code")
+            .and_then(Json::as_str),
+        Some("policy_denied")
+    );
+
+    let _ = request(
+        &mut state,
+        r#"{"id":2,"method":"policy.set","params":{"allow_admin":true}}"#,
+    );
+    let messages = request(
+        &mut state,
+        r#"{"id":3,"method":"admin","params":{"op":"set_time","worker_id":"pc-1","unix_ms":123}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("op").and_then(Json::as_str), Some("set_time"));
+    assert_eq!(result.get("cmd_id").and_then(Json::as_u64), Some(7));
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].name, "sekai.set_time");
+    assert_eq!(sent[0].args, 123u64.to_be_bytes().to_vec());
+
+    let messages = request(
+        &mut state,
+        r#"{"id":4,"method":"admin","params":{"op":"workers.set","worker_id":"pc-1","workers":[{"name":"peer-1","ip":"127.0.0.1","port":7422}]}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("op").and_then(Json::as_str), Some("workers.set"));
+    let sent = calls.lock().unwrap().clone();
+    let encoded = sent.last().expect("应有 workers.set 请求").args.clone();
+    let list = DeviceList::decode(&encoded).expect("DeviceList 编码可解码");
+    let device = list.get("peer-1").expect("应含 peer-1");
+    assert_eq!(device.ip, "127.0.0.1");
+    assert_eq!(device.port, 7422);
+
+    // admin op=cancel 复用取消路径（账本无该 id → known=false）。
+    let messages = request(
+        &mut state,
+        r#"{"id":5,"method":"admin","params":{"op":"cancel","cmd_id":42}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("cancelled").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("known").and_then(Json::as_bool), Some(false));
+    assert_eq!(*cancelled.lock().unwrap(), vec![42]);
+}
+
+/// status：诊断字段（link_info / inflight / counters / clock_synced /
+/// late_results）齐全且来自控制面诊断。
+#[test]
+fn status_exposes_diagnostics_fields() {
+    let (mut state, _calls, _cancelled) = linked_state();
+    let messages = request(&mut state, r#"{"id":1,"method":"status","params":{}}"#);
+    assert_eq!(messages[0].get("ok").and_then(Json::as_bool), Some(true));
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(
+        result.get("link").and_then(Json::as_str),
+        Some("测试链路（注入）")
+    );
+    let link_info = result.get("link_info").unwrap();
+    assert_eq!(link_info.get("state").and_then(Json::as_str), Some("ready"));
+    assert_eq!(link_info.get("workers").and_then(Json::as_u64), Some(1));
+    let Json::Array(inflight) = result.get("inflight").unwrap() else {
+        panic!("inflight 应是数组");
+    };
+    assert!(inflight.is_empty());
+    let counters = result.get("counters").unwrap();
+    assert_eq!(counters.get("late_results").and_then(Json::as_u64), Some(0));
+    assert_eq!(
+        counters.get("dropped_events").and_then(Json::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        result.get("clock_synced").and_then(Json::as_bool),
+        Some(false)
+    );
+    let Json::Array(late) = result.get("late_results").unwrap() else {
+        panic!("late_results 应是数组");
+    };
+    assert!(late.is_empty());
+}
+
+/// D5 自动路由：名字在 Worker 通告的 tasks 列表里时，`tool_call` 按 Task 下发
+/// （策略仍按名字分类，需要 allow_tasks）。
+#[test]
+fn tool_call_routes_advertised_task_names_as_task() {
+    let (mut state, calls, _cancelled) = linked_state();
+    // 默认拒绝 Task：echo 已在 Worker tasks 列表 → 按 Task 分类被拒。
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"tool_call","params":{"worker_id":"pc-1","tool":"echo","args":"hi"}}"#,
+    );
+    let denied = messages[0].get("result").unwrap();
+    assert_eq!(
+        denied
+            .get("error")
+            .unwrap()
+            .get("code")
+            .and_then(Json::as_str),
+        Some("policy_denied")
+    );
+    assert_eq!(denied.get("kind").and_then(Json::as_str), Some("tool"));
+    assert!(calls.lock().unwrap().is_empty(), "策略拒绝不应发命令");
+
+    let _ = request(
+        &mut state,
+        r#"{"id":2,"method":"policy.set","params":{"allow_tasks":true}}"#,
+    );
+    let messages = request(
+        &mut state,
+        r#"{"id":3,"method":"tool_call","params":{"worker_id":"pc-1","tool":"echo","args":"hi"}}"#,
+    );
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(result.get("ok").and_then(Json::as_bool), Some(true));
+    assert_eq!(result.get("kind").and_then(Json::as_str), Some("task"));
+    let sent = calls.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].kind, CommandKind::Task);
+
+    // 未通告的普通工具仍按 Tool 下发。
+    let messages = request(
+        &mut state,
+        r#"{"id":4,"method":"tool_call","params":{"worker_id":"pc-1","tool":"gpio.read","args":"IO4"}}"#,
+    );
+    assert_eq!(
+        messages[0]
+            .get("result")
+            .unwrap()
+            .get("kind")
+            .and_then(Json::as_str),
+        Some("tool")
     );
 }

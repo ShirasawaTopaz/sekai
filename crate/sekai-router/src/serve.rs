@@ -9,18 +9,30 @@
 //! ## 线程模型
 //!
 //! - **主线程**：逐行读 stdin → mpsc → dispatcher（只转发，不写 stdout）；
-//! - **dispatcher 线程**：独占协议状态（网关句柄 / 策略），串行处理请求，
-//!   写响应与 link_state 通知（调用天然串行，无需额外排队）；
-//! - **poll 线程**：约 200ms diff `list_workers()`，发 worker_online /
-//!   worker_offline 通知；
+//! - **dispatcher 线程**：独占协议状态（网关句柄 / 策略），串行处理请求；
+//!   **长方法（tool_call / task / prompt / jump / admin）不在这里阻塞**：
+//!   dispatcher 拆出 [`Deferred`] 任务（含已校验请求与网关克隆）到工作线程，
+//!   结果经共享写队列按 id 回写 JSONL 行（行完整；乱序由插件按 id 匹配）；
+//! - **后台命令线程**：每请求一个，执行 `submit + wait` 或 LLM 调用；
+//!   `async:true` 的请求在 dispatcher 内完成提交、立刻回 `accepted`，
+//!   完成时工作线程发无 id 的 `{"method":"command_result",...}` 通知；
+//! - **poll 线程**：约 200ms diff `list_workers()` 发 worker_online /
+//!   worker_offline；同时观测网关 ready 由 true→false / false→true 时补发
+//!   `link_state` 通知（B11）；
 //! - **prompt ingress 线程**（--prompt-addr 启用时）：TCP JSONL 通道，
 //!   见 [`crate::prompt_server`]。
 //!
 //! ## 协议（v1，冻结，插件侧并行开发，不得偏离）
 //!
 //! **v1.1 additive**：新增 `prompt` 方法（参数/响应形状与错误码见
-//! [`crate::prompt_server`]；由 Router 调 LLM 后返回回答）。该方法为
-//! 纯增量——旧插件不调用它，行为不变，向后兼容。
+//! [`crate::prompt_server`]；由 Router 调 LLM 后返回回答）。
+//!
+//! **v1.2 additive**：`tool_call` / `task` 支持 `async:true`；新增
+//! `cancel {cmd_id}` / `commands` / `admin` / `jump` 方法；`link` 响应追加
+//! 实际监听地址键（tcp:`listen_addr`、mqtt:`mqtt_addr`）；`status` 追加
+//! `link_info` / `inflight` / `counters` / `clock_synced`；新增无 id 的
+//! `{"method":"command_result","params":{...}}` 完成通知。均为纯增量——
+//! 旧插件不调用 / 不读取时行为不变。
 //!
 //! - 请求：`{"id":<整数>,"method":"<名>","params":{...}}`
 //! - 响应：`{"id":..,"ok":true,"result":{...}}` /
@@ -30,24 +42,29 @@
 //!   `{"event":"worker_online","worker_id":"..","worker":{...}}`、
 //!   `{"event":"worker_offline","worker_id":".."}`
 //! - 方法：link / link_off / workers / tool_call / task / policy.get /
-//!   policy.set / status / shutdown / prompt（v1.1 additive）
+//!   policy.set / status / shutdown / prompt（v1.1 additive）/
+//!   cancel / commands / jump / admin（v1.2 additive）
 //! - 畸形 JSON 行：跳行回 `invalid_json`；无法取 id 时以通知形式
 //!   `{"event":"invalid_json","message":"..."}` 回错，进程不得崩溃。
 //! - stdin EOF 或 shutdown 请求：优雅退出，进程退出码 0。
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use sekai::sekai_device_list::Endpoint;
+use sekai::sekai_device_list::{Device, DeviceList, Endpoint};
 use sekai::sekai_wire::validate_worker_id;
 
 use crate::agent::AgentConfig;
 use crate::agent::retryable_gateway_code;
 use crate::config;
-use crate::control::{CommandKind, CommandRequest};
+use crate::control::{
+    CommandKind, CommandRequest, GatewayDiagnostics, InflightCommand, LateResult,
+};
 use crate::direct_gateway::DirectMode;
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::http::StdHttpClient;
@@ -68,6 +85,8 @@ const CODE_UNKNOWN_METHOD: &str = "unknown_method";
 const CODE_LINK_ERROR: &str = "link_error";
 /// 链路关闭后的描述。
 const DESC_OFFLINE: &str = "未连接";
+/// `status` / `commands` 里最多列出的在途命令条数。
+const MAX_LISTED_INFLIGHT: usize = 32;
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -112,6 +131,8 @@ pub struct ServeConfig {
     /// prompt ingress 监听地址（`--prompt-addr`；None = 不起 ingress，
     /// serve 的 `prompt` 方法仍可用）。
     pub prompt_addr: Option<String>,
+    /// trace JSONL 路径（`--trace`；serve 下对 prompt/agent 生效，B8）。
+    pub trace_path: Option<PathBuf>,
 }
 
 impl ServeConfig {
@@ -135,6 +156,7 @@ impl ServeConfig {
             temperature: 0.0,
             max_tokens: 4_096,
             prompt_addr: config.prompt_addr.clone(),
+            trace_path: config.trace_path.clone(),
         }
     }
 
@@ -148,7 +170,7 @@ impl ServeConfig {
             mqtt_username: None,
             mqtt_password: None,
             topic_root: TopicRoot::new("sekai/v1").expect("默认主题根合法"),
-            default_ddl_ms: 1_000,
+            default_ddl_ms: config::DEFAULT_DDL_MS,
             tool_timeout_ms: None,
             task_timeout_ms: None,
             api_key: None,
@@ -158,6 +180,7 @@ impl ServeConfig {
             temperature: 0.0,
             max_tokens: 4_096,
             prompt_addr: None,
+            trace_path: None,
         }
     }
 }
@@ -174,6 +197,192 @@ impl ServeConfig {
 struct PollView {
     handle: Option<GatewayHandle>,
     baseline: Vec<String>,
+    /// 上一次观测到的网关就绪状态（用于 true→false / false→true 补发
+    /// link_state 通知，B11）。
+    last_ready: bool,
+    /// 当前链路描述（link_state 通知的 desc）。
+    desc: String,
+}
+
+// ---------------------------------------------------------------------------
+// 在途账本 / 后台任务
+// ---------------------------------------------------------------------------
+
+/// serve 侧在途命令账本项（与 ControlPlane 的诊断视图互补：这里额外记录
+/// 是否 async、是否已被取消）。
+#[derive(Debug, Clone)]
+struct LedgerEntry {
+    worker_id: String,
+    name: String,
+    kind: CommandKind,
+    started: Instant,
+    async_mode: bool,
+    cancelled: bool,
+}
+
+/// serve 侧在途账本（dispatcher 与后台线程共享）。
+///
+/// 晚到终态统一由 [`crate::control::ControlPlane::diagnostics`] 提供
+/// （环形 + 计数），serve 只维护“谁还在途、是否 async / 已取消”。
+#[derive(Debug, Default)]
+struct ServeLedger {
+    inflight: BTreeMap<u64, LedgerEntry>,
+}
+
+impl ServeLedger {
+    /// 登记一条已提交命令（cmd_id == 0 表示网关未知 id，不登记）。
+    fn begin(
+        &mut self,
+        cmd_id: u64,
+        worker_id: &str,
+        name: &str,
+        kind: CommandKind,
+        async_mode: bool,
+    ) {
+        if cmd_id == 0 {
+            return;
+        }
+        self.inflight.insert(
+            cmd_id,
+            LedgerEntry {
+                worker_id: String::from(worker_id),
+                name: String::from(name),
+                kind,
+                started: Instant::now(),
+                async_mode,
+                cancelled: false,
+            },
+        );
+    }
+
+    /// 命令结束（无论成功/失败）：返回账本项。
+    fn finish(&mut self, cmd_id: u64) -> Option<LedgerEntry> {
+        self.inflight.remove(&cmd_id)
+    }
+
+    /// 标记取消；返回该 cmd 是否仍在账本中。
+    fn mark_cancelled(&mut self, cmd_id: u64) -> bool {
+        match self.inflight.get_mut(&cmd_id) {
+            Some(entry) => {
+                entry.cancelled = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// 在途账本转 JSON 行（cmd_id / worker / name / elapsed）。
+    fn commands_json(&self) -> Vec<Json> {
+        self.inflight
+            .iter()
+            .take(MAX_LISTED_INFLIGHT)
+            .map(|(cmd_id, entry)| {
+                Json::object(vec![
+                    ("cmd_id", Json::from(*cmd_id)),
+                    ("worker_id", Json::string(entry.worker_id.as_str())),
+                    ("name", Json::string(entry.name.as_str())),
+                    ("kind", Json::string(entry.kind.as_str())),
+                    (
+                        "elapsed_ms",
+                        Json::from(entry.started.elapsed().as_millis() as u64),
+                    ),
+                    ("async", Json::Bool(entry.async_mode)),
+                    ("cancelled", Json::Bool(entry.cancelled)),
+                ])
+            })
+            .collect()
+    }
+}
+
+/// dispatcher 拆出的后台任务：在工作线程执行，返回要回写的 JSONL 行。
+pub struct Deferred {
+    id: i64,
+    label: String,
+    run: Box<dyn FnOnce() -> Vec<Json> + Send + 'static>,
+}
+
+impl Deferred {
+    /// 构造后台任务（`id` 为对应请求 id，线程启动失败时用于回错）。
+    fn new(
+        id: i64,
+        label: impl Into<String>,
+        run: Box<dyn FnOnce() -> Vec<Json> + Send + 'static>,
+    ) -> Self {
+        Self {
+            id,
+            label: label.into(),
+            run,
+        }
+    }
+
+    /// 对应请求 id。
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+
+    /// 任务标签（诊断用）。
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// 执行并返回输出行（只允许调用一次）。
+    pub fn run(self) -> Vec<Json> {
+        (self.run)()
+    }
+}
+
+/// 后台任务计数：EOF / shutdown 后等待收尾，保证 JSONL 行都写完再退出
+/// （生产 shutdown 直接 `process::exit`，本计数只服务于测试与优雅退出）。
+#[derive(Default)]
+struct JobTracker {
+    count: Mutex<usize>,
+    done: std::sync::Condvar,
+}
+
+impl JobTracker {
+    fn begin(&self) {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_add(1);
+    }
+
+    fn end(&self) {
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *count = count.saturating_sub(1);
+        self.done.notify_all();
+    }
+
+    fn wait_idle(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut count = self
+            .count
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *count > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (guard, _) = self
+                .done
+                .wait_timeout(count, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            count = guard;
+        }
+    }
+}
+
+/// 单步处理结果：（即时输出, 是否退出, 可选后台任务）。
+type Step = (Vec<Json>, bool, Option<Deferred>);
+
+/// 即时输出的 [`Step`]。
+fn immediate(messages: Vec<Json>) -> Step {
+    (messages, false, None)
 }
 
 /// serve 协议状态（网关句柄、链路描述、策略；dispatcher 线程独占）。
@@ -189,6 +398,8 @@ pub struct ServeState {
     /// prompt 通道共享核心（serve `prompt` 方法与 ingress 共用；
     /// None 时首次 prompt 请求按 config 惰性构造）。
     prompt_hub: Option<Arc<PromptCore<LlmClient>>>,
+    /// 在途账本 / 本地晚到终态（dispatcher 与后台任务线程共享）。
+    ledger: Arc<Mutex<ServeLedger>>,
 }
 
 impl ServeState {
@@ -202,6 +413,7 @@ impl ServeState {
             config,
             poll_view: Arc::new(Mutex::new(PollView::default())),
             prompt_hub: None,
+            ledger: Arc::new(Mutex::new(ServeLedger::default())),
         }
     }
 
@@ -244,100 +456,55 @@ impl ServeState {
 
     /// 处理一行输入；返回（JSON 输出行, 是否退出）。
     ///
+    /// 同步语义：拆出的后台任务在内联执行完才返回（测试 / 嵌入场景用）。
+    /// 运行层用 [`ServeState::step`] 把后台任务交给工作线程，保持可响应。
+    ///
     /// 任何畸形输入只影响该行（跳行回错），不会 panic，进程继续。
     pub fn handle_line(&mut self, line: &str) -> (Vec<Json>, bool) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return (Vec::new(), false);
+        let (mut messages, exit, deferred) = self.step(line);
+        if let Some(deferred) = deferred {
+            messages.extend(deferred.run());
         }
-        let value = match Json::parse(trimmed) {
-            Ok(value) => value,
-            Err(error) => {
-                // 畸形 JSON 取不到 id：以通知形式回 invalid_json
-                // （JsonError 的 Display 自带「JSON 解析失败（偏移 N）：」前缀）。
-                return (vec![invalid_json_notification(&error.to_string())], false);
-            }
-        };
-        if value.as_object().is_none() {
-            return (
-                vec![invalid_json_notification("请求必须是 JSON 对象")],
-                false,
-            );
-        }
-        let id = match value.get("id") {
-            None => {
-                return (vec![invalid_json_notification("请求缺少 id")], false);
-            }
-            Some(id) => match id.as_i64() {
-                Some(id) => id,
-                None => {
-                    return (vec![invalid_json_notification("请求 id 必须是整数")], false);
-                }
-            },
-        };
-        let method = match value.get("method") {
-            Some(Json::String(method)) => method.clone(),
-            None => {
-                return (
-                    vec![error_response(
-                        id,
-                        tools::CODE_INVALID_ARGUMENTS,
-                        "缺少必填参数 method",
-                    )],
-                    false,
-                );
-            }
-            Some(_) => {
-                return (
-                    vec![error_response(
-                        id,
-                        tools::CODE_INVALID_ARGUMENTS,
-                        "参数 method 必须是字符串",
-                    )],
-                    false,
-                );
-            }
-        };
-        let params = match value.get("params") {
-            None => Json::object(Vec::new()),
-            Some(value) if value.as_object().is_some() => value.clone(),
-            Some(_) => {
-                return (
-                    vec![error_response(
-                        id,
-                        tools::CODE_INVALID_ARGUMENTS,
-                        "参数 params 必须是 JSON 对象",
-                    )],
-                    false,
-                );
-            }
-        };
-        self.dispatch(id, &method, &params)
+        (messages, exit)
     }
 
+    /// 单步处理一行：即时输出 + 是否退出 + 可选后台任务（B3）。
+    ///
+    /// dispatcher 拿到 [`Deferred`] 后交给工作线程执行，结果经共享写队列
+    /// 按 id 回写；dispatcher 自身永不阻塞在长命令 / LLM 调用上。
+    pub fn step(&mut self, line: &str) -> Step {
+        let (id, method, params) = match parse_request(line) {
+            Ok(parsed) => parsed,
+            Err(messages) => return immediate(messages),
+        };
+        // shutdown：先回响应再退出（退出动作由运行层执行）。
+        if method == "shutdown" {
+            return (vec![ok_response(id, Json::Null)], true, None);
+        }
+        self.dispatch(id, &method, &params)
+    }
     /// 方法分发（参数已通过结构校验）。
-    fn dispatch(&mut self, id: i64, method: &str, params: &Json) -> (Vec<Json>, bool) {
+    fn dispatch(&mut self, id: i64, method: &str, params: &Json) -> Step {
         match method {
-            "link" => (self.method_link(id, params), false),
-            "link_off" => (self.method_link_off(id), false),
-            "workers" => (vec![self.method_workers(id)], false),
-            "tool_call" => (self.method_command(id, params, true), false),
-            "task" => (self.method_command(id, params, false), false),
-            "policy.get" => (vec![ok_response(id, self.policy_json())], false),
-            "policy.set" => (self.method_policy_set(id, params), false),
-            "status" => (vec![ok_response(id, self.status_json())], false),
+            "link" => immediate(self.method_link(id, params)),
+            "link_off" => immediate(self.method_link_off(id)),
+            "workers" => immediate(vec![self.method_workers(id)]),
+            "tool_call" => self.method_command(id, params, true),
+            "task" => self.method_command(id, params, false),
+            "cancel" => immediate(self.method_cancel(id, params)),
+            "commands" => immediate(vec![ok_response(id, self.method_commands())]),
+            "jump" => self.method_jump(id, params),
+            "admin" => self.method_admin(id, params),
+            "policy.get" => immediate(vec![ok_response(id, self.policy_json())]),
+            "policy.set" => immediate(self.method_policy_set(id, params)),
+            "status" => immediate(vec![ok_response(id, self.status_json())]),
             // v1.1 additive：prompt 方法（见模块注释与 prompt_server）。
-            "prompt" => (self.method_prompt(id, params), false),
-            // shutdown：先回响应再退出（退出动作由运行层执行）。
-            "shutdown" => (vec![ok_response(id, Json::Null)], true),
-            other => (
-                vec![error_response(
-                    id,
-                    CODE_UNKNOWN_METHOD,
-                    &format!("未知方法 {other}"),
-                )],
-                false,
-            ),
+            "prompt" => self.method_prompt(id, params),
+            other => immediate(vec![error_response(
+                id,
+                CODE_UNKNOWN_METHOD,
+                &format!("未知方法 {other}"),
+            )]),
         }
     }
 
@@ -415,6 +582,9 @@ impl ServeState {
                         Json::object(vec![
                             ("mode", Json::string("tcp")),
                             ("desc", Json::string(desc.as_str())),
+                            // v1.2 additive：插件读 listen_addr（B11）。
+                            ("listen_addr", Json::string(actual.as_str())),
+                            // 兼容旧字段。
                             ("addr", Json::string(actual.as_str())),
                         ]),
                     ),
@@ -485,6 +655,7 @@ impl ServeState {
                         Json::object(vec![
                             ("mode", Json::string("stdio")),
                             ("desc", Json::string(desc.as_str())),
+                            ("worker_bin", Json::string(worker_bin.as_str())),
                         ]),
                     ),
                     link_state_notification(&desc, true),
@@ -539,6 +710,8 @@ impl ServeState {
                         Json::object(vec![
                             ("mode", Json::string("mqtt")),
                             ("desc", Json::string(desc.as_str())),
+                            // v1.2 additive：插件读 mqtt_addr（B11）。
+                            ("mqtt_addr", Json::string(display.as_str())),
                         ]),
                     ),
                     link_state_notification(&desc, true),
@@ -595,49 +768,76 @@ impl ServeState {
     /// tool_call / task 方法：参数解析复用 tools::parse_call 严格校验，
     /// 策略在发布命令之前强制执行；结果与 agent tool 结果同形状
     /// （成功 command_result_json，本地 / 网关失败 failure_result_json）。
-    fn method_command(&mut self, id: i64, params: &Json, is_tool: bool) -> Vec<Json> {
+    ///
+    /// v1.2 additive：
+    /// - `async:true`：dispatcher 内只做提交，立刻回
+    ///   `{accepted:true,cmd_id,worker_id,kind,name}`；完成时工作线程发无 id 的
+    ///   `{"method":"command_result","params":{...}}` 通知；
+    /// - 默认（同步）路径也拆到后台线程执行，dispatcher 不阻塞。
+    ///
+    /// D5：名字在 Worker `tasks` 列表（或 pc.ask/pc.job）时按 Task 下发；
+    /// 策略分类仍按名字（见 `tools::check_policy_for_worker`）。
+    fn method_command(&mut self, id: i64, params: &Json, is_tool: bool) -> Step {
+        let async_mode = match parse_async_flag(params) {
+            Ok(value) => value,
+            Err(message) => {
+                return immediate(vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    &message,
+                )]);
+            }
+        };
+        let filtered = without_async_flag(params);
         let function = if is_tool {
             tools::FN_WORKER_TOOL
         } else {
             tools::FN_WORKER_TASK
         };
-        let parsed = match tools::parse_call(function, &params.to_compact_string()) {
+        let parsed = match tools::parse_call(function, &filtered.to_compact_string()) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return vec![error_response(
+                return immediate(vec![error_response(
                     id,
                     tools::CODE_INVALID_ARGUMENTS,
                     &error.to_string(),
-                )];
+                )]);
             }
         };
         let worker_id = String::from(parsed.worker_id().unwrap_or_default());
         let name = String::from(parsed.command_name().unwrap_or_default());
-        let kind = if is_tool {
+        let requested_kind = if is_tool {
             CommandKind::Tool
         } else {
             CommandKind::Task
         };
         let Some(mut gateway) = self.gateway.clone() else {
-            return vec![error_response(
+            return immediate(vec![error_response(
                 id,
                 CODE_LINK_ERROR,
                 "未连接：先 link tcp|stdio|mqtt",
-            )];
+            )]);
         };
-        if let Err(denied) = tools::check_policy(&self.policy, &parsed) {
-            return vec![ok_response(
+        // D5：先看 Worker 能力快照（策略分类与线类型都要用 tasks 列表）。
+        let worker = gateway
+            .list_workers()
+            .into_iter()
+            .find(|worker| worker.worker_id == worker_id);
+        if let Err(denied) = tools::check_policy_for_worker(&self.policy, &parsed, worker.as_ref())
+        {
+            return immediate(vec![ok_response(
                 id,
                 tools::failure_result_json(
                     &worker_id,
-                    Some(kind),
+                    Some(requested_kind),
                     &name,
                     tools::CODE_POLICY_DENIED,
                     &denied.to_string(),
                     false,
                 ),
-            )];
+            )]);
         }
+        let kind = tools::route_command_kind(worker.as_ref(), &name, requested_kind);
         let request = CommandRequest {
             timeout_ms: if is_tool {
                 self.config.tool_timeout_ms
@@ -650,9 +850,115 @@ impl ServeState {
             name: name.clone(),
             args: parsed.args().as_bytes().to_vec(),
         };
-        match gateway.call(request) {
-            Ok(result) => vec![ok_response(id, tools::command_result_json(&result))],
-            Err(error) => vec![ok_response(
+        if async_mode {
+            return self.spawn_async_command(id, gateway, request, worker_id, name, kind);
+        }
+        let job_ledger = Arc::clone(&self.ledger);
+        let worker_id_job = worker_id.clone();
+        let name_job = name.clone();
+        let deferred = Deferred::new(
+            id,
+            "command",
+            Box::new(move || match gateway.submit(request) {
+                Ok(receipt) => {
+                    let cmd_id = receipt.cmd_id();
+                    begin_ledger(&job_ledger, cmd_id, &worker_id_job, &name_job, kind, false);
+                    let outcome = receipt.wait();
+                    let cancelled = finish_ledger(&job_ledger, cmd_id)
+                        .map(|entry| entry.cancelled)
+                        .unwrap_or(false);
+                    match outcome {
+                        Ok(result) => vec![ok_response(
+                            id,
+                            command_result_json_with_cancel(&result, cancelled),
+                        )],
+                        Err(error) => vec![ok_response(
+                            id,
+                            tools::failure_result_json(
+                                &worker_id_job,
+                                Some(kind),
+                                &name_job,
+                                &error.code,
+                                &error.message,
+                                retryable_gateway_code(&error.code),
+                            ),
+                        )],
+                    }
+                }
+                Err(error) => vec![ok_response(
+                    id,
+                    tools::failure_result_json(
+                        &worker_id_job,
+                        Some(kind),
+                        &name_job,
+                        &error.code,
+                        &error.message,
+                        retryable_gateway_code(&error.code),
+                    ),
+                )],
+            }),
+        );
+        (Vec::new(), false, Some(deferred))
+    }
+
+    /// 异步命令：dispatcher 内完成提交并立刻回 accepted；完成时后台线程
+    /// 发无 id 的 `command_result` 通知。
+    fn spawn_async_command(
+        &mut self,
+        id: i64,
+        mut gateway: GatewayHandle,
+        request: CommandRequest,
+        worker_id: String,
+        name: String,
+        kind: CommandKind,
+    ) -> Step {
+        match gateway.submit(request) {
+            Ok(receipt) => {
+                let cmd_id = receipt.cmd_id();
+                begin_ledger(&self.ledger, cmd_id, &worker_id, &name, kind, true);
+                let ledger = Arc::clone(&self.ledger);
+                let worker_id_job = worker_id.clone();
+                let name_job = name.clone();
+                let deferred = Deferred::new(
+                    id,
+                    "async-command",
+                    Box::new(move || {
+                        let outcome = receipt.wait();
+                        let cancelled = finish_ledger(&ledger, cmd_id)
+                            .map(|entry| entry.cancelled)
+                            .unwrap_or(false);
+                        match outcome {
+                            Ok(result) => {
+                                vec![command_result_notification(&result, cancelled)]
+                            }
+                            Err(error) => vec![command_error_notification(
+                                &worker_id_job,
+                                Some(kind),
+                                &name_job,
+                                &error.code,
+                                &error.message,
+                                retryable_gateway_code(&error.code),
+                                cancelled,
+                            )],
+                        }
+                    }),
+                );
+                immediate_with_deferred(
+                    vec![ok_response(
+                        id,
+                        Json::object(vec![
+                            ("accepted", Json::Bool(true)),
+                            ("cmd_id", Json::from(cmd_id)),
+                            ("worker_id", Json::string(worker_id.as_str())),
+                            ("kind", Json::string(kind.as_str())),
+                            ("name", Json::string(name.as_str())),
+                            ("async", Json::Bool(true)),
+                        ]),
+                    )],
+                    deferred,
+                )
+            }
+            Err(error) => immediate(vec![ok_response(
                 id,
                 tools::failure_result_json(
                     &worker_id,
@@ -662,7 +968,405 @@ impl ServeState {
                     &error.message,
                     retryable_gateway_code(&error.code),
                 ),
+            )]),
+        }
+    }
+
+    // ---- cancel / commands（B2）----
+
+    /// cancel 方法：`{cmd_id}` → 网关取消（内部映射 Worker 并下发 sekai.cancel）。
+    fn method_cancel(&mut self, id: i64, params: &Json) -> Vec<Json> {
+        if let Err(error) = tools::check_fields(params, &["cmd_id"]) {
+            return vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                &error.to_string(),
+            )];
+        }
+        let cmd_id = match params.get("cmd_id").and_then(Json::as_u64) {
+            Some(cmd_id) if cmd_id > 0 => cmd_id,
+            _ => {
+                return vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "参数 cmd_id 必须是正整数",
+                )];
+            }
+        };
+        self.cancel_quiet(id, cmd_id)
+    }
+
+    /// 取消实现（cancel 方法与 admin op=cancel 共用）。
+    fn cancel_quiet(&mut self, id: i64, cmd_id: u64) -> Vec<Json> {
+        let Some(mut gateway) = self.gateway.clone() else {
+            return vec![error_response(
+                id,
+                CODE_LINK_ERROR,
+                "未连接：先 link tcp|stdio|mqtt",
+            )];
+        };
+        let known = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .mark_cancelled(cmd_id);
+        match gateway.cancel(cmd_id) {
+            Ok(()) => vec![ok_response(
+                id,
+                Json::object(vec![
+                    ("cmd_id", Json::from(cmd_id)),
+                    ("cancelled", Json::Bool(true)),
+                    ("known", Json::Bool(known)),
+                ]),
             )],
+            Err(error) => vec![error_response(id, &error.code, &error.message)],
+        }
+    }
+
+    /// commands 方法：列出在途账本（cmd_id / worker / name / elapsed）。
+    ///
+    /// 合并网关侧诊断（含自动对时等内部命令）与 serve 自身账本（异步标记
+    /// 更准）；同一 cmd_id 以 serve 账本为准。响应为标准信封
+    /// `{id,ok,result:{count,commands}}`（与 status/policy.get 一致）。
+    fn method_commands(&mut self) -> Json {
+        let diagnostics = self.gateway_diagnostics();
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .commands_json();
+        let ledger_ids: Vec<u64> = ledger
+            .iter()
+            .filter_map(|item| item.get("cmd_id").and_then(Json::as_u64))
+            .collect();
+        let mut commands: Vec<Json> = ledger;
+        for command in diagnostics.inflight.iter() {
+            if ledger_ids.contains(&command.cmd_id) {
+                continue;
+            }
+            commands.push(Json::object(vec![
+                ("cmd_id", Json::from(command.cmd_id)),
+                ("worker_id", Json::string(command.worker_id.as_str())),
+                ("name", Json::string(command.name.as_str())),
+                ("elapsed_ms", Json::from(command.elapsed_ms)),
+                ("async", Json::Bool(false)),
+                ("cancelled", Json::Bool(false)),
+            ]));
+        }
+        Json::object(vec![
+            ("count", Json::from(commands.len())),
+            ("commands", Json::Array(commands)),
+        ])
+    }
+
+    // ---- jump / admin（B6/B7，均受 --allow-admin）----
+
+    /// jump 方法：`{worker_id,target}` → `CommandKind::Jump`（后台等待最终事件）。
+    fn method_jump(&mut self, id: i64, params: &Json) -> Step {
+        if let Err(message) = self.require_admin() {
+            return immediate(vec![error_response(
+                id,
+                tools::CODE_POLICY_DENIED,
+                &message,
+            )]);
+        }
+        if let Err(error) = tools::check_fields(params, &["worker_id", "target"]) {
+            return immediate(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                &error.to_string(),
+            )]);
+        }
+        let worker_id = match params.get("worker_id").and_then(Json::as_str) {
+            Some(worker_id) if !worker_id.is_empty() => String::from(worker_id),
+            _ => {
+                return immediate(vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "缺少必填参数 worker_id（字符串）",
+                )]);
+            }
+        };
+        let target = match params.get("target").and_then(Json::as_str) {
+            Some(target) if !target.is_empty() => String::from(target),
+            _ => {
+                return immediate(vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "缺少必填参数 target（字符串）",
+                )]);
+            }
+        };
+        let Some(mut gateway) = self.gateway.clone() else {
+            return immediate(vec![error_response(
+                id,
+                CODE_LINK_ERROR,
+                "未连接：先 link tcp|stdio|mqtt",
+            )]);
+        };
+        let ledger = Arc::clone(&self.ledger);
+        let worker_id_job = worker_id.clone();
+        let target_job = target.clone();
+        let deferred = Deferred::new(
+            id,
+            "jump",
+            Box::new(move || {
+                let request = CommandRequest::jump(worker_id_job.as_str(), target_job.as_str());
+                match gateway.submit(request) {
+                    Ok(receipt) => {
+                        let cmd_id = receipt.cmd_id();
+                        begin_ledger(
+                            &ledger,
+                            cmd_id,
+                            &worker_id_job,
+                            &target_job,
+                            CommandKind::Jump,
+                            false,
+                        );
+                        let outcome = receipt.wait();
+                        finish_ledger(&ledger, cmd_id);
+                        match outcome {
+                            Ok(result) => {
+                                vec![ok_response(id, tools::command_result_json(&result))]
+                            }
+                            Err(error) => vec![ok_response(
+                                id,
+                                tools::failure_result_json(
+                                    &worker_id_job,
+                                    Some(CommandKind::Jump),
+                                    &target_job,
+                                    &error.code,
+                                    &error.message,
+                                    retryable_gateway_code(&error.code),
+                                ),
+                            )],
+                        }
+                    }
+                    Err(error) => vec![ok_response(
+                        id,
+                        tools::failure_result_json(
+                            &worker_id_job,
+                            Some(CommandKind::Jump),
+                            &target_job,
+                            &error.code,
+                            &error.message,
+                            retryable_gateway_code(&error.code),
+                        ),
+                    )],
+                }
+            }),
+        );
+        (Vec::new(), false, Some(deferred))
+    }
+
+    /// admin 方法（受 `--allow-admin`）：`set_time` / `cancel` / `workers.set`。
+    ///
+    /// - `{op:"set_time", worker_id, unix_ms?}` → sekai.set_time（8 字节大端）；
+    /// - `{op:"cancel", cmd_id}` → 同 cancel 方法；
+    /// - `{op:"workers.set", worker_id, workers:[{name,ip,port}...]}` →
+    ///   JSON 转 DeviceList 二进制后下发 sekai.workers.set。
+    ///
+    /// 走 `submit_control`（绕过在途上限；自动对时不经过这里、也不受
+    /// allow_admin 限制）。
+    fn method_admin(&mut self, id: i64, params: &Json) -> Step {
+        if let Err(message) = self.require_admin() {
+            return immediate(vec![error_response(
+                id,
+                tools::CODE_POLICY_DENIED,
+                &message,
+            )]);
+        }
+        if let Err(error) =
+            tools::check_fields(params, &["op", "worker_id", "unix_ms", "cmd_id", "workers"])
+        {
+            return immediate(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                &error.to_string(),
+            )]);
+        }
+        let op = match params.get("op").and_then(Json::as_str) {
+            Some(op) => String::from(op),
+            None => {
+                return immediate(vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "缺少必填参数 op（set_time/cancel/workers.set）",
+                )]);
+            }
+        };
+        match op.as_str() {
+            "cancel" => {
+                let cmd_id = match params.get("cmd_id").and_then(Json::as_u64) {
+                    Some(cmd_id) if cmd_id > 0 => cmd_id,
+                    _ => {
+                        return immediate(vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            "缺少必填参数 cmd_id（正整数）",
+                        )]);
+                    }
+                };
+                return immediate(self.cancel_quiet(id, cmd_id));
+            }
+            "set_time" => {
+                let worker_id = match params.get("worker_id").and_then(Json::as_str) {
+                    Some(worker_id) if !worker_id.is_empty() => String::from(worker_id),
+                    _ => {
+                        return immediate(vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            "缺少必填参数 worker_id（字符串）",
+                        )]);
+                    }
+                };
+                let unix_ms = match params.get("unix_ms") {
+                    None | Some(Json::Null) => now_unix_ms(),
+                    Some(value) => match value.as_u64() {
+                        Some(value) => value,
+                        None => {
+                            return immediate(vec![error_response(
+                                id,
+                                tools::CODE_INVALID_ARGUMENTS,
+                                "参数 unix_ms 必须是非负整数",
+                            )]);
+                        }
+                    },
+                };
+                let payload = unix_ms.to_be_bytes().to_vec();
+                self.spawn_control(id, worker_id, "sekai.set_time", payload, op)
+            }
+            "workers.set" => {
+                let worker_id = match params.get("worker_id").and_then(Json::as_str) {
+                    Some(worker_id) if !worker_id.is_empty() => String::from(worker_id),
+                    _ => {
+                        return immediate(vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            "缺少必填参数 worker_id（字符串）",
+                        )]);
+                    }
+                };
+                let list = match parse_device_list(params.get("workers")) {
+                    Ok(list) => list,
+                    Err(message) => {
+                        return immediate(vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            &message,
+                        )]);
+                    }
+                };
+                let encoded = match list.encode() {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        return immediate(vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            &format!("workers 编码失败：{error}"),
+                        )]);
+                    }
+                };
+                self.spawn_control(id, worker_id, "sekai.workers.set", encoded, op)
+            }
+            other => immediate(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                &format!("admin op 不支持 {other}（可选 set_time/cancel/workers.set）"),
+            )]),
+        }
+    }
+
+    /// 后台执行一条管理控制命令（`submit_control` + 等待结果）。
+    fn spawn_control(
+        &mut self,
+        id: i64,
+        worker_id: String,
+        name: &'static str,
+        payload: Vec<u8>,
+        op: String,
+    ) -> Step {
+        let Some(mut gateway) = self.gateway.clone() else {
+            return immediate(vec![error_response(
+                id,
+                CODE_LINK_ERROR,
+                "未连接：先 link tcp|stdio|mqtt",
+            )]);
+        };
+        let ledger = Arc::clone(&self.ledger);
+        let deferred = Deferred::new(
+            id,
+            "admin",
+            Box::new(move || {
+                let request = CommandRequest {
+                    worker_id: worker_id.clone(),
+                    kind: CommandKind::Tool,
+                    name: String::from(name),
+                    args: payload,
+                    ddl_ms: 0,
+                    timeout_ms: None,
+                };
+                match gateway.submit_control(request) {
+                    Ok(receipt) => {
+                        let cmd_id = receipt.cmd_id();
+                        begin_ledger(&ledger, cmd_id, &worker_id, name, CommandKind::Tool, false);
+                        let outcome = receipt.wait();
+                        finish_ledger(&ledger, cmd_id);
+                        match outcome {
+                            Ok(result) => vec![ok_response(
+                                id,
+                                Json::object(vec![
+                                    ("op", Json::string(op.as_str())),
+                                    ("cmd_id", Json::from(cmd_id)),
+                                    ("result", tools::command_result_json(&result)),
+                                ]),
+                            )],
+                            Err(error) => vec![ok_response(
+                                id,
+                                tools::failure_result_json(
+                                    &worker_id,
+                                    Some(CommandKind::Tool),
+                                    name,
+                                    &error.code,
+                                    &error.message,
+                                    retryable_gateway_code(&error.code),
+                                ),
+                            )],
+                        }
+                    }
+                    Err(error) => vec![ok_response(
+                        id,
+                        tools::failure_result_json(
+                            &worker_id,
+                            Some(CommandKind::Tool),
+                            name,
+                            &error.code,
+                            &error.message,
+                            retryable_gateway_code(&error.code),
+                        ),
+                    )],
+                }
+            }),
+        );
+        (Vec::new(), false, Some(deferred))
+    }
+
+    /// 管理命令前置校验：`--allow-admin` 未开启时返回策略拒绝消息。
+    fn require_admin(&self) -> Result<(), String> {
+        if self.policy.allow_admin {
+            Ok(())
+        } else {
+            Err(String::from(
+                "管理命令未授权：启动时加 --allow-admin（或 policy.set allow_admin=true）",
+            ))
+        }
+    }
+
+    /// 网关诊断快照（无网关时返回默认值）。
+    fn gateway_diagnostics(&mut self) -> GatewayDiagnostics {
+        match self.gateway.clone() {
+            Some(mut gateway) => gateway.diagnostics(),
+            None => GatewayDiagnostics::default(),
         }
     }
 
@@ -740,7 +1444,9 @@ impl ServeState {
 
     /// prompt 方法：参数解析与执行复用 [`crate::prompt_server`]（与 TCP
     /// ingress 同一核心）；hub 惰性构造，无 API key → `llm_unavailable`。
-    fn method_prompt(&mut self, id: i64, params: &Json) -> Vec<Json> {
+    ///
+    /// LLM 调用可能持续数秒：拆到后台线程执行（B3），dispatcher 不阻塞。
+    fn method_prompt(&mut self, id: i64, params: &Json) -> Step {
         if self.prompt_hub.is_none() {
             let hub = build_prompt_hub(&self.config, self.policy.clone());
             self.prompt_hub = Some(Arc::clone(&hub));
@@ -753,25 +1459,97 @@ impl ServeState {
             .prompt_hub
             .as_ref()
             .expect("上面已保证 prompt_hub 存在");
-        match prompt_server::dispatch_prompt(hub, params) {
-            Ok(result) => vec![ok_response(id, result)],
-            Err(error) => vec![error_response(id, &error.code, &error.message)],
-        }
+        let hub = Arc::clone(hub);
+        let params = params.clone();
+        let deferred = Deferred::new(
+            id,
+            "prompt",
+            Box::new(
+                move || match prompt_server::dispatch_prompt(&hub, &params) {
+                    Ok(result) => vec![ok_response(id, result)],
+                    Err(error) => vec![error_response(id, &error.code, &error.message)],
+                },
+            ),
+        );
+        (Vec::new(), false, Some(deferred))
     }
 
     // ---- status ----
 
     /// status 方法：链路描述 / 模式 / 就绪 / Worker 数 / 策略摘要 / 版本 / pid。
-    fn status_json(&self) -> Json {
+    ///
+    /// v1.2 additive（B8）：`link_info{state,workers,last_error}`、
+    /// `inflight[]`、`counters{late_results,dropped_events}`、
+    /// `clock_synced`、`late_results[]`。旧 `link` 字符串字段保留。
+    fn status_json(&mut self) -> Json {
         let (ready, worker_count) = match self.gateway.clone() {
             Some(mut gateway) => (gateway.is_ready(), gateway.list_workers().len()),
             None => (false, 0),
         };
+        let diagnostics = self.gateway_diagnostics();
+        let ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inflight: Vec<Json> = ledger.commands_json();
+        let known: Vec<u64> = inflight
+            .iter()
+            .filter_map(|item| item.get("cmd_id").and_then(Json::as_u64))
+            .collect();
+        for command in diagnostics.inflight.iter().take(MAX_LISTED_INFLIGHT) {
+            if known.contains(&command.cmd_id) {
+                continue;
+            }
+            inflight.push(inflight_json(command));
+        }
+        // 晚到终态统一来自控制面诊断（serve 不再本地累积，B8）。
+        let late: Vec<Json> = diagnostics
+            .late_results
+            .iter()
+            .map(late_result_json)
+            .collect();
+        let late_count = diagnostics.counters.late_results;
+        drop(ledger);
+        let state = if self.gateway.is_none() {
+            "off"
+        } else if ready {
+            "ready"
+        } else {
+            "down"
+        };
         Json::object(vec![
             ("link", Json::string(self.link_desc.as_str())),
+            ("link_desc", Json::string(self.link_desc.as_str())),
+            (
+                "link_info",
+                Json::object(vec![
+                    ("state", Json::string(state)),
+                    ("workers", Json::from(worker_count)),
+                    (
+                        "last_error",
+                        match &diagnostics.last_error {
+                            Some(error) => Json::string(error.as_str()),
+                            None => Json::Null,
+                        },
+                    ),
+                ]),
+            ),
             ("mode", Json::string(self.link_mode)),
             ("ready", Json::Bool(ready)),
-            ("worker_count", Json::num(worker_count as i64)),
+            ("worker_count", Json::from(worker_count)),
+            ("inflight", Json::Array(inflight)),
+            (
+                "counters",
+                Json::object(vec![
+                    ("late_results", Json::from(late_count)),
+                    (
+                        "dropped_events",
+                        Json::from(diagnostics.counters.dropped_events),
+                    ),
+                ]),
+            ),
+            ("clock_synced", Json::Bool(diagnostics.clock_synced)),
+            ("late_results", Json::Array(late)),
             ("policy", Json::string(self.policy.summary())),
             ("version", Json::string(config::version_text())),
             ("pid", Json::num(i64::from(std::process::id()))),
@@ -805,6 +1583,11 @@ impl ServeState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         view.handle = self.gateway.clone();
+        view.desc = self.link_desc.clone();
+        view.last_ready = match self.gateway.clone() {
+            Some(gateway) => gateway.is_ready(),
+            None => false,
+        };
         view.baseline = match self.gateway.clone() {
             Some(mut gateway) => gateway
                 .list_workers()
@@ -860,12 +1643,225 @@ fn build_prompt_hub(config: &ServeConfig, policy: Policy) -> Arc<PromptCore<LlmC
         temperature: config.temperature,
         max_tokens: config.max_tokens,
     };
-    Arc::new(PromptCore::lazy(
-        builder,
-        policy,
-        agent_config,
-        TraceWriter::disabled(),
-    ))
+    let trace = match TraceWriter::new(config.trace_path.as_deref()) {
+        Ok(trace) => trace,
+        Err(error) => {
+            eprintln!("sekai-router: serve trace 打开失败，改为禁用：{error}");
+            TraceWriter::disabled()
+        }
+    };
+    Arc::new(PromptCore::lazy(builder, policy, agent_config, trace))
+}
+
+// ---------------------------------------------------------------------------
+// 请求解析 / 后台任务 / 诊断辅助
+// ---------------------------------------------------------------------------
+
+/// 解析一行 JSONL 请求；失败时返回要回写的错误消息（跳行回错）。
+fn parse_request(line: &str) -> Result<(i64, String, Json), Vec<Json>> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(Vec::new());
+    }
+    let value = match Json::parse(trimmed) {
+        Ok(value) => value,
+        Err(error) => {
+            // 畸形 JSON 取不到 id：以通知形式回 invalid_json
+            // （JsonError 的 Display 自带「JSON 解析失败（偏移 N）：」前缀）。
+            return Err(vec![invalid_json_notification(&error.to_string())]);
+        }
+    };
+    if value.as_object().is_none() {
+        return Err(vec![invalid_json_notification("请求必须是 JSON 对象")]);
+    }
+    let id = match value.get("id") {
+        None => return Err(vec![invalid_json_notification("请求缺少 id")]),
+        Some(id) => match id.as_i64() {
+            Some(id) => id,
+            None => return Err(vec![invalid_json_notification("请求 id 必须是整数")]),
+        },
+    };
+    let method = match value.get("method") {
+        Some(Json::String(method)) => method.clone(),
+        None => {
+            return Err(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                "缺少必填参数 method",
+            )]);
+        }
+        Some(_) => {
+            return Err(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                "参数 method 必须是字符串",
+            )]);
+        }
+    };
+    let params = match value.get("params") {
+        None => Json::object(Vec::new()),
+        Some(value) if value.as_object().is_some() => value.clone(),
+        Some(_) => {
+            return Err(vec![error_response(
+                id,
+                tools::CODE_INVALID_ARGUMENTS,
+                "参数 params 必须是 JSON 对象",
+            )]);
+        }
+    };
+    Ok((id, method, params))
+}
+
+/// `params.async` 解析（非布尔 → 中文错误）。
+fn parse_async_flag(params: &Json) -> Result<bool, String> {
+    match params.get("async") {
+        None | Some(Json::Null) => Ok(false),
+        Some(Json::Bool(value)) => Ok(*value),
+        Some(_) => Err(String::from("参数 async 必须是布尔值")),
+    }
+}
+
+/// 去掉 `async` 字段后的参数对象（其余字段交给 tools::parse_call 严格校验）。
+fn without_async_flag(params: &Json) -> Json {
+    let Some(entries) = params.as_object() else {
+        return params.clone();
+    };
+    let mut filtered = Json::object(Vec::new());
+    for (key, value) in entries {
+        if key != "async" {
+            filtered.set(key.clone(), value.clone());
+        }
+    }
+    filtered
+}
+
+/// 即时输出 + 后台任务的 [`Step`]。
+fn immediate_with_deferred(messages: Vec<Json>, deferred: Deferred) -> Step {
+    (messages, false, Some(deferred))
+}
+
+/// 登记在途命令（忽略 0 等未知 id）。
+fn begin_ledger(
+    ledger: &Arc<Mutex<ServeLedger>>,
+    cmd_id: u64,
+    worker_id: &str,
+    name: &str,
+    kind: CommandKind,
+    async_mode: bool,
+) {
+    ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .begin(cmd_id, worker_id, name, kind, async_mode);
+}
+
+/// 结束在途命令（返回账本项，用于读取 cancelled 标记）。
+fn finish_ledger(ledger: &Arc<Mutex<ServeLedger>>, cmd_id: u64) -> Option<LedgerEntry> {
+    ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .finish(cmd_id)
+}
+
+/// 成功/失败结果 JSON + `cancelled` 标记（取消后到达的终态仍如实回报）。
+fn command_result_json_with_cancel(
+    result: &crate::control::CommandResult,
+    cancelled: bool,
+) -> Json {
+    let mut value = tools::command_result_json(result);
+    if cancelled {
+        value.set("cancelled", Json::Bool(true));
+    }
+    value
+}
+
+/// 无 id 的异步完成通知：`{"method":"command_result","params":{...}}`。
+fn command_result_notification(result: &crate::control::CommandResult, cancelled: bool) -> Json {
+    Json::object(vec![
+        ("method", Json::string("command_result")),
+        ("params", command_result_json_with_cancel(result, cancelled)),
+    ])
+}
+
+/// 无 id 的异步失败通知（网关层错误，无 CommandResult）。
+#[allow(clippy::too_many_arguments)]
+fn command_error_notification(
+    worker_id: &str,
+    kind: Option<CommandKind>,
+    name: &str,
+    code: &str,
+    message: &str,
+    retryable: bool,
+    cancelled: bool,
+) -> Json {
+    let mut params = tools::failure_result_json(worker_id, kind, name, code, message, retryable);
+    if cancelled {
+        params.set("cancelled", Json::Bool(true));
+    }
+    Json::object(vec![
+        ("method", Json::string("command_result")),
+        ("params", params),
+    ])
+}
+
+/// 在途命令转 JSON（`inflight[]` / `commands` 共用形状）。
+fn inflight_json(command: &InflightCommand) -> Json {
+    Json::object(vec![
+        ("cmd_id", Json::from(command.cmd_id)),
+        ("worker_id", Json::string(command.worker_id.as_str())),
+        ("name", Json::string(command.name.as_str())),
+        ("elapsed_ms", Json::from(command.elapsed_ms)),
+        ("async", Json::Bool(false)),
+        ("cancelled", Json::Bool(false)),
+    ])
+}
+
+/// 晚到终态转 JSON。
+fn late_result_json(item: &LateResult) -> Json {
+    Json::object(vec![
+        ("cmd_id", Json::from(item.cmd_id)),
+        ("worker_id", Json::string(item.worker_id.as_str())),
+        ("code", Json::string(item.code.as_str())),
+        ("elapsed_ms", Json::from(item.elapsed_ms)),
+    ])
+}
+
+/// `admin workers.set` 的 JSON 数组 → [`DeviceList`]。
+fn parse_device_list(value: Option<&Json>) -> Result<DeviceList, String> {
+    let Some(Json::Array(items)) = value else {
+        return Err(String::from(
+            "缺少必填参数 workers（数组：[{name,ip,port}]）",
+        ));
+    };
+    let mut list = DeviceList::new();
+    for (index, item) in items.iter().enumerate() {
+        let name = item
+            .get("name")
+            .and_then(Json::as_str)
+            .ok_or_else(|| format!("workers[{index}].name 必须是字符串"))?;
+        let ip = item
+            .get("ip")
+            .and_then(Json::as_str)
+            .ok_or_else(|| format!("workers[{index}].ip 必须是字符串"))?;
+        let port = item
+            .get("port")
+            .and_then(Json::as_u64)
+            .ok_or_else(|| format!("workers[{index}].port 必须是整数"))?;
+        let port = u16::try_from(port).map_err(|_| format!("workers[{index}].port 超出范围"))?;
+        let device = Device::new(name, ip, port)
+            .map_err(|error| format!("workers[{index}] 非法：{error}"))?;
+        list.insert(device)
+            .map_err(|error| format!("workers[{index}] 无法加入列表：{error}"))?;
+    }
+    Ok(list)
+}
+
+/// 当前 Unix 毫秒（serve admin set_time 默认值）。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,17 +2052,48 @@ where
     let poll_view = state.poll_view();
     let (tx, rx) = mpsc::channel::<String>();
     let stop = Arc::new(AtomicBool::new(false));
+    let jobs = Arc::new(JobTracker::default());
 
-    // dispatcher：唯一状态所有者，串行处理请求（调用天然串行）。
+    // dispatcher：唯一状态所有者，串行处理请求；长方法拆成 Deferred 任务
+    // 交给工作线程（B3），dispatcher 自身不阻塞。
     let dispatcher_writer = Arc::clone(&writer);
     let dispatcher_stop = Arc::clone(&stop);
+    let dispatcher_jobs = Arc::clone(&jobs);
     let dispatcher = std::thread::Builder::new()
         .name(String::from("sekai-router-serve"))
         .spawn(move || {
             while let Ok(line) = rx.recv() {
-                let (messages, exit) = state.handle_line(&line);
+                let (messages, exit, deferred) = state.step(&line);
                 for message in &messages {
                     write_shared_line(&dispatcher_writer, message);
+                }
+                if let Some(deferred) = deferred {
+                    let job_writer = Arc::clone(&dispatcher_writer);
+                    let job_tracker = Arc::clone(&dispatcher_jobs);
+                    let label = String::from(deferred.label());
+                    let job_id = deferred.id();
+                    job_tracker.begin();
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("sekai-router-serve-{label}"))
+                        .spawn(move || {
+                            let messages = deferred.run();
+                            for message in &messages {
+                                write_shared_line(&job_writer, message);
+                            }
+                            job_tracker.end();
+                        });
+                    if let Err(error) = spawned {
+                        eprintln!("sekai-router: 后台任务线程启动失败：{error}");
+                        dispatcher_jobs.end();
+                        write_shared_line(
+                            &dispatcher_writer,
+                            &error_response(
+                                job_id,
+                                "internal_error",
+                                &format!("无法启动后台任务线程：{error}"),
+                            ),
+                        );
+                    }
                 }
                 if exit {
                     // shutdown：响应已写。停 poll、拆链路（Drop 停各 IO 线程），
@@ -1093,7 +2120,8 @@ where
         }
     };
 
-    // poll 线程：~200ms diff Worker 集合，发上线 / 离线通知。
+    // poll 线程：~200ms diff Worker 集合，发上线 / 离线通知；同时观测
+    // 网关 ready 变化，true→false / false→true 时补发 link_state 通知（B11）。
     let poll_writer = Arc::clone(&writer);
     let poll_stop = Arc::clone(&stop);
     let poller = std::thread::Builder::new()
@@ -1111,7 +2139,14 @@ where
                     let Some(mut handle) = view.handle.clone() else {
                         continue;
                     };
-                    worker_notifications(&mut view.baseline, &handle.list_workers())
+                    let mut notifications =
+                        worker_notifications(&mut view.baseline, &handle.list_workers());
+                    let ready = handle.is_ready();
+                    if ready != view.last_ready {
+                        view.last_ready = ready;
+                        notifications.push(link_state_notification(&view.desc, ready));
+                    }
+                    notifications
                 };
                 for notification in &notifications {
                     write_shared_line(&poll_writer, notification);
@@ -1149,6 +2184,8 @@ where
     let _ = dispatcher.join();
     stop.store(true, Ordering::Relaxed);
     let _ = poller.join();
+    // 等后台任务把结果行写完（最多 5s；shutdown 在测试里是 no-op）。
+    jobs.wait_idle(Duration::from_secs(5));
     let mut writer = writer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

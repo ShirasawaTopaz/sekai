@@ -15,21 +15,25 @@
 //! /link off                          关闭当前链路
 //! /workers                           列出已发现 Worker
 //! /wait [MS]                         阻塞等待 Worker 上线
+//! /cancel [id|last]                  取消当前后台目标（或指定 cmd_id 的在途命令）
 //! /policy [NAME on|off]              查看/切换 allow-write|allow-tasks|allow-admin
 //! /exit / /quit                      退出会话
 //! <非 / 开头输入>                     自然语言目标 → Agent 回路
 //! ```
 //!
-//! [`Session::poll`] 排空异步更新（Worker 上线通知），前端在空闲或每条
-//! 命令后调用。`/start` 挂起态下，非 '/' 输入由向导消费（选菜单/填参数），
-//! 任何 '/' 命令取消挂起态并照常执行。
+//! 前端（[`crate::repl`] / [`crate::tui`]）用 [`Session::submit_line`] 提交
+//! 普通输入：目标在**后台线程**里跑 Agent，[`Session::poll`] 消费完成事件，
+//! 期间界面保持可响应；[`Session::cancel_goal`] / `/cancel` 触发协作式取消
+//! （agent 会先向 Worker 下发 `sekai.cancel`）。[`Session::execute`] 保留
+//! 同步语义（测试与批处理用）。
 
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use sekai::sekai_device_list::Endpoint;
 
-use crate::agent::{Agent, AgentConfig, AgentError, AgentOutcome, AgentStatus};
+use crate::agent::{Agent, AgentConfig, AgentError, AgentOutcome, AgentStatus, CancelToken};
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::link_builder::{self, LinkOptions};
 use crate::llm::ChatClient;
@@ -87,11 +91,17 @@ impl SessionConfig {
             mqtt_password: None,
             topic_root: TopicRoot::new("sekai/v1").expect("默认主题根合法"),
             wait_worker_ms: 10_000,
-            default_ddl_ms: 1_000,
+            default_ddl_ms: crate::config::DEFAULT_DDL_MS,
             tool_timeout_ms: None,
             task_timeout_ms: None,
         }
     }
+}
+
+/// 后台目标执行状态（[`Session::start_goal`] 创建；[`Session::poll`] 消费）。
+struct GoalRun {
+    receiver: Receiver<Vec<SessionMessage>>,
+    started: Instant,
 }
 
 /// REPL / TUI 会话状态机。
@@ -111,6 +121,10 @@ pub struct Session<C: ChatClient + Clone> {
     /// prompt 通道共享核心（可选；ingress 由 bin 构造并注入，
     /// 建链/关链/策略变更时同步，见 [`Session::sync_hub`]）。
     hub: Option<Arc<PromptCore<C>>>,
+    /// 后台目标的协作式取消令牌（一次目标一个）。
+    cancel: CancelToken,
+    /// 正在后台执行的目标（None = 空闲）。
+    goal: Option<GoalRun>,
 }
 
 impl<C: ChatClient + Clone> Session<C> {
@@ -133,6 +147,8 @@ impl<C: ChatClient + Clone> Session<C> {
             wizard: None,
             last_workers: Vec::new(),
             hub: None,
+            cancel: CancelToken::new(),
+            goal: None,
         }
     }
 
@@ -164,11 +180,35 @@ impl<C: ChatClient + Clone> Session<C> {
 
     /// 排空异步更新（REPL 在每条命令后、TUI 在空闲时调用）。
     ///
-    /// 目前实现 Worker 上线通知：对比上次快照与
-    /// [`GatewayHandle::list_workers`]，新出现的 Worker 输出
-    /// 「Worker <id> 已上线」；无网关或无变化返回空。建链 / 注入 /
-    /// `/wait` 宣告后会刷新基线，因此 poll 只报此后真正新增的 Worker。
+    /// 先消费后台目标完成事件（若有），再对比上次快照与
+    /// [`GatewayHandle::list_workers`] 报新出现的 Worker；无网关或无变化返回空。
     pub fn poll(&mut self) -> Vec<SessionMessage> {
+        let mut messages = self.drain_goal_events();
+        messages.extend(self.poll_workers());
+        messages
+    }
+
+    /// 取后台目标的完成输出（非阻塞）；无目标 / 未完成返回空。
+    fn drain_goal_events(&mut self) -> Vec<SessionMessage> {
+        let Some(goal) = self.goal.as_ref() else {
+            return Vec::new();
+        };
+        match goal.receiver.try_recv() {
+            Ok(messages) => {
+                self.goal = None;
+                messages
+            }
+            Err(TryRecvError::Empty) => Vec::new(),
+            Err(TryRecvError::Disconnected) => {
+                self.goal = None;
+                vec![SessionMessage::Line(String::from(
+                    "后台执行线程已退出（无结果）",
+                ))]
+            }
+        }
+    }
+
+    fn poll_workers(&mut self) -> Vec<SessionMessage> {
         let Some(mut gateway) = self.gateway.clone() else {
             return Vec::new();
         };
@@ -271,6 +311,7 @@ impl<C: ChatClient + Clone> Session<C> {
             "/unlink" => self.link_off(),
             "/workers" => self.workers_lines(),
             "/wait" => self.wait_for_worker(tokens.get(1).copied()),
+            "/cancel" => self.cancel_command(tokens.get(1).copied()),
             "/policy" => self.policy_command(&tokens[1..]),
             other => vec![SessionMessage::Line(format!(
                 "未知命令 {other}（/help 查看命令列表）"
@@ -291,9 +332,10 @@ impl<C: ChatClient + Clone> Session<C> {
   /start                       引导式建连向导（别名 /connect）
   /workers                     列出已发现的 Worker
   /wait [MS]                   等待 Worker 上线（默认 {wait}ms）
+  /cancel [id|last]            取消当前后台目标；带 cmd_id 时取消该在途命令
   /policy [NAME on|off]        查看/切换权限（allow-write/allow-tasks/allow-admin）
   /exit                        退出会话
-其它任何输入都会作为自然语言目标交给 Agent 执行。"
+其它任何输入都会作为自然语言目标交给 Agent 执行（后台线程，可 /cancel 取消）。"
             .replace("{listen}", &self.config.listen_addr)
             .replace("{worker_bin}", &self.config.worker_bin)
             .replace("{wait}", &self.config.wait_worker_ms.to_string());
@@ -311,12 +353,86 @@ impl<C: ChatClient + Clone> Session<C> {
                 gateway.is_ready(),
                 workers.len()
             )));
+            // B8：诊断快照（在途账本 / 最近错误 / 晚到终态 / 时钟校准）。
+            let diagnostics = gateway.diagnostics();
+            if let Some(error) = &diagnostics.last_error {
+                lines.push(SessionMessage::Line(format!("最近错误：{error}")));
+            }
+            if !diagnostics.inflight.is_empty() {
+                lines.push(SessionMessage::Line(format!(
+                    "在途命令 {} 条：",
+                    diagnostics.inflight.len()
+                )));
+                for command in diagnostics.inflight.iter().take(8) {
+                    lines.push(SessionMessage::Line(format!(
+                        "  #{} {} {} 已运行 {}ms",
+                        command.cmd_id, command.worker_id, command.name, command.elapsed_ms
+                    )));
+                }
+            }
+            lines.push(SessionMessage::Line(format!(
+                "时钟校准：{} ｜ 晚到终态：{} 条（累计 {}）",
+                if diagnostics.clock_synced {
+                    "是"
+                } else {
+                    "否"
+                },
+                diagnostics.late_results.len(),
+                diagnostics.counters.late_results
+            )));
         } else {
             lines.push(SessionMessage::Line(String::from(
                 "未连接任何链路（/link tcp|stdio|mqtt）",
             )));
         }
+        if let Some(goal) = &self.goal {
+            lines.push(SessionMessage::Line(format!(
+                "目标执行中（{}ms）：/cancel 取消",
+                goal.started.elapsed().as_millis()
+            )));
+        }
         lines
+    }
+
+    /// `/cancel [id|last]`：无参/last 取消当前后台目标；数字取消指定在途命令。
+    fn cancel_command(&mut self, arg: Option<&str>) -> Vec<SessionMessage> {
+        match arg {
+            None | Some("last") => {
+                if self.goal.is_none() {
+                    return vec![SessionMessage::Line(String::from(
+                        "当前没有在后台执行的目标（带 cmd_id 可取消指定在途命令）",
+                    ))];
+                }
+                self.cancel.cancel();
+                vec![
+                    SessionMessage::Line(String::from("已请求取消当前目标")),
+                    SessionMessage::Line(String::from(
+                        "agent 会在 50ms 内向 Worker 下发 sekai.cancel 并停止后续派工",
+                    )),
+                ]
+            }
+            Some(text) => match text.parse::<u64>() {
+                Ok(cmd_id) => {
+                    let Some(mut gateway) = self.gateway.clone() else {
+                        return vec![SessionMessage::Line(String::from(
+                            "未连接（先 /link tcp|stdio|mqtt）",
+                        ))];
+                    };
+                    match gateway.cancel(cmd_id) {
+                        Ok(()) => vec![SessionMessage::Line(format!(
+                            "已请求取消命令 {cmd_id}（sekai.cancel）"
+                        ))],
+                        Err(error) => vec![SessionMessage::Line(format!(
+                            "取消命令 {cmd_id} 失败：{}",
+                            error.message
+                        ))],
+                    }
+                }
+                Err(_) => vec![SessionMessage::Line(format!(
+                    "/cancel 参数必须是 cmd_id 或 last：{text}"
+                ))],
+            },
+        }
     }
 
     fn link_command(&mut self, tokens: &[&str]) -> Vec<SessionMessage> {
@@ -656,6 +772,11 @@ impl<C: ChatClient + Clone> Session<C> {
     // ---- 目标执行 ----
 
     fn run_goal(&mut self, goal: &str) -> Vec<SessionMessage> {
+        if self.goal.is_some() {
+            return vec![SessionMessage::Line(String::from(
+                "已有目标在后台执行：/cancel 取消后再提交新目标",
+            ))];
+        }
         let Some(mut gateway) = self.gateway.clone() else {
             return vec![SessionMessage::Line(String::from(
                 "未连接：先 /link tcp|stdio|mqtt 建立链路，再 /wait 等 Worker 上线",
@@ -672,7 +793,144 @@ impl<C: ChatClient + Clone> Session<C> {
             self.policy.clone(),
             self.agent_config.clone(),
             self.trace.clone(),
-        );
+        )
+        .with_cancel(self.cancel.clone());
+        match agent.run(goal) {
+            Ok(outcome) => render_outcome(&outcome),
+            Err(error) => render_agent_error(&error),
+        }
+    }
+
+    // ---- 后台目标（B3：REPL/TUI 运行在后台线程 + 事件通道）----
+
+    /// 前端统一入口：`/` 命令与向导输入同步执行，自然语言目标放后台线程。
+    pub fn submit_line(&mut self, input: &str) -> Vec<SessionMessage>
+    where
+        C: Clone + Send + 'static,
+    {
+        let trimmed = input.trim();
+        if self.wizard.is_some() || trimmed.starts_with('/') || trimmed.is_empty() {
+            return self.execute(input);
+        }
+        self.start_goal(trimmed)
+    }
+
+    /// 启动后台目标；立即返回提示行，完成事件由 [`Session::poll`] 消费。
+    pub fn start_goal(&mut self, goal: &str) -> Vec<SessionMessage>
+    where
+        C: Clone + Send + 'static,
+    {
+        if self.goal.is_some() {
+            return vec![SessionMessage::Line(String::from(
+                "已有目标在后台执行：/cancel 取消后再提交新目标",
+            ))];
+        }
+        let Some(mut gateway) = self.gateway.clone() else {
+            return vec![SessionMessage::Line(String::from(
+                "未连接：先 /link tcp|stdio|mqtt 建立链路，再 /wait 等 Worker 上线",
+            ))];
+        };
+        if gateway.list_workers().is_empty() {
+            return vec![SessionMessage::Line(String::from(
+                "当前没有已发现的 Worker：先 /wait 等待上线（或检查 Worker 是否已连接）",
+            ))];
+        }
+        let mut runner = self.fork_for_goal();
+        runner.cancel = CancelToken::new();
+        self.cancel = runner.cancel.clone();
+        let goal = String::from(goal);
+        // 提示行在 spawn 前拼好：`goal` 会被 move 进工作线程。
+        let started_line = format!("已开始执行：{goal}");
+        let (sender, receiver) = mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(String::from("sekai-router-agent"))
+            .spawn(move || {
+                let messages = runner.run_goal_now(&goal);
+                let _ = sender.send(messages);
+            });
+        match spawned {
+            Ok(_handle) => {
+                self.goal = Some(GoalRun {
+                    receiver,
+                    started: Instant::now(),
+                });
+                vec![
+                    SessionMessage::Line(started_line),
+                    SessionMessage::Line(String::from(
+                        "后台执行中（界面保持可响应）；/cancel 可取消",
+                    )),
+                ]
+            }
+            Err(error) => vec![SessionMessage::Line(format!(
+                "无法启动后台执行线程：{error}"
+            ))],
+        }
+    }
+
+    /// 当前是否有后台目标在跑。
+    pub fn goal_running(&self) -> bool {
+        self.goal.is_some()
+    }
+
+    /// 后台目标已运行毫秒（无目标时 0；TUI 状态栏用）。
+    pub fn goal_elapsed_ms(&self) -> u64 {
+        self.goal
+            .as_ref()
+            .map(|goal| goal.started.elapsed().as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// 请求取消当前后台目标；返回是否有目标被取消。
+    pub fn cancel_goal(&mut self) -> bool {
+        if self.goal.is_some() {
+            self.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 复制一份会话给后台线程（丢弃向导 / 上次目标等一次性状态）。
+    fn fork_for_goal(&self) -> Session<C>
+    where
+        C: Clone,
+    {
+        Session {
+            chat: self.chat.clone(),
+            gateway: self.gateway.clone(),
+            link_desc: self.link_desc.clone(),
+            policy: self.policy.clone(),
+            agent_config: self.agent_config.clone(),
+            trace: self.trace.clone(),
+            config: self.config.clone(),
+            wizard: None,
+            last_workers: self.last_workers.clone(),
+            hub: self.hub.clone(),
+            cancel: self.cancel.clone(),
+            goal: None,
+        }
+    }
+
+    /// 在（后台）会话里同步跑 Agent 回路；返回渲染好的输出行。
+    fn run_goal_now(&mut self, goal: &str) -> Vec<SessionMessage> {
+        let Some(mut gateway) = self.gateway.clone() else {
+            return vec![SessionMessage::Line(String::from(
+                "未连接：先 /link tcp|stdio|mqtt 建立链路，再 /wait 等 Worker 上线",
+            ))];
+        };
+        if gateway.list_workers().is_empty() {
+            return vec![SessionMessage::Line(String::from(
+                "当前没有已发现的 Worker：先 /wait 等待上线（或检查 Worker 是否已连接）",
+            ))];
+        }
+        let mut agent = Agent::new(
+            self.chat.clone(),
+            gateway,
+            self.policy.clone(),
+            self.agent_config.clone(),
+            self.trace.clone(),
+        )
+        .with_cancel(self.cancel.clone());
         match agent.run(goal) {
             Ok(outcome) => render_outcome(&outcome),
             Err(error) => render_agent_error(&error),
@@ -950,7 +1208,13 @@ fn render_outcome(outcome: &AgentOutcome) -> Vec<SessionMessage> {
 
 /// Agent 错误 → 会话输出行（会话继续）。
 fn render_agent_error(error: &AgentError) -> Vec<SessionMessage> {
-    vec![SessionMessage::Line(format!("执行失败：{error}"))]
+    let text = error.to_string();
+    if text.contains("cancelled") {
+        return vec![SessionMessage::Line(String::from(
+            "目标已取消：已向 Worker 下发 sekai.cancel 并停止后续派工",
+        ))];
+    }
+    vec![SessionMessage::Line(format!("执行失败：{text}"))]
 }
 
 #[cfg(test)]

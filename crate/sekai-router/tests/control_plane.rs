@@ -9,7 +9,7 @@ use sekai::mqtt::qos::QoS;
 use sekai::mqtt::reason::ReasonCode;
 use sekai::sekai_device_list::DeviceList;
 use sekai::sekai_runtime::{CONTENT_TYPE_STDIN, CONTENT_TYPE_STDOUT};
-use sekai::sekai_stdin::Kind;
+use sekai::sekai_stdin::{JumpBody, Kind, Stdin, ToolBody};
 use sekai::sekai_stdout::{Hello, Phase, Stdout};
 use sekai::sekai_wire::ErrorCode;
 use sekai_gpio::{ChipFamily, Level, PinId, Port};
@@ -521,7 +521,7 @@ fn lwt_offline_fails_pending_with_worker_offline() {
 // ---- 未知命令 / 重复帧 / 能力更新 ----
 
 #[test]
-fn unknown_cmd_id_frames_are_ignored() {
+fn unknown_cmd_id_final_frames_are_recorded_as_late() {
     let mut harness = base_harness();
     let before = harness.command_results().len();
     let frame = Stdout::new(
@@ -535,9 +535,23 @@ fn unknown_cmd_id_frames_are_ignored() {
     .expect("Stdout 帧");
     harness.inject_stdout("esp32-1", &frame, false, Some(CONTENT_TYPE_STDOUT));
     harness.settle();
-    assert_eq!(harness.command_results().len(), before);
+    assert_eq!(
+        harness.command_results().len(),
+        before,
+        "未知 cmd_id 不产生结果"
+    );
+    // B8：记为晚到终态（环形 + 计数），而不是写 last_error。
+    let diagnostics = harness.server().diagnostics(harness.now_mono_ms());
+    assert_eq!(diagnostics.counters.late_results, 1);
+    let recorded = diagnostics
+        .late_results
+        .first()
+        .expect("未知 cmd_id 应进 late_results");
+    assert_eq!(recorded.cmd_id, 424_242);
+    assert_eq!(recorded.worker_id, "esp32-1");
+    assert_eq!(recorded.code, "completed");
     assert!(
-        harness
+        !harness
             .server()
             .last_error()
             .unwrap_or_default()
@@ -827,7 +841,7 @@ fn malformed_stdout_wrong_content_type_and_bad_topic_are_ignored() {
 }
 
 #[test]
-fn late_final_event_after_timeout_is_discarded() {
+fn late_final_event_after_timeout_is_recorded_as_late_result() {
     let mut harness = base_harness();
     harness.silence_worker("esp32-1", true);
     let cmd_id =
@@ -838,7 +852,8 @@ fn late_final_event_after_timeout_is_discarded() {
     assert_eq!(result.failure.expect("失败信息").code, "timeout");
     let finished_before = harness.finished_count(cmd_id);
 
-    // 最终事件晚到：按未知 cmd_id 忽略，不改变已返回结果。
+    // B8：最终事件晚到（已超时）不再当作正常终态，也不污染 last_error，
+    // 而是进环形 late_results 供 status/诊断读取。
     let late = Stdout::new(
         1,
         cmd_id,
@@ -850,13 +865,28 @@ fn late_final_event_after_timeout_is_discarded() {
     .expect("Stdout 帧");
     harness.inject_stdout("esp32-1", &late, false, Some(CONTENT_TYPE_STDOUT));
     harness.settle();
-    assert_eq!(harness.finished_count(cmd_id), finished_before);
+    assert_eq!(
+        harness.finished_count(cmd_id),
+        finished_before,
+        "晚到事件不得改写已返回的超时结果"
+    );
+    let diagnostics = harness.server().diagnostics(harness.now_mono_ms());
+    assert_eq!(diagnostics.counters.late_results, 1);
+    let recorded = diagnostics
+        .late_results
+        .first()
+        .expect("晚到终态应进 late_results");
+    assert_eq!(recorded.cmd_id, cmd_id);
+    assert_eq!(recorded.worker_id, "esp32-1");
+    assert_eq!(recorded.code, "completed");
     assert!(
-        harness
+        !harness
             .server()
             .last_error()
             .unwrap_or_default()
-            .contains("未知 cmd_id")
+            .contains("未知 cmd_id"),
+        "晚到终态不应写入 last_error：{:?}",
+        harness.server().last_error()
     );
 }
 
@@ -919,4 +949,155 @@ fn two_workers_are_isolated() {
         .collect();
     assert_eq!(online, vec![true, true]);
     harness.assert_no_errors();
+}
+
+// ---- v1.2：管理命令 / 取消 / 自动对时 / Jump（B2/B6/B7）----
+
+/// 解出服务端最近一次发给 Worker 的 Stdin 帧。
+fn last_server_stdin(harness: &Harness, worker_id: &str) -> Stdin {
+    harness
+        .last_stdin_publish(worker_id)
+        .expect("应有 stdin 发布")
+        .decode_stdin()
+        .expect("Stdin 帧可解码")
+}
+
+/// `submit_control` 绕过在途上限：长 Task 在途时管理命令仍可送达。
+#[test]
+fn submit_control_bypasses_inflight_limit() {
+    let mut harness = base_harness();
+    harness.silence_worker("esp32-1", true);
+    let _long_task = harness
+        .submit(CommandRequest::task("esp32-1", "sleep", b"60000".to_vec()).with_ddl(60_000));
+    harness.settle();
+    // 普通命令被在途上限挡住（默认每 Worker 1 条）。
+    assert!(matches!(
+        harness
+            .try_submit(CommandRequest::tool("esp32-1", "gpio.info", "IO4"))
+            .unwrap_err(),
+        ControlError::WorkerBusy(_)
+    ));
+
+    let now = harness.now_unix_ms();
+    let now_mono = harness.now_mono_ms();
+    let cmd_id = harness
+        .server_mut()
+        .submit_control(
+            "esp32-1",
+            "sekai.set_time",
+            now.to_be_bytes().to_vec(),
+            now,
+            now_mono,
+        )
+        .expect("管理命令必须绕过在途上限");
+    harness.settle();
+    let frame = last_server_stdin(&harness, "esp32-1");
+    assert_eq!(frame.id, cmd_id);
+    assert_eq!(frame.kind, Kind::ToolCall);
+    let body = ToolBody::decode(&frame.payload).expect("ToolBody 可解码");
+    assert_eq!(body.name, "sekai.set_time");
+    assert_eq!(body.args, now.to_be_bytes().to_vec());
+    // 管理命令同样登记进在途账本（诊断可见）。
+    let diagnostics = harness.server().diagnostics(now_mono);
+    assert!(
+        diagnostics
+            .inflight
+            .iter()
+            .any(|item| item.cmd_id == cmd_id),
+        "管理命令应在 inflight 中可见"
+    );
+}
+
+/// `cancel(cmd_id)` 内部映射到属主 Worker 并下发 `sekai.cancel`（8 字节大端）。
+#[test]
+fn cancel_maps_inflight_command_to_sekai_cancel() {
+    let mut harness = base_harness();
+    harness.silence_worker("esp32-1", true);
+    let cmd_id = harness
+        .submit(CommandRequest::task("esp32-1", "sleep", b"60000".to_vec()).with_ddl(60_000));
+    harness.settle();
+    let now = harness.now_unix_ms();
+    let now_mono = harness.now_mono_ms();
+    let cancel_id = harness
+        .server_mut()
+        .cancel(cmd_id, now, now_mono)
+        .expect("在途命令应可取消");
+    harness.settle();
+    let frame = last_server_stdin(&harness, "esp32-1");
+    assert_eq!(frame.id, cancel_id);
+    assert_eq!(frame.kind, Kind::ToolCall);
+    let body = ToolBody::decode(&frame.payload).expect("ToolBody 可解码");
+    assert_eq!(body.name, "sekai.cancel");
+    assert_eq!(body.args, cmd_id.to_be_bytes().to_vec());
+    // 未知 cmd_id：稳定错误，不发帧。
+    let publishes = stdin_publish_count(&harness, "esp32-1");
+    assert!(matches!(
+        harness.server_mut().cancel(9_999_999, now, now_mono),
+        Err(ControlError::UnknownCommand(9_999_999))
+    ));
+    assert_eq!(stdin_publish_count(&harness, "esp32-1"), publishes);
+}
+
+/// B6：首个（重连后）Hello 时钟未校准（unix_ms==0 或偏差 >2s）时自动下发
+/// `sekai.set_time`（同一 boot_id 只发一次），校准后 `clock_synced` 变真。
+#[test]
+fn hello_clock_skew_triggers_automatic_set_time_once() {
+    let mut harness = base_harness();
+    // 重启以取得独立 boot_id（自动校时按 (worker, boot) 去重）。
+    harness.restart_worker("esp32-1", 2);
+    let publishes = stdin_publish_count(&harness, "esp32-1");
+    assert!(harness.server().clock_synced(), "重启 Hello 时钟正常");
+
+    // 注入的 Hello 需通告 sekai.set_time（submit_control 会做能力校验；
+    // 真实 Worker 的 Hello 一定带全部内置工具）。
+    let mut skewed = hello("esp32-1", &["gpio.info", "sekai.set_time"], &["echo"]);
+    skewed.unix_ms = 0;
+    harness
+        .inject_hello("esp32-1", &skewed, 2, 910, false)
+        .expect("注入 Hello");
+    harness.settle();
+    assert!(!harness.server().clock_synced(), "未校准前不应报告已同步");
+    assert_eq!(
+        stdin_publish_count(&harness, "esp32-1"),
+        publishes + 1,
+        "应自动下发一条 sekai.set_time"
+    );
+    let now = harness.now_unix_ms();
+    let frame = last_server_stdin(&harness, "esp32-1");
+    let body = ToolBody::decode(&frame.payload).expect("ToolBody 可解码");
+    assert_eq!(body.name, "sekai.set_time");
+    assert_eq!(body.args, now.to_be_bytes().to_vec());
+
+    // 同一 boot_id 再次收到偏差 Hello：不重复自动校时。
+    harness
+        .inject_hello("esp32-1", &skewed, 2, 911, false)
+        .expect("注入 Hello");
+    harness.settle();
+    assert_eq!(
+        stdin_publish_count(&harness, "esp32-1"),
+        publishes + 1,
+        "同一 boot_id 只自动校时一次"
+    );
+
+    // Worker 报回正确时钟：状态恢复为已校准。
+    let mut synced = hello("esp32-1", &["gpio.info"], &["echo"]);
+    synced.unix_ms = harness.now_unix_ms();
+    harness
+        .inject_hello("esp32-1", &synced, 2, 912, false)
+        .expect("注入 Hello");
+    harness.settle();
+    assert!(harness.server().clock_synced(), "校准后应报告 clock_synced");
+}
+
+/// B7：`CommandRequest::jump` 编码 Stdin::Jump(JumpBody)，目标不做通告校验。
+#[test]
+fn jump_request_encodes_jump_body() {
+    let mut harness = base_harness();
+    let cmd_id = harness.submit(CommandRequest::jump("esp32-1", "peer-1"));
+    harness.settle();
+    let frame = last_server_stdin(&harness, "esp32-1");
+    assert_eq!(frame.id, cmd_id);
+    assert_eq!(frame.kind, Kind::Jump);
+    let body = JumpBody::decode(&frame.payload).expect("JumpBody 可解码");
+    assert_eq!(body.target, "peer-1");
 }

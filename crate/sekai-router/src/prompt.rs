@@ -19,8 +19,9 @@ pub fn system_prompt(workers: &[WorkerInfo], policy: &Policy) -> String {
     out.push_str("- Worker、工具、任务清单以 list_workers 的返回（来自Worker Hello）为准。禁止臆造Worker id、工具名或任务名。\n");
     out.push_str("- 每次调用 worker_tool / worker_task 前，先确认 worker_id 与名称出现在 list_workers 结果中；不确定就先调用 list_workers。\n");
     out.push_str("- worker_tool / worker_task 的 args 是Worker端原始 UTF-8 参数文本，直接写工具语法，不加引号、不做 JSON 转义、不要空行。\n");
-    out.push_str("- ddl_ms 可选，范围 1..=300000；不确定就省略，使用服务端默认值。\n");
-    out.push_str("- Worker已有 active_tasks 时避免继续堆 Task；先等待或先查询状态。\n");
+    out.push_str("- 名字在 Worker tasks 列表中的命令（以及 pc.ask / pc.job）会自动按 Task 下发；Task 需要 allow_tasks 授权。\n");
+    out.push_str("- ddl_ms 可选，范围 1..=300000；不写时使用默认 10000ms。长命令必须显式给 ddl_ms，否则会被默认预算判超时：pc.exec 建议 >=30000，pc.ask / pc.job 建议 60000（上限 300000）。\n");
+    out.push_str("- 同一 Worker 最多 4 条命令并行；一个长时间 Task 在途时，仍可用同一 Worker 的只读工具（prompt 内层可以调用工具），不要因为 active_tasks 非空就放弃查询。\n");
     out.push_str("- 多个工具调用会按顺序执行；不要把互不依赖的写操作并行发起。\n\n");
     out.push_str("## GPIO 标准流程\n");
     out.push_str("1. 需要语法说明或首次操作：调用 gpio.info help。\n");
@@ -38,7 +39,8 @@ pub fn system_prompt(workers: &[WorkerInfo], policy: &Policy) -> String {
         "- 策略由服务端强制执行，你无法绕过；被拒绝时如实说明需要人工授权，不要尝试换写法绕过。\n",
     );
     out.push_str("- 没有工具结果时不得声称硬件状态；失败必须如实报告错误码与消息（例如 worker_failed/InvalidArgument、worker_offline、timeout、policy_denied）。\n");
-    out.push_str("- 超时或断链的写操作不要自动重试；先查询Worker状态再决定。\n\n");
+    out.push_str("- 超时或断链的写操作不要自动重试；先查询Worker状态再决定。\n");
+    out.push_str("- 结果错误码 cancelled 表示用户主动取消：如实报告，不要重试或换目标。\n\n");
     out.push_str("## 当前策略\n");
     out.push_str(&policy.summary());
     out.push_str("\n（策略同时由服务端强制；违反策略的调用会返回 policy_denied。）\n\n");
@@ -114,6 +116,20 @@ mod tests {
         ] {
             assert!(prompt.contains(needle), "prompt 缺少 {needle}");
         }
+    }
+
+    #[test]
+    fn prompt_mentions_parallelism_long_ddl_and_cancelled() {
+        let prompt = system_prompt(&[worker("host-gpio", true)], &Policy::default());
+        // B5：同一 Worker 最多 4 条并行命令、prompt 内层可调用工具。
+        assert!(prompt.contains("同一 Worker 最多 4 条命令并行"), "{prompt}");
+        assert!(prompt.contains("prompt 内层可以调用工具"), "{prompt}");
+        // B4.1：默认 10000ms，长命令必须显式 ddl_ms，pc.ask 建议 60000。
+        assert!(prompt.contains("默认 10000ms"), "{prompt}");
+        assert!(prompt.contains("pc.ask / pc.job 建议 60000"), "{prompt}");
+        assert!(prompt.contains("上限 300000"), "{prompt}");
+        // B2：取消后的行为约束。
+        assert!(prompt.contains("cancelled 表示用户主动取消"), "{prompt}");
     }
 
     #[test]

@@ -19,6 +19,15 @@
 //! 这样 Hello 在每次链路建立后作为首帧发出（对应 retained state 语义），
 //! seq 在 boot 内跨重连单调递增，出站事件在重连时按 `(boot_id, seq)` 重放，
 //! 与 MQTT 承载时完全一致。
+//!
+//! ## 保活与投递语义
+//!
+//! - **保活（P10）**：PINGREQ/PINGRESP 不再就地合成，而是作为 MQTT 保活
+//!   报文真正跨链路（由 [`crate::link::decode_keepalive`] 识别）；对端此时
+//!   活着但网络上静默死亡时，由链路层读空闲判定与 MQTT 保活超时发现；
+//! - **投递（P9）**：出站帧交给调用方写链路后**不立即**回 PUBACK，而是在
+//!   下一次调用（确认上一批帧已写出成功）再向 Runtime 补确认；写失败走
+//!   [`WorkerHost::on_link_lost`] 丢弃待确认列表，事件留在 outbox 重连后重放。
 
 use sekai::mqtt::packet::{Ack, Connack, Packet, Publish, Suback};
 use sekai::mqtt::property::Properties;
@@ -32,6 +41,8 @@ use sekai::sekai_runtime::{
 };
 use sekai::sekai_task::TaskRegistry;
 use sekai::sekai_tool::ToolRegistry;
+
+use crate::link::{KeepAlive, decode_keepalive, encode_keepalive};
 
 /// 宿主适配层错误。
 #[derive(Debug)]
@@ -75,6 +86,12 @@ pub struct WorkerHost<C: Clock> {
     input_topic: TopicName,
     next_packet_id: u16,
     disconnect_requested: bool,
+    /// 上一轮交给调用方写链路的出站 PUBLISH 包 id（P9）。
+    ///
+    /// 调用方把帧交给链路后，下一次 [`WorkerHost::drain`] 才向 Runtime 补
+    /// PUBACK；若写链路失败，调用方走 [`WorkerHost::on_link_lost`] 丢弃本
+    /// 列表，事件仍留在 Runtime 的 outbox 中等待重连重放（不伪造已确认）。
+    pending_pubacks: Vec<u16>,
 }
 
 impl<C: Clock> WorkerHost<C> {
@@ -82,7 +99,7 @@ impl<C: Clock> WorkerHost<C> {
     ///
     /// `config.topic_root` 与 `config.worker_id` 同时用于推导输入主题。
     pub fn new(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         clock: C,
         workers: DeviceList,
         tasks: TaskRegistry,
@@ -91,25 +108,47 @@ impl<C: Clock> WorkerHost<C> {
         let input_topic =
             TopicName::new(format!("{}/dev/{}/in", config.topic_root, config.worker_id))
                 .map_err(HostError::Topic)?;
+        // P9 的 PUBACK 延后一个写周期才补：Outbox 需要额外余量，否则并发完成的
+        // 事件在「已写出、尚未确认」窗口内可能被容量淘汰而丢失。
+        config.max_outbox = config.max_outbox.max(32);
+        config.outbox_bytes = config.outbox_bytes.max(64 * 1024);
         let runtime = Runtime::new(config, clock, workers, tasks, tools)?;
         Ok(Self {
             runtime,
             input_topic,
             next_packet_id: 1,
             disconnect_requested: false,
+            pending_pubacks: Vec::new(),
         })
     }
 
     /// 链路建立后调用：发起 Runtime 的连接流程（CONNACK 由适配器就地合成）。
+    ///
+    /// 重新 link_up 成功即清除 [`WorkerHost::disconnect_requested`]：否则 PC
+    /// Worker 收到一次 DISCONNECT 后会进入「连上就立刻关」的重连循环（P11）。
     pub fn on_link_up(&mut self, endpoint: Endpoint) -> Result<Vec<Vec<u8>>, HostError> {
         self.runtime.link_up(endpoint)?;
+        self.disconnect_requested = false;
+        // 旧链路的待确认帧已不可能写出：不补 PUBACK，交给 Runtime 重放（P9）。
+        self.pending_pubacks.clear();
         self.drain()
     }
 
-    /// 链路上收到一帧（Router 下发的 V1 Stdin 帧）。
+    /// 链路上收到一帧（Router 下发的 V1 Stdin 帧或 MQTT 保活报文）。
     ///
     /// 帧合法性由 Runtime 的 Stdin 解码负责；非法帧按协议回 `Failed` 或计数拒绝。
     pub fn on_frame(&mut self, frame: &[u8]) -> Result<Vec<Vec<u8>>, HostError> {
+        if let Some(keepalive) = decode_keepalive(frame) {
+            let mut frames = self.drain()?;
+            match keepalive {
+                // 对端（Router 的 ControlPlane 客户端）的 PINGREQ：作为虚拟
+                // broker 回 PINGRESP，报文真正跨链路（P10）。
+                KeepAlive::Pingreq => frames.push(encode_keepalive(KeepAlive::Pingresp)),
+                // 对端对我们 PINGREQ 的应答：喂给 Runtime 清除保活等待。
+                KeepAlive::Pingresp => self.runtime.feed(Packet::Pingresp)?,
+            }
+            return Ok(frames);
+        }
         let packet_id = self.alloc_packet_id();
         let mut properties = Properties::new();
         properties.content_type = Some(String::from(CONTENT_TYPE_STDIN));
@@ -133,11 +172,15 @@ impl<C: Clock> WorkerHost<C> {
 
     /// 链路意外断开（EOF/读写错误）。未确认的出站事件保留，重连后重放。
     pub fn on_link_lost(&mut self) {
+        // 待确认帧未写出成功：丢弃确认列表（不伪造 PUBACK），事件由
+        // Runtime 在重连后按 (boot_id, seq) 重放（P9）。
+        self.pending_pubacks.clear();
         self.runtime.link_lost();
     }
 
     /// 链路主动关闭（不触发 Jump 回退）。
     pub fn on_link_closed(&mut self) {
+        self.pending_pubacks.clear();
         self.runtime.link_closed();
     }
 
@@ -173,15 +216,30 @@ impl<C: Clock> WorkerHost<C> {
 
     /// 推进 Runtime 并把出站方向收敛为 V1 帧列表。
     ///
-    /// poll 两轮：第一轮喂事件（CONNACK/SUBACK 的回喂会触发订阅与 Hello 入队），
-    /// 第二轮冲刷发件箱，保证一次调用就能带回本次产生的全部帧。
+    /// 先补上一轮（已交给调用方写出成功）的 PUBACK（P9），再 poll 两轮：
+    /// 第一轮喂事件（CONNACK/SUBACK 的回喂会触发订阅与 Hello 入队），第二轮
+    /// 冲刷发件箱，保证一次调用就能带回本次产生的全部帧。
     fn drain(&mut self) -> Result<Vec<Vec<u8>>, HostError> {
+        self.flush_pending_pubacks()?;
         let mut frames = Vec::new();
         for _ in 0..2 {
             self.runtime.poll()?;
             self.pump_outgoing(&mut frames)?;
         }
         Ok(frames)
+    }
+
+    /// 向上轮已写链路的出站帧补 PUBACK（P9）：确认后事件才从 outbox 移除。
+    fn flush_pending_pubacks(&mut self) -> Result<(), HostError> {
+        for packet_id in std::mem::take(&mut self.pending_pubacks) {
+            let puback = Ack {
+                packet_id,
+                reason_code: ReasonCode::Success,
+                properties: Properties::new(),
+            };
+            self.runtime.feed(Packet::Puback(puback))?;
+        }
+        Ok(())
     }
 
     /// 消费 Runtime 的全部出站 MQTT 报文，收敛为 V1 帧。
@@ -212,23 +270,21 @@ impl<C: Clock> WorkerHost<C> {
                     };
                     self.runtime.feed(Packet::Suback(suback))?;
                 }
-                // 出站 Stdout：剥出 V1 帧写链路，并就地 PUBACK 清理发件箱。
+                // 出站 Stdout：剥出 V1 帧交给调用方写链路；PUBACK 推迟到下一
+                // 轮（确认已写出成功）再补，写失败时事件留在 outbox 重放（P9）。
                 Packet::Publish(publish) => {
-                    let packet_id = publish.packet_id;
-                    frames.push(publish.payload);
-                    if let Some(packet_id) = packet_id {
-                        let puback = Ack {
-                            packet_id,
-                            reason_code: ReasonCode::Success,
-                            properties: Properties::new(),
-                        };
-                        self.runtime.feed(Packet::Puback(puback))?;
+                    if let Some(packet_id) = publish.packet_id {
+                        self.pending_pubacks.push(packet_id);
                     }
+                    frames.push(publish.payload);
                 }
-                // 保活：就地回应。
+                // 保活：PINGREQ 真正写链路（由 Router 侧虚拟 broker 回 PINGRESP），
+                // 不再就地合成 PINGRESP（P10）。
                 Packet::Pingreq => {
-                    self.runtime.feed(Packet::Pingresp)?;
+                    frames.push(encode_keepalive(KeepAlive::Pingreq));
                 }
+                // Runtime 是 MQTT 客户端，正常不会产生 PINGRESP（由对端回给我们）。
+                Packet::Pingresp => {}
                 // Runtime 确认我们注入的 Stdin PUBLISH，不需要外发。
                 Packet::Puback(_) => {}
                 // Runtime 主动断开（Jump / 服务器迁移）：链路应关闭。

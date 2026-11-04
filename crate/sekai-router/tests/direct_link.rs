@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use sekai::sekai_device_list::{DeviceList, Endpoint};
 use sekai::sekai_runtime::RuntimeConfig;
-use sekai::sekai_stdin::Stdin;
+use sekai::sekai_stdin::{Kind, Stdin, TaskBody};
 use sekai::sekai_stdout::{ErrorPayload, Hello, Phase, Stdout};
 use sekai::sekai_wire::ErrorCode;
 use sekai_gpio::ChipFamily;
@@ -25,7 +25,9 @@ use sekai_router::topic::TopicRoot;
 use sekai_router::worker::WorkerInfo;
 use sekai_worker::capability::{SystemClock, host_registries};
 use sekai_worker::host::WorkerHost;
-use sekai_worker::link::{Link, LinkError, MemoryLink, TcpLink};
+use sekai_worker::link::{
+    KeepAlive, Link, LinkError, MemoryLink, TcpLink, decode_keepalive, encode_keepalive,
+};
 
 const FAMILY: ChipFamily = ChipFamily::Esp32;
 /// 单测试整体超时。
@@ -80,15 +82,26 @@ fn failed_frame(boot_id: u64, cmd_id: u64, seq: u32, code: ErrorCode, message: &
 
 /// 在独立线程里用真实 `WorkerHost` 驱动链路对端，直到链路关闭。
 fn spawn_real_worker(
+    link: impl Link + Send + 'static,
+    worker_id: &str,
+    boot_id: u64,
+) -> JoinHandle<()> {
+    spawn_real_worker_with_keepalive(link, worker_id, boot_id, 30)
+}
+
+/// 同上，但可指定 Worker 的 MQTT keep_alive（秒），用于保活跨链路测试。
+fn spawn_real_worker_with_keepalive(
     mut link: impl Link + Send + 'static,
     worker_id: &str,
     boot_id: u64,
+    keep_alive: u16,
 ) -> JoinHandle<()> {
     let worker_id = String::from(worker_id);
     thread::spawn(move || {
         let (tasks, tools) = host_registries(FAMILY).expect("宿主能力注册失败");
         let mut config = RuntimeConfig::new(worker_id, boot_id);
         config.firmware = String::from("direct-test");
+        config.mqtt.keep_alive = keep_alive;
         let mut host = WorkerHost::new(config, SystemClock::new(), DeviceList::new(), tasks, tools)
             .expect("WorkerHost 构造失败");
         for frame in host.on_link_up(direct_endpoint()).expect("link_up 失败") {
@@ -528,4 +541,194 @@ fn stdio_subprocess_hello_and_echo() {
     assert!(result.ok(), "子进程 echo 应成功：{:?}", result.failure);
     assert_eq!(result.payload, b"sub-process".to_vec());
     endpoint.close(unix_ms());
+}
+
+// ---- P9：写失败不丢事件（未写出的出站事件留在 Outbox，重连后重放） ----
+
+/// 写链路失败时不得伪造 PUBACK：出站事件仍留在 Runtime 的 Outbox，
+/// 重连后按 `(boot_id, seq)` 重放（P9）。
+#[test]
+fn write_failure_keeps_outgoing_event_for_replay() {
+    let (_router_link, mut worker_link) = sekai_worker::link::memory_pair();
+    let (tasks, tools) = host_registries(FAMILY).expect("宿主能力注册失败");
+    let mut config = RuntimeConfig::new(String::from("pc-wf"), 81);
+    config.firmware = String::from("direct-test");
+    let mut host = WorkerHost::new(config, SystemClock::new(), DeviceList::new(), tasks, tools)
+        .expect("WorkerHost 构造失败");
+
+    let hello = host.on_link_up(direct_endpoint()).expect("link_up 失败");
+    assert_eq!(hello.len(), 1, "link_up 应恰好产出一帧 Hello");
+    for frame in hello {
+        worker_link.write_frame(&frame).expect("写出 Hello 失败");
+    }
+
+    // Router 下发 echo Task；出站帧故意不写链路（模拟写失败）。
+    let task_body = TaskBody::new("echo", b"replay-me".to_vec()).expect("任务载荷构造失败");
+    let stdin = Stdin::new(
+        7,
+        Kind::Task,
+        unix_ms(),
+        0,
+        500,
+        task_body.encode().unwrap(),
+    )
+    .expect("Stdin 构造失败")
+    .encode()
+    .expect("Stdin 编码失败");
+    let frames = host.on_frame(&stdin).expect("处理帧失败");
+    assert!(!frames.is_empty(), "echo 应产生出站帧");
+    assert!(
+        host.status().outbox > 0,
+        "未确认的出站事件应留在 Outbox：{:?}",
+        host.status()
+    );
+
+    // 写失败 → 断链（不补 PUBACK）→ 重连：事件应重放。
+    host.on_link_lost();
+    let replayed = host.on_link_up(direct_endpoint()).expect("重连失败");
+    let decoded: Vec<Stdout> = replayed
+        .iter()
+        .filter_map(|frame| Stdout::decode(frame).ok())
+        .collect();
+    assert!(
+        decoded.iter().any(|stdout| stdout.phase == Phase::Hello),
+        "重连后应先发 Hello：{:?}",
+        decoded
+            .iter()
+            .map(|stdout| stdout.phase)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        decoded
+            .iter()
+            .any(|stdout| stdout.phase == Phase::Completed && stdout.cmd_id == 7),
+        "写失败的事件应在重连后重放：{:?}",
+        decoded
+            .iter()
+            .map(|stdout| stdout.phase)
+            .collect::<Vec<_>>()
+    );
+}
+
+// ---- P10：读空闲判定与保活跨链路 ----
+
+/// 对端静默（链路上再无任何帧）：Router 端点按 1.5 × keep_alive 判死，
+/// 转 link_lost 并记录读空闲错误（P10）。
+#[test]
+fn silent_peer_triggers_read_idle_link_lost() {
+    let (router_link, worker_link) = sekai_worker::link::memory_pair();
+    let mut config = endpoint_config("idle");
+    config.keep_alive = 1; // 读空闲阈值 = 1.5s
+    let mut endpoint =
+        DirectWorkerEndpoint::new(config, router_link, "pc-idle", direct_endpoint(), unix_ms())
+            .expect("端点构造失败");
+    // 对端保持「活着但静默」：持有链路但永不读写。
+    let started = Instant::now();
+    while endpoint.is_open() && started.elapsed() < Duration::from_secs(5) {
+        pump_and_collect(&mut endpoint);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!endpoint.is_open(), "静默对端应在 1.5 × keep_alive 后判死");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1_200),
+        "不应过早判死：{:?}",
+        started.elapsed()
+    );
+    let last_error = endpoint.last_error().unwrap_or("");
+    assert!(
+        last_error.contains("空闲") || last_error.contains("保活超时"),
+        "last_error 应记录读空闲/保活超时：{last_error}"
+    );
+    drop(worker_link);
+}
+
+/// 健康空闲连接不被读空闲误杀：对端按真实 Worker 语义回应 PINGREQ
+/// （回 PINGRESP），1.5 × keep_alive 之后链路仍打开（P10）。
+#[test]
+fn healthy_idle_link_survives_keepalive_rounds() {
+    let (router_link, mut worker_link) = sekai_worker::link::memory_pair();
+    let mut config = endpoint_config("alive");
+    config.keep_alive = 1;
+    let mut endpoint = DirectWorkerEndpoint::new(
+        config,
+        router_link,
+        "pc-alive",
+        direct_endpoint(),
+        unix_ms(),
+    )
+    .expect("端点构造失败");
+
+    // 对端模拟 Worker 的虚拟 broker：只回应 PINGREQ，其余忽略。
+    let responder = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_millis(3_000);
+        while Instant::now() < deadline {
+            match worker_link.read_frame() {
+                Ok(Some(frame)) => {
+                    if decode_keepalive(&frame) == Some(KeepAlive::Pingreq) {
+                        let _ = worker_link.write_frame(&encode_keepalive(KeepAlive::Pingresp));
+                    }
+                }
+                Ok(None) => break,
+                Err(LinkError::Timeout) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(2_200) {
+        pump_and_collect(&mut endpoint);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        endpoint.is_open(),
+        "健康空闲连接不应被读空闲误杀：{:?}",
+        endpoint.last_error()
+    );
+    assert!(endpoint.is_ready());
+    endpoint.close(unix_ms());
+    responder.join().expect("保活应答线程 panic");
+}
+
+/// Worker 侧 PINGREQ 真正跨链路：Router 端点回应 PINGRESP，Worker 的
+/// MQTT 保活等待被清除，健康链路保持打开（P10 双向）。
+#[test]
+fn worker_pingreq_crosses_link_and_router_answers() {
+    let (router_link, worker_link) = sekai_worker::link::memory_pair();
+    let worker = spawn_real_worker_with_keepalive(worker_link, "pc-ping", 91, 1);
+    let mut endpoint = DirectWorkerEndpoint::new(
+        endpoint_config("ping"),
+        router_link,
+        "pc-ping",
+        direct_endpoint(),
+        unix_ms(),
+    )
+    .expect("端点构造失败");
+    wait_online(&mut endpoint, "pc-ping");
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(2_500) {
+        pump_and_collect(&mut endpoint);
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Worker 若收不到 PINGRESP，会在 2s 内保活超时并让对端线程 panic；
+    // 同时 Router 端点必须仍打开且至少收到 Hello 与 PINGREQ。
+    assert!(
+        endpoint.is_open(),
+        "保活互通时链路应保持打开：{:?}",
+        endpoint.last_error()
+    );
+    assert!(
+        endpoint.frames_rx() >= 2,
+        "至少收到 Hello 与 PINGREQ：frames_rx={}",
+        endpoint.frames_rx()
+    );
+    assert!(
+        endpoint
+            .worker("pc-ping")
+            .map(|w| w.online)
+            .unwrap_or(false)
+    );
+    endpoint.close(unix_ms());
+    worker.join().expect("Worker 线程 panic");
 }

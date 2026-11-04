@@ -372,3 +372,192 @@ fn stdio_spawn_runs_real_worker_binary() {
     assert_eq!(result.payload, b"from-spawn".to_vec());
     drop(gateway);
 }
+
+// ---- B1：多 Worker 直连 ----
+
+/// 两个 tcp Worker 同时在线：都出现在 list_workers，且可按 worker_id 分别派工。
+#[test]
+fn tcp_listen_serves_two_workers_and_routes_by_id() {
+    let mut gateway = DirectGateway::listen_tcp("127.0.0.1:0", gateway_config("multi")).unwrap();
+    let addr = match gateway.mode() {
+        DirectMode::TcpListen { addr } => addr.clone(),
+        other => panic!("模式应为 TcpListen：{other:?}"),
+    };
+    let worker_a = spawn_tcp_worker(addr.clone(), "pc-a", 51, 1, Duration::from_secs(60));
+    let worker_b = spawn_tcp_worker(addr.clone(), "pc-b", 52, 1, Duration::from_secs(60));
+
+    gateway.wait_ready(5_000).expect("应接受至少一条连接");
+    wait_for_worker(&mut gateway, "pc-a");
+    wait_for_worker(&mut gateway, "pc-b");
+
+    let workers = gateway.list_workers();
+    assert!(
+        workers
+            .iter()
+            .any(|worker| worker.worker_id == "pc-a" && worker.online),
+        "pc-a 应同时在线：{workers:?}"
+    );
+    assert!(
+        workers
+            .iter()
+            .any(|worker| worker.worker_id == "pc-b" && worker.online),
+        "pc-b 应同时在线：{workers:?}"
+    );
+
+    // 按 worker_id 精确路由：两个 Worker 各自收到自己的命令。
+    let result_a = gateway
+        .call(CommandRequest::task("pc-a", "echo", b"to-a".to_vec()))
+        .expect("pc-a echo 应成功");
+    assert!(result_a.ok(), "pc-a echo 应成功：{:?}", result_a.failure);
+    assert_eq!(result_a.worker_id, "pc-a");
+    assert_eq!(result_a.payload, b"to-a".to_vec());
+
+    let result_b = gateway
+        .call(CommandRequest::task("pc-b", "echo", b"to-b".to_vec()))
+        .expect("pc-b echo 应成功");
+    assert!(result_b.ok(), "pc-b echo 应成功：{:?}", result_b.failure);
+    assert_eq!(result_b.worker_id, "pc-b");
+    assert_eq!(result_b.payload, b"to-b".to_vec());
+
+    drop(gateway);
+    worker_a.join().expect("Worker A 线程 panic");
+    worker_b.join().expect("Worker B 线程 panic");
+}
+
+/// 断开其中一个 Worker 后，另一个仍可用（端点表按连接隔离）。
+#[test]
+fn tcp_one_worker_disconnect_keeps_other_usable() {
+    let mut gateway = DirectGateway::listen_tcp("127.0.0.1:0", gateway_config("onegone")).unwrap();
+    let addr = match gateway.mode() {
+        DirectMode::TcpListen { addr } => addr.clone(),
+        other => panic!("模式应为 TcpListen：{other:?}"),
+    };
+    // pc-a 会话较短（主动断开），pc-b 长驻；1.2s 留足被网关发现的窗口。
+    let worker_a = spawn_tcp_worker(addr.clone(), "pc-a", 61, 1, Duration::from_millis(1_200));
+    let worker_b = spawn_tcp_worker(addr.clone(), "pc-b", 62, 1, Duration::from_secs(60));
+    gateway.wait_ready(5_000).expect("应接受连接");
+    wait_for_worker(&mut gateway, "pc-a");
+    wait_for_worker(&mut gateway, "pc-b");
+
+    // 等 pc-a 断开并从端点表移除。
+    let deadline = Instant::now() + DRIVE_TIMEOUT;
+    loop {
+        let online_a = gateway
+            .list_workers()
+            .iter()
+            .any(|worker| worker.worker_id == "pc-a" && worker.online);
+        if !online_a {
+            break;
+        }
+        assert!(Instant::now() < deadline, "等待 pc-a 断链超时");
+        thread::sleep(POLL);
+    }
+
+    // pc-a 已离线：派工失败（端点已移除 → worker_not_found 或链路错误）。
+    let error = gateway
+        .call(CommandRequest::task("pc-a", "echo", b"x".to_vec()))
+        .expect_err("pc-a 离线后派工应失败");
+    assert!(
+        matches!(error.code.as_str(), "worker_not_found" | "link_lost"),
+        "pc-a 离线错误码：{error}"
+    );
+
+    // pc-b 不受影响，仍可派工。
+    let result = gateway
+        .call(CommandRequest::task("pc-b", "echo", b"still-here".to_vec()))
+        .expect("pc-b 应仍可用");
+    assert!(result.ok(), "pc-b echo 应成功：{:?}", result.failure);
+    assert_eq!(result.worker_id, "pc-b");
+    assert_eq!(result.payload, b"still-here".to_vec());
+
+    drop(gateway);
+    worker_a.join().expect("Worker A 线程 panic");
+    worker_b.join().expect("Worker B 线程 panic");
+}
+
+/// 同一 worker_id 的第二个连接顶替第一个（旧连接关闭、注册表只剩新 boot_id）。
+#[test]
+fn tcp_same_worker_id_new_connection_replaces_old() {
+    let mut gateway = DirectGateway::listen_tcp("127.0.0.1:0", gateway_config("dup")).unwrap();
+    let addr = match gateway.mode() {
+        DirectMode::TcpListen { addr } => addr.clone(),
+        other => panic!("模式应为 TcpListen：{other:?}"),
+    };
+    let old = spawn_tcp_worker(addr.clone(), "pc-dup", 71, 1, Duration::from_secs(60));
+    gateway.wait_ready(5_000).expect("应接受旧连接");
+    wait_for_worker(&mut gateway, "pc-dup");
+
+    // 同 worker_id 的第二条连接（新 boot_id）连入。
+    let new = spawn_tcp_worker(addr.clone(), "pc-dup", 72, 1, Duration::from_secs(60));
+
+    // 注册表最终只剩一条 pc-dup，且为新连接的 boot_id。
+    let deadline = Instant::now() + DRIVE_TIMEOUT;
+    loop {
+        let workers: Vec<_> = gateway
+            .list_workers()
+            .into_iter()
+            .filter(|worker| worker.worker_id == "pc-dup")
+            .collect();
+        if workers.len() == 1 && workers[0].boot_id == 72 && workers[0].online {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "等待新连接顶替旧连接超时（workers={workers:?}）"
+        );
+        thread::sleep(POLL);
+    }
+
+    // 顶替后的链路可正常派工。
+    let result = gateway
+        .call(CommandRequest::task("pc-dup", "echo", b"new-conn".to_vec()))
+        .expect("顶替后的连接应可用");
+    assert!(result.ok(), "echo 应成功：{:?}", result.failure);
+    assert_eq!(result.payload, b"new-conn".to_vec());
+
+    drop(gateway);
+    old.join().expect("旧 Worker 线程 panic");
+    new.join().expect("新 Worker 线程 panic");
+}
+
+/// 取消契约：submit 在 accepted 上限内回传 cmd_id；已结束的命令取消返回
+/// unknown_command；诊断快照可无阻塞读取（B2 契约的 gateway 侧）。
+#[test]
+fn submit_exposes_cmd_id_and_cancel_unknown_command() {
+    let (router_link, worker_link): (MemoryLink, MemoryLink) = sekai_worker::link::memory_pair();
+    let worker = spawn_real_worker(worker_link, "pc-cancel", 91);
+    let mut gateway =
+        DirectGateway::over_link(Box::new(router_link), gateway_config("cancel")).unwrap();
+    gateway.wait_ready(2_000).expect("应立即可就绪");
+    wait_for_worker(&mut gateway, "pc-cancel");
+
+    let receipt = gateway
+        .submit(CommandRequest::task(
+            "pc-cancel",
+            "echo",
+            b"with-cmd-id".to_vec(),
+        ))
+        .expect("submit 应成功");
+    let cmd_id = receipt.cmd_id();
+    assert!(cmd_id > 0, "submit 应回传 cmd_id：{cmd_id}");
+    let result = receipt.wait().expect("应收到最终事件");
+    assert!(result.ok(), "echo 应成功：{:?}", result.failure);
+    assert_eq!(result.cmd_id, cmd_id);
+
+    // 命令已结束：取消应返回 unknown_command（工作树链路的稳定错误码）。
+    let error = gateway.cancel(cmd_id).expect_err("已结束的命令不可取消");
+    assert_eq!(error.code, "unknown_command", "错误码：{error}");
+
+    // 诊断快照读取不阻塞、不 panic（echo 已从在途账本移除）。
+    let diagnostics = gateway.diagnostics();
+    assert!(
+        diagnostics
+            .inflight
+            .iter()
+            .all(|command| command.name != "echo"),
+        "命令结束后 echo 不应仍在途：{diagnostics:?}"
+    );
+
+    drop(gateway);
+    worker.join().expect("Worker 线程 panic");
+}

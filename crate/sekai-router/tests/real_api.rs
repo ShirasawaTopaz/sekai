@@ -316,6 +316,8 @@ fn direct_command(
     let request = match kind {
         CommandKind::Tool => CommandRequest::tool(worker_id, name, args.as_bytes().to_vec()),
         CommandKind::Task => CommandRequest::task(worker_id, name, args.as_bytes().to_vec()),
+        // Jump 的载荷是目标端点（JumpBody 编码），不走 args。
+        CommandKind::Jump => CommandRequest::jump(worker_id, name),
     };
     let mut harness = harness.borrow_mut();
     harness.run_command(request, 5_000)

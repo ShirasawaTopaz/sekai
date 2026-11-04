@@ -35,7 +35,11 @@ pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 /// 默认最大 agent 步数。
 pub const DEFAULT_MAX_STEPS: u32 = 12;
 /// 默认 DDL（毫秒）。
-pub const DEFAULT_DDL_MS: u32 = 1_000;
+///
+/// 与 `pc.exec` 自身的 10s 上限对齐（B4.1）：默认 10s + 控制端 5s 余量，
+/// 避免多数真实命令被 Router 先判超时；长任务（pc.ask 等）由调用方显式
+/// 传更大的 `ddl_ms`（上限见 `MAX_DDL_MS`）。
+pub const DEFAULT_DDL_MS: u32 = 10_000;
 /// 默认等待Worker上线时间（毫秒）。
 pub const DEFAULT_WAIT_WORKER_MS: u64 = 5_000;
 /// 默认 HTTP 超时（毫秒）。
@@ -699,12 +703,14 @@ pub fn usage() -> String {
   --model <NAME>        覆盖模型
   --base-url <URL>      覆盖 API base URL
   --max-steps <N>       agent 最大步数（1..=64，默认 {DEFAULT_MAX_STEPS}）
-  --ddl-ms <N>          Worker端执行预算（默认 {DEFAULT_DDL_MS}）
+  --ddl-ms <N>          Worker端执行预算（默认 {DEFAULT_DDL_MS}；pc.exec 等长命令
+                        建议显式传更大值，pc.ask 建议 60000，上限 300000）
   --timeout-ms <N>      控制端命令超时覆盖
   --wait-worker-ms <N>  等待Worker上线时间（默认 {DEFAULT_WAIT_WORKER_MS}）
   --allow-write         允许 gpio.config / gpio.write 等写操作
-  --allow-tasks         允许下发Worker Task
-  --allow-admin         允许 sekai.set_time / sekai.workers.set / sekai.cancel 等管理工具
+  --allow-tasks         允许下发Worker Task（含 pc.ask / pc.job 等长任务）
+  --allow-admin         允许管理命令：serve admin/jump 与 sekai.set_time /
+                        sekai.workers.set / sekai.cancel
   --prompt-addr <HOST:PORT|off>
                         prompt ingress 监听地址（Worker 经此把 prompt 交给
                         Router 调 LLM）；默认交互/--serve 模式

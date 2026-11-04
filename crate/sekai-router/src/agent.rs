@@ -8,6 +8,11 @@
 //! trace 只记录摘要：llm_request / llm_response / usage / tool_call / tool_result；
 //! 不记录 API key、Authorization 或 MQTT 凭据。
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
+
 use crate::control::{CommandKind, CommandRequest};
 use crate::gateway::{GatewayError, WorkerGateway};
 use crate::json::Json;
@@ -19,6 +24,38 @@ use crate::trace::TraceWriter;
 const TRACE_FIELD_MAX_BYTES: usize = 4_096;
 /// trace 中工具参数的最大展示字节数。
 const TRACE_ARGS_MAX_BYTES: usize = 2_048;
+/// 工具等待的取消轮询间隔（毫秒）：50ms 内响应取消 / Ctrl-C。
+pub const CANCEL_POLL_MS: u64 = 50;
+
+/// 协作式取消令牌（线程安全；REPL /cancel、TUI Ctrl-C、serve cancel 共用）。
+#[derive(Debug, Clone, Default)]
+pub struct CancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// 新建未取消令牌。
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// 请求取消（幂等）。
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// 是否已请求取消。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 清除取消状态（同一 agent 复用前的复位；默认新建即未取消）。
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::SeqCst);
+    }
+}
 
 /// agent 运行配置。
 #[derive(Debug, Clone)]
@@ -129,6 +166,7 @@ pub struct Agent<C: ChatClient, G: WorkerGateway> {
     policy: Policy,
     config: AgentConfig,
     trace: TraceWriter,
+    cancel: CancelToken,
 }
 
 impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
@@ -146,7 +184,14 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             policy,
             config,
             trace,
+            cancel: CancelToken::new(),
         }
+    }
+
+    /// 挂接外部取消令牌（REPL /cancel、TUI Ctrl-C 用）。
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// 执行目标，直到模型给出最终回答或达到最大步数。
@@ -170,6 +215,9 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
         let mut steps: usize = 0;
 
         for step_index in 0..self.config.max_steps {
+            if self.cancel.is_cancelled() {
+                return Err(cancelled_error());
+            }
             steps = step_index as usize + 1;
             let request = ChatRequest {
                 model: self.config.model.clone(),
@@ -278,6 +326,9 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                 None,
             ));
             for call in &response.tool_calls {
+                if self.cancel.is_cancelled() {
+                    return Err(cancelled_error());
+                }
                 let outcome = self.execute_call(call);
                 last_tool_failed = !outcome.record.ok;
                 if outcome.worker_failure {
@@ -286,6 +337,10 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                 let result_text = outcome.json.to_compact_string();
                 records.push(outcome.record);
                 messages.push(Message::tool(call.id.clone(), result_text));
+                if self.cancel.is_cancelled() {
+                    // 取消后不再进入下一轮 LLM，避免模型继续派工。
+                    return Err(cancelled_error());
+                }
             }
         }
 
@@ -396,12 +451,18 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
     fn execute_worker_command(&mut self, call: &ToolCall, parsed: &ParsedCall) -> CallOutcome {
         let worker_id = String::from(parsed.worker_id().unwrap_or_default());
         let name = String::from(parsed.command_name().unwrap_or_default());
-        let kind = parsed.command_kind().unwrap_or(CommandKind::Tool);
-        if let Err(denied) = tools::check_policy(&self.policy, parsed) {
+        let requested_kind = parsed.command_kind().unwrap_or(CommandKind::Tool);
+        // 先取 Worker 能力快照：策略分类（D5）与线类型路由都依赖 tasks 列表。
+        let worker = self
+            .gateway
+            .list_workers()
+            .into_iter()
+            .find(|worker| worker.worker_id == worker_id);
+        if let Err(denied) = tools::check_policy_for_worker(&self.policy, parsed, worker.as_ref()) {
             return failure_outcome(
                 &call.name,
                 &worker_id,
-                Some(kind),
+                Some(requested_kind),
                 &name,
                 tools::CODE_POLICY_DENIED,
                 &denied.to_string(),
@@ -409,6 +470,8 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                 false,
             );
         }
+        // D5：按「名字 → 线类型」自动路由（Worker tasks 列表 / pc.ask/pc.job）。
+        let kind = tools::route_command_kind(worker.as_ref(), &name, requested_kind);
         let request = CommandRequest {
             worker_id: worker_id.clone(),
             kind,
@@ -417,7 +480,7 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             ddl_ms: parsed.ddl_ms().unwrap_or(self.config.ddl_ms),
             timeout_ms: self.config.timeout_ms,
         };
-        match self.gateway.call(request) {
+        match self.submit_and_wait(request) {
             Ok(result) => {
                 let ok = result.ok();
                 let error_code = result.failure.as_ref().map(|failure| failure.code.clone());
@@ -445,6 +508,53 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             ),
         }
     }
+
+    /// 提交命令并在 50ms 粒度上等待最终事件；取消令牌置位时先下发
+    /// `sekai.cancel` 再返回 `cancelled`，不等 Worker 的最终事件。
+    ///
+    /// 等待本身在辅助线程上阻塞（`CommandReceipt::wait`），主循环用
+    /// `recv_timeout` 轮询取消位——因此取消在 50ms 内生效，且不需要
+    /// 网关层新增非阻塞等待 API。
+    fn submit_and_wait(
+        &mut self,
+        request: CommandRequest,
+    ) -> Result<crate::control::CommandResult, GatewayError> {
+        let receipt = self.gateway.submit(request)?;
+        let cmd_id = receipt.cmd_id();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(String::from("sekai-router-agent-wait"))
+            .spawn(move || {
+                let _ = sender.send(receipt.wait());
+            })
+            .map_err(|error| {
+                GatewayError::new("protocol_error", format!("无法启动命令等待线程：{error}"))
+            })?;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(CANCEL_POLL_MS)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.cancel.is_cancelled() {
+                        // 取消：先派发 Worker 侧 sekai.cancel（8 字节大端 cmd_id），
+                        // 再本地放弃等待；Worker 的最终事件晚到由 ControlPlane 记账。
+                        let _ = self.gateway.cancel(cmd_id);
+                        return Err(GatewayError::new(
+                            "cancelled",
+                            format!("用户取消命令 {cmd_id}（已下发 sekai.cancel）"),
+                        ));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(GatewayError::new("link_lost", "命令等待线程已退出"));
+                }
+            }
+        }
+    }
+}
+
+/// 取消时的 agent 终止错误（沿用 Gateway 变体，避免扩大公开枚举）。
+fn cancelled_error() -> AgentError {
+    AgentError::Gateway(String::from("cancelled: 用户已取消当前目标"))
 }
 
 /// 服务端错误码是否提示可以重试（agent 回路与 serve `tool_call`/`task`

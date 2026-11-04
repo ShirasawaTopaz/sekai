@@ -16,6 +16,12 @@
 //! 不发明新的帧格式。`N` 的上限取 V1 两类帧的理论最大值
 //! （Stdout 头 34 + 载荷上限 4096 = 4130），超出即视为对端异常。
 //!
+//! 唯一例外是 MQTT 保活控制报文（PINGREQ/PINGRESP，固定 2 字节）：直连
+//! 承载下两端各有一个 MQTT 客户端，保活报文必须真正跨链路才能发现对端
+//! **静默死亡**（拔网线/休眠）。链路帧仍是「u32 长度 + 完整报文」，只是
+//! 报文允许是 PINGREQ/PINGRESP；用 [`decode_keepalive`] / [`encode_keepalive`]
+//! 与 V1 帧区分（V1 帧首字节是版本号 1，MQTT 保活报文首字节是 0xC0/0xD0）。
+//!
 //! ## 语义约定
 //!
 //! - [`Link::read_frame`]：`Ok(Some(frame))` 收到一帧；`Ok(None)` 对端有序关闭；
@@ -34,8 +40,9 @@ use std::fmt;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use sekai::mqtt::packet::Packet;
 use sekai::sekai_stdin::STDIN_HEADER_LEN;
 use sekai::sekai_stdout::STDOUT_HEADER_LEN;
 use sekai::sekai_wire::MAX_PAYLOAD;
@@ -48,6 +55,12 @@ pub const MAX_FRAME_LEN: usize = STDOUT_HEADER_LEN + MAX_PAYLOAD;
 
 /// Stdin 帧的最大长度（诊断/测试用）。
 pub const MAX_STDIN_FRAME_LEN: usize = STDIN_HEADER_LEN + MAX_PAYLOAD;
+
+/// 直连链路读空闲判定默认阈值（毫秒）：1.5 × 默认 keep_alive（30s）。
+///
+/// 保活报文跨链路后，健康连接每 keep_alive 至少出现一次 PINGREQ/PINGRESP；
+/// 超过 1.5 倍仍未收到任何帧即视为对端静默死亡（P10）。
+pub const DEFAULT_READ_IDLE_TIMEOUT_MS: u64 = 45_000;
 
 /// 链路错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +180,42 @@ fn validate_frame_len(frame: &[u8]) -> Result<(), LinkError> {
         });
     }
     Ok(())
+}
+
+/// 直连链路承载的 MQTT 保活控制报文。
+///
+/// 直连承载下两端各有一个 MQTT 客户端（Router 的 ControlPlane 与 Worker 的
+/// Runtime）；保活必须真正跨链路，否则对端静默死亡无法被发现（P10）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepAlive {
+    /// 保活请求（发送方等待对端回应）。
+    Pingreq,
+    /// 保活应答。
+    Pingresp,
+}
+
+/// 识别链路帧是否为 MQTT 保活控制报文；V1 Stdin/Stdout 帧返回 `None`。
+///
+/// 判定用 MQTT 报文解码：PINGREQ/PINGRESP 是固定 2 字节报文；V1 帧首字节
+/// 是协议版本号 1，不可能被解成保活报文。
+pub fn decode_keepalive(frame: &[u8]) -> Option<KeepAlive> {
+    match Packet::decode(frame) {
+        Ok((Packet::Pingreq, used)) if used == frame.len() => Some(KeepAlive::Pingreq),
+        Ok((Packet::Pingresp, used)) if used == frame.len() => Some(KeepAlive::Pingresp),
+        _ => None,
+    }
+}
+
+/// 编码 MQTT 保活控制报文（作为一条链路帧写出）。
+///
+/// PINGREQ/PINGRESP 是固定两字节报文，编码不会失败；万一失败返回空帧，
+/// 由 [`Link::write_frame`] 的长度校验拒绝，不会静默丢帧。
+pub fn encode_keepalive(kind: KeepAlive) -> Vec<u8> {
+    let packet = match kind {
+        KeepAlive::Pingreq => Packet::Pingreq,
+        KeepAlive::Pingresp => Packet::Pingresp,
+    };
+    packet.encode().unwrap_or_default()
 }
 
 /// 有界流式分帧器：把字节流按「u32 大端长度前缀 + 帧字节」切分。
@@ -472,11 +521,19 @@ impl<R: Read, W: Write> Link for StdioLink<R, W> {
 ///
 /// 读超时视为非致命 [`LinkError::Timeout`]（与 Router 侧 `host_link` 相同的
 /// 20ms 轮询节奏），断线由调用方配合 [`Backoff`] 重连。
+///
+/// 除读超时外还有**读空闲判定**（P10）：超过 [`DEFAULT_READ_IDLE_TIMEOUT_MS`]
+/// 没有收到任何完整帧时返回 I/O 错误，调用方按断链处理并退避重连。健康连接
+/// 因保活报文（PINGREQ/PINGRESP）跨链路而至少每 keep_alive 有一次入站帧。
 pub struct TcpLink {
     stream: Option<TcpStream>,
     decoder: FrameDecoder,
     read_timeout: Duration,
     connect_timeout: Duration,
+    /// 读空闲判定阈值；`None` 关闭判定。
+    read_idle_timeout: Option<Duration>,
+    /// 最近一次成功收到完整帧的时刻。
+    last_rx: Instant,
 }
 
 impl Default for TcpLink {
@@ -486,14 +543,27 @@ impl Default for TcpLink {
 }
 
 impl TcpLink {
-    /// 创建未连接链路；读超时 20ms，连接超时 5s，帧上限 [`MAX_FRAME_LEN`]。
+    /// 创建未连接链路；读超时 20ms，连接超时 5s，帧上限 [`MAX_FRAME_LEN`]，
+    /// 读空闲阈值 [`DEFAULT_READ_IDLE_TIMEOUT_MS`]。
     pub fn new() -> Self {
         Self {
             stream: None,
             decoder: FrameDecoder::new(MAX_FRAME_LEN),
             read_timeout: Duration::from_millis(20),
             connect_timeout: Duration::from_secs(5),
+            read_idle_timeout: Some(Duration::from_millis(DEFAULT_READ_IDLE_TIMEOUT_MS)),
+            last_rx: Instant::now(),
         }
+    }
+
+    /// 设置读空闲判定阈值；`None` 关闭判定（测试/特殊部署用）。
+    pub fn set_read_idle_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_idle_timeout = timeout;
+    }
+
+    /// 当前读空闲阈值。
+    pub fn read_idle_timeout(&self) -> Option<Duration> {
+        self.read_idle_timeout
     }
 
     /// 连接到 `host:port`；先关闭旧连接。
@@ -511,6 +581,7 @@ impl TcpLink {
         let _ = stream.set_read_timeout(Some(self.read_timeout));
         let _ = stream.set_write_timeout(Some(self.connect_timeout));
         self.stream = Some(stream);
+        self.last_rx = Instant::now();
         Ok(())
     }
 
@@ -523,6 +594,21 @@ impl TcpLink {
     pub fn buffered(&self) -> usize {
         self.decoder.buffered()
     }
+
+    /// 读空闲超过阈值时把链路判死（返回 I/O 错误并由调用方重连）。
+    fn check_read_idle(&mut self) -> Result<(), LinkError> {
+        let Some(timeout) = self.read_idle_timeout else {
+            return Ok(());
+        };
+        if self.last_rx.elapsed() < timeout {
+            return Ok(());
+        }
+        let idle_ms = self.last_rx.elapsed().as_millis();
+        self.close();
+        Err(LinkError::Io(format!(
+            "读空闲超时：{idle_ms}ms 未收到对端帧（保活超时，判定对端静默死亡）"
+        )))
+    }
 }
 
 impl Link for TcpLink {
@@ -532,6 +618,7 @@ impl Link for TcpLink {
         };
         loop {
             if let Some(frame) = self.decoder.next_frame()? {
+                self.last_rx = Instant::now();
                 return Ok(Some(frame));
             }
             let mut chunk = [0u8; 2048];
@@ -545,12 +632,11 @@ impl Link for TcpLink {
                     return Ok(None);
                 }
                 Ok(n) => self.decoder.push(&chunk[..n])?,
+                Err(error) if matches!(error.kind(), ErrorKind::Interrupted) => continue,
                 Err(error)
-                    if matches!(
-                        error.kind(),
-                        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                    ) =>
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
+                    self.check_read_idle()?;
                     return Err(LinkError::Timeout);
                 }
                 Err(error) => {
@@ -622,6 +708,7 @@ mod tests {
     use std::io::Cursor;
     use std::net::TcpListener;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     fn frame_bytes(payload: &[u8]) -> Vec<u8> {
         encode_frame(payload).unwrap()
@@ -862,5 +949,54 @@ mod tests {
         let mut link = TcpLink::new();
         let result = link.connect(&format!("127.0.0.1:{port}"));
         assert!(result.is_err() || link.is_connected());
+    }
+
+    #[test]
+    fn keepalive_frames_roundtrip_and_do_not_look_like_v1_frames() {
+        for kind in [KeepAlive::Pingreq, KeepAlive::Pingresp] {
+            let frame = encode_keepalive(kind);
+            assert!(!frame.is_empty());
+            assert_eq!(decode_keepalive(&frame), Some(kind));
+        }
+        // 普通 V1 帧不会被误判成保活报文。
+        let v1 = frame_bytes(b"hello");
+        assert_eq!(decode_keepalive(&v1), None);
+        // 空/截断报文同样不误判。
+        assert_eq!(decode_keepalive(&[]), None);
+        assert_eq!(decode_keepalive(&[0xC0]), None);
+    }
+
+    #[test]
+    fn tcp_link_read_idle_times_out_on_silent_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // 接受连接但永不写帧：模拟对端静默死亡（拔网线/休眠）。
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(1_500));
+        });
+        let mut link = TcpLink::new();
+        link.set_read_idle_timeout(Some(Duration::from_millis(150)));
+        link.connect(&format!("127.0.0.1:{port}")).unwrap();
+        let started = Instant::now();
+        let error = loop {
+            match link.read_frame() {
+                Err(LinkError::Timeout) => {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(3),
+                        "读空闲应在阈值后判死"
+                    );
+                }
+                Err(error) => break error,
+                Ok(Some(frame)) => panic!("不应收到帧：{frame:?}"),
+                Ok(None) => panic!("不应被有序关闭"),
+            }
+        };
+        assert!(
+            matches!(&error, LinkError::Io(message) if message.contains("读空闲超时")),
+            "{error:?}"
+        );
+        assert!(!link.is_connected(), "判死后链路应关闭");
+        server.join().unwrap();
     }
 }

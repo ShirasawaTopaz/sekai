@@ -12,8 +12,17 @@
 //! - 超时/断链不自动重发；
 //! - 按 (worker_id, boot_id, seq) 去重；
 //! - Worker重启/离线时失败其所有在途命令。
+//!
+//! ## 管理面（Router 侧）
+//!
+//! - [`ControlPlane::submit_control`]：管理工具（`sekai.set_time` /
+//!   `sekai.workers.set` / `sekai.cancel`）等控制命令，校验与 [`submit`]
+//!   一致但**绕过**每Worker在途上限；
+//! - [`ControlPlane::cancel`]：按 cmd_id 找到属主Worker后下发 `sekai.cancel`；
+//! - [`ControlPlane::diagnostics`]：在途账本 / 晚到终态环 / 时钟状态快照；
+//! - 首个 Hello 时钟偏差 >2s 或 `unix_ms==0` 时自动下发 `sekai.set_time`。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use sekai::mqtt::client::{Client, ClientConfig, Event, PublishOptions, State};
@@ -23,19 +32,27 @@ use sekai::mqtt::qos::QoS;
 use sekai::mqtt::topic::{Subscription, SubscriptionOptions, TopicFilter, TopicName};
 use sekai::sekai_device_list::Endpoint;
 use sekai::sekai_runtime::{CONTENT_TYPE_STDIN, CONTENT_TYPE_STDOUT};
-use sekai::sekai_stdin::{Stdin, TaskBody, ToolBody};
+use sekai::sekai_stdin::{JumpBody, Stdin, TaskBody, ToolBody};
 use sekai::sekai_stdout::{ErrorPayload, Hello, Phase, Stdout};
 use sekai::sekai_wire::ErrorCode;
 
 use crate::topic::{TopicRoot, parse_incoming};
 use crate::worker::{FrameAcceptance, RegistryEvent, WorkerInfo, WorkerRegistry, phase_name};
 
-/// 每Worker默认在途命令上限。
+/// 每Worker默认在途命令上限（保守默认；产品链路由 `link_builder` 提升到 4，
+/// 允许 prompt 内层在 Task 在途时继续调用同一 Worker 的工具）。
 pub const DEFAULT_MAX_INFLIGHT_PER_WORKER: usize = 1;
 /// Tool 命令的额外超时余量（毫秒）。
-pub const TOOL_TIMEOUT_EXTRA_MS: u64 = 2_000;
+///
+/// 默认 DDL 10s + 5s 余量 = 15s 控制端预算；覆盖 `pc.exec` 自身的 10s 上限，
+/// 避免 3–10s 的真实命令被 Router 先判超时（B4.1）。
+pub const TOOL_TIMEOUT_EXTRA_MS: u64 = 5_000;
 /// Task 命令的额外超时余量（毫秒）。
 pub const TASK_TIMEOUT_EXTRA_MS: u64 = 15_000;
+/// 自动对时的允许偏差（毫秒）：|Worker unix_ms - 本机 now| 超过即校时。
+pub const CLOCK_SYNC_MAX_SKEW_MS: u64 = 2_000;
+/// 晚到终态环形缓冲容量。
+pub const LATE_RESULTS_CAPACITY: usize = 16;
 
 /// 命令类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +61,8 @@ pub enum CommandKind {
     Tool,
     /// Task。
     Task,
+    /// Jump（链路迁移；payload 为 [`JumpBody`] 编码）。
+    Jump,
 }
 
 impl CommandKind {
@@ -52,6 +71,7 @@ impl CommandKind {
         match self {
             Self::Tool => "tool",
             Self::Task => "task",
+            Self::Jump => "jump",
         }
     }
 
@@ -60,6 +80,7 @@ impl CommandKind {
         match self {
             Self::Tool => sekai::sekai_stdin::Kind::ToolCall,
             Self::Task => sekai::sekai_stdin::Kind::Task,
+            Self::Jump => sekai::sekai_stdin::Kind::Jump,
         }
     }
 
@@ -68,9 +89,62 @@ impl CommandKind {
         match value {
             "tool" => Some(Self::Tool),
             "task" => Some(Self::Task),
+            "jump" => Some(Self::Jump),
             _ => None,
         }
     }
+}
+
+// ---- 诊断快照（gateway 层转交给 serve status / REPL /status）----
+
+/// 控制面诊断快照（`serve status` 的 link/inflight/counters/clock 数据源）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayDiagnostics {
+    /// 最近一次链路/协议错误。
+    pub last_error: Option<String>,
+    /// 当前在途命令账本。
+    pub inflight: Vec<InflightCommand>,
+    /// 最近晚到的终态（环形，最旧在前）。
+    pub late_results: Vec<LateResult>,
+    /// 计数。
+    pub counters: GatewayCounters,
+    /// 所有在线Worker时钟是否已校准。
+    pub clock_synced: bool,
+}
+
+/// 在途命令账本项。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InflightCommand {
+    /// 命令 id。
+    pub cmd_id: u64,
+    /// Worker id。
+    pub worker_id: String,
+    /// 工具/任务名（Jump 为目标）。
+    pub name: String,
+    /// 已运行毫秒（由调用方传入的 now_mono 计算）。
+    pub elapsed_ms: u64,
+}
+
+/// 晚到终态记录（超时/取消后 Worker 才回的最终事件）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LateResult {
+    /// 原命令 id。
+    pub cmd_id: u64,
+    /// Worker id。
+    pub worker_id: String,
+    /// 晚到的终态：`completed` / `failed` / `ignored`。
+    pub code: String,
+    /// 该命令从提交到被判定晚到的毫秒数；未知时 0。
+    pub elapsed_ms: u64,
+}
+
+/// 控制面计数。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GatewayCounters {
+    /// 晚到终态累计条数。
+    pub late_results: u64,
+    /// 被丢弃的事件数（当前 ControlPlane 不丢事件，恒 0；由 gateway 合并）。
+    pub dropped_events: u64,
 }
 
 /// 一次命令提交请求。
@@ -118,6 +192,21 @@ impl CommandRequest {
             kind: CommandKind::Task,
             name: name.into(),
             args: args.into(),
+            ddl_ms: 0,
+            timeout_ms: None,
+        }
+    }
+
+    /// 构造 Jump 请求；`target` 为 Worker 端 DeviceList 名称或允许的 `host:port`。
+    ///
+    /// 复用 `name` 字段承载目标（展示 / 日志用），`args` 保持空；
+    /// 实际 Stdin 载荷在 [`encode_payload`] 里编码为 [`JumpBody`]。
+    pub fn jump(worker_id: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            worker_id: worker_id.into(),
+            kind: CommandKind::Jump,
+            name: target.into(),
+            args: Vec::new(),
             ddl_ms: 0,
             timeout_ms: None,
         }
@@ -300,6 +389,8 @@ pub enum ControlError {
     },
     /// Worker在途命令已满。
     WorkerBusy(String),
+    /// 取消/查询时命令 id 不存在（已结束或从未提交）。
+    UnknownCommand(u64),
     /// 协议错误。
     Protocol(String),
     /// 链路错误。
@@ -316,6 +407,7 @@ impl ControlError {
             Self::WorkerOffline(_) => "worker_offline",
             Self::NotAdvertised { .. } => "not_advertised",
             Self::WorkerBusy(_) => "worker_busy",
+            Self::UnknownCommand(_) => "unknown_command",
             Self::Protocol(_) => "protocol_error",
             Self::Link(_) => "link_lost",
         }
@@ -333,6 +425,7 @@ impl fmt::Display for ControlError {
                 write!(f, "Worker {worker_id} 未通告 {name}")
             }
             Self::WorkerBusy(id) => write!(f, "Worker {id} 仍有在途命令"),
+            Self::UnknownCommand(cmd_id) => write!(f, "命令 {cmd_id} 不在在途账本中"),
             Self::Protocol(message) => write!(f, "协议错误：{message}"),
             Self::Link(message) => write!(f, "链路错误：{message}"),
         }
@@ -350,6 +443,8 @@ struct PendingCommand {
     phases: Vec<Phase>,
     submit_mono_ms: u64,
     deadline_mono_ms: u64,
+    /// 静默命令（自动对时 / 内部管理）：终态不产生 `CommandFinished` 事件。
+    silent: bool,
 }
 
 impl PendingCommand {
@@ -375,6 +470,14 @@ pub struct ControlPlane {
     subscribe_packet_id: Option<u16>,
     next_cmd_id: u64,
     last_mono_ms: u64,
+    /// 晚到终态环（容量 [`LATE_RESULTS_CAPACITY`]，最旧在前）。
+    late_results: VecDeque<LateResult>,
+    /// 晚到终态累计条数。
+    late_result_count: u64,
+    /// 每Worker时钟是否已校准（最近一次 Hello 判定）。
+    clock_synced: HashMap<String, bool>,
+    /// 已对时检查过的 (worker_id, boot_id)；每次（重）连首个 Hello 才自动校时。
+    clock_checked: HashSet<(String, u64)>,
 }
 
 impl ControlPlane {
@@ -432,6 +535,10 @@ impl ControlPlane {
             subscribe_packet_id: None,
             next_cmd_id: 0,
             last_mono_ms: 0,
+            late_results: VecDeque::new(),
+            late_result_count: 0,
+            clock_synced: HashMap::new(),
+            clock_checked: HashSet::new(),
         })
     }
 
@@ -506,6 +613,118 @@ impl ControlPlane {
         now_unix_ms: u64,
         now_mono_ms: u64,
     ) -> Result<u64, ControlError> {
+        self.submit_with(request, now_unix_ms, now_mono_ms, false, false)
+    }
+
+    /// 提交管理/控制命令（`sekai.set_time` / `sekai.workers.set` / `sekai.cancel`）。
+    ///
+    /// 校验与 [`ControlPlane::submit`] 相同（ready / 在线 / 已通告），但
+    /// **绕过**每Worker在途命令上限：管理命令必须能在长 Task 在途时送达。
+    pub fn submit_control(
+        &mut self,
+        worker_id: &str,
+        name: &str,
+        payload: Vec<u8>,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<u64, ControlError> {
+        let request = CommandRequest {
+            worker_id: String::from(worker_id),
+            kind: CommandKind::Tool,
+            name: String::from(name),
+            args: payload,
+            ddl_ms: 0,
+            timeout_ms: None,
+        };
+        self.submit_with(request, now_unix_ms, now_mono_ms, true, false)
+    }
+
+    /// 取消一条在途命令：查在途账本找到属主Worker，下发 `sekai.cancel`
+    /// （8 字节大端 cmd_id）。
+    ///
+    /// 返回 `sekai.cancel` 自身的 cmd_id；原命令的最终事件（通常是
+    /// `Failed`/取消）仍由Worker回传并经 [`ControlEvent::CommandFinished`]
+    /// 交给原等待者。
+    pub fn cancel(
+        &mut self,
+        cmd_id: u64,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<u64, ControlError> {
+        let worker_id = self
+            .pending
+            .get(&cmd_id)
+            .map(|pending| pending.worker_id.clone())
+            .ok_or(ControlError::UnknownCommand(cmd_id))?;
+        self.submit_control(
+            &worker_id,
+            "sekai.cancel",
+            cmd_id.to_be_bytes().to_vec(),
+            now_unix_ms,
+            now_mono_ms,
+        )
+    }
+
+    /// 控制面诊断快照（gateway 层转交 serve `status` / REPL `/status`）。
+    ///
+    /// `now_mono_ms` 只用于计算在途命令的已运行时长；调用方传自己的单调钟。
+    pub fn diagnostics(&self, now_mono_ms: u64) -> GatewayDiagnostics {
+        let inflight = self
+            .pending
+            .values()
+            .map(|pending| InflightCommand {
+                cmd_id: pending.cmd_id,
+                worker_id: pending.worker_id.clone(),
+                name: pending.name.clone(),
+                elapsed_ms: now_mono_ms.saturating_sub(pending.submit_mono_ms),
+            })
+            .collect();
+        GatewayDiagnostics {
+            last_error: self.last_error.clone(),
+            inflight,
+            late_results: self.late_results.iter().cloned().collect(),
+            counters: GatewayCounters {
+                late_results: self.late_result_count,
+                dropped_events: 0,
+            },
+            clock_synced: self.all_clocks_synced(),
+        }
+    }
+
+    /// 所有在线Worker时钟是否已校准（无在线Worker时为 false）。
+    pub fn clock_synced(&self) -> bool {
+        self.all_clocks_synced()
+    }
+
+    fn all_clocks_synced(&self) -> bool {
+        let mut online = 0usize;
+        for worker in self.registry.workers() {
+            if !worker.online {
+                continue;
+            }
+            online += 1;
+            if !self
+                .clock_synced
+                .get(&worker.worker_id)
+                .copied()
+                .unwrap_or(false)
+            {
+                return false;
+            }
+        }
+        online > 0
+    }
+
+    /// 提交实现：`bypass_inflight` 供管理命令跳过在途上限；`silent` 让
+    /// 内部命令（自动对时）的终态不产生事件。
+    fn submit_with(
+        &mut self,
+        request: CommandRequest,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+        bypass_inflight: bool,
+        silent: bool,
+    ) -> Result<u64, ControlError> {
         self.last_mono_ms = now_mono_ms;
         if !self.ready || self.client.state() != State::Connected {
             return Err(ControlError::NotReady);
@@ -520,6 +739,8 @@ impl ControlPlane {
         let advertised = match request.kind {
             CommandKind::Tool => worker.has_tool(&request.name),
             CommandKind::Task => worker.has_task(&request.name),
+            // Jump 不是 Worker 通告的能力：目标由 Worker 端 DeviceList 解析。
+            CommandKind::Jump => true,
         };
         if !advertised {
             return Err(ControlError::NotAdvertised {
@@ -527,13 +748,15 @@ impl ControlPlane {
                 name: request.name.clone(),
             });
         }
-        let inflight = self
-            .inflight_by_worker
-            .get(&request.worker_id)
-            .copied()
-            .unwrap_or(0);
-        if inflight >= self.config.max_inflight_per_worker {
-            return Err(ControlError::WorkerBusy(request.worker_id.clone()));
+        if !bypass_inflight {
+            let inflight = self
+                .inflight_by_worker
+                .get(&request.worker_id)
+                .copied()
+                .unwrap_or(0);
+            if inflight >= self.config.max_inflight_per_worker {
+                return Err(ControlError::WorkerBusy(request.worker_id.clone()));
+            }
         }
 
         let effective_ddl = if request.ddl_ms == 0 {
@@ -542,7 +765,7 @@ impl ControlPlane {
             request.ddl_ms
         };
         let extra = match request.kind {
-            CommandKind::Tool => self.config.tool_timeout_extra_ms,
+            CommandKind::Tool | CommandKind::Jump => self.config.tool_timeout_extra_ms,
             CommandKind::Task => self.config.task_timeout_extra_ms,
         };
         let timeout_ms = request
@@ -601,6 +824,7 @@ impl ControlPlane {
             phases: Vec::new(),
             submit_mono_ms: now_mono_ms,
             deadline_mono_ms: now_mono_ms.saturating_add(timeout_ms),
+            silent,
         };
         self.pending.insert(cmd_id, pending);
         *self
@@ -671,6 +895,8 @@ impl ControlPlane {
                 self.ready = false;
                 self.subscribe_packet_id = None;
                 self.last_error = None;
+                // 新连接上重新检查时钟（Worker 可能已重启或未校准）。
+                self.clock_checked.clear();
                 self.subscribe();
                 self.emit_link_state();
                 // 新连接上的 retained Hello/Offline 是权威状态：清空去重窗口，
@@ -696,7 +922,7 @@ impl ControlPlane {
                 self.emit_link_state();
             }
             Event::Publish(publish) => {
-                self.handle_publish(publish)?;
+                self.handle_publish(publish, now_unix_ms)?;
             }
             Event::Suback(suback) => {
                 if Some(suback.packet_id) == self.subscribe_packet_id {
@@ -718,7 +944,6 @@ impl ControlPlane {
             Event::SessionReset { .. } | Event::Auth(_) => {}
             Event::Puback(_) | Event::Pubrec(_) | Event::Pubcomp(_) | Event::Unsuback(_) => {}
         }
-        let _ = now_unix_ms;
         Ok(())
     }
 
@@ -790,6 +1015,9 @@ impl ControlPlane {
         let pending = std::mem::take(&mut self.pending);
         self.inflight_by_worker.clear();
         for (_, command) in pending {
+            if command.silent {
+                continue;
+            }
             let result = Self::failure_result(command, self.last_mono_ms, code, message);
             self.events.push_back(ControlEvent::CommandFinished(result));
         }
@@ -804,8 +1032,11 @@ impl ControlPlane {
             .collect();
         for id in ids {
             if let Some(command) = self.pending.remove(&id) {
+                let silent = command.silent;
                 let result = Self::failure_result(command, self.last_mono_ms, code, message);
-                self.events.push_back(ControlEvent::CommandFinished(result));
+                if !silent {
+                    self.events.push_back(ControlEvent::CommandFinished(result));
+                }
             }
             if let Some(count) = self.inflight_by_worker.get_mut(worker_id) {
                 *count = count.saturating_sub(1);
@@ -826,12 +1057,29 @@ impl ControlPlane {
         for id in expired {
             if let Some(command) = self.pending.remove(&id) {
                 let worker_id = command.worker_id.clone();
+                let silent = command.silent;
                 let result =
                     Self::failure_result(command, now_mono_ms, "timeout", "等待Worker最终事件超时");
-                self.events.push_back(ControlEvent::CommandFinished(result));
+                if !silent {
+                    self.events.push_back(ControlEvent::CommandFinished(result));
+                }
                 self.decrement_inflight(&worker_id);
             }
         }
+    }
+
+    /// 记录一条晚到终态（超时/取消后 Worker 才回）：计数 + 16 条环形缓冲。
+    fn note_late_result(&mut self, cmd_id: u64, worker_id: &str, code: &str) {
+        self.late_result_count = self.late_result_count.saturating_add(1);
+        if self.late_results.len() >= LATE_RESULTS_CAPACITY {
+            self.late_results.pop_front();
+        }
+        self.late_results.push_back(LateResult {
+            cmd_id,
+            worker_id: String::from(worker_id),
+            code: String::from(code),
+            elapsed_ms: 0,
+        });
     }
 
     fn failure_result(
@@ -861,7 +1109,7 @@ impl ControlPlane {
         }
     }
 
-    fn handle_publish(&mut self, publish: Publish) -> Result<(), ControlError> {
+    fn handle_publish(&mut self, publish: Publish, now_unix_ms: u64) -> Result<(), ControlError> {
         let Some(topic) = publish.topic.as_ref() else {
             self.note_error(String::from("忽略无主题的 PUBLISH"));
             return Ok(());
@@ -901,7 +1149,7 @@ impl ControlPlane {
             }
         }
         match stdout.phase {
-            Phase::Hello => self.handle_hello(&worker_id, &stdout),
+            Phase::Hello => self.handle_hello(&worker_id, &stdout, now_unix_ms),
             Phase::Offline => self.handle_offline(&worker_id, &stdout),
             Phase::Accepted | Phase::Started => {
                 self.note_phase(&worker_id, &stdout);
@@ -915,7 +1163,12 @@ impl ControlPlane {
         }
     }
 
-    fn handle_hello(&mut self, worker_id: &str, stdout: &Stdout) -> Result<(), ControlError> {
+    fn handle_hello(
+        &mut self,
+        worker_id: &str,
+        stdout: &Stdout,
+        now_unix_ms: u64,
+    ) -> Result<(), ControlError> {
         let hello = match Hello::decode(&stdout.payload) {
             Ok(hello) => hello,
             Err(error) => {
@@ -944,7 +1197,42 @@ impl ControlPlane {
             }
             Err(error) => self.note_error(error.to_string()),
         }
+        self.note_clock(worker_id, stdout.boot_id, hello.unix_ms, now_unix_ms);
         Ok(())
+    }
+
+    /// 时钟校准（B6）：每次（重）连后首个 Hello 若 `unix_ms==0` 或与本机
+    /// 偏差 > [`CLOCK_SYNC_MAX_SKEW_MS`]，自动下发 `sekai.set_time`
+    /// （8 字节大端 Unix 毫秒，走 [`ControlPlane::submit_control`]——不受
+    /// `--allow-admin` 与在途上限限制）；结果静默消费，不进事件流。
+    fn note_clock(&mut self, worker_id: &str, boot_id: u64, worker_unix_ms: u64, now_unix_ms: u64) {
+        let skew = if worker_unix_ms == 0 {
+            None
+        } else {
+            Some(worker_unix_ms.abs_diff(now_unix_ms))
+        };
+        let synced = skew
+            .map(|value| value <= CLOCK_SYNC_MAX_SKEW_MS)
+            .unwrap_or(false);
+        self.clock_synced.insert(String::from(worker_id), synced);
+        if synced {
+            return;
+        }
+        let key = (String::from(worker_id), boot_id);
+        if !self.clock_checked.insert(key) {
+            // 同一启动周期只自动校时一次（避免 retained Hello 反复触发）。
+            return;
+        }
+        let payload = now_unix_ms.to_be_bytes().to_vec();
+        if let Err(error) = self.submit_control(
+            worker_id,
+            "sekai.set_time",
+            payload,
+            now_unix_ms,
+            self.last_mono_ms,
+        ) {
+            self.note_error(format!("自动对时失败（Worker {worker_id}）：{error}"));
+        }
     }
 
     fn handle_offline(&mut self, worker_id: &str, stdout: &Stdout) -> Result<(), ControlError> {
@@ -986,7 +1274,14 @@ impl ControlPlane {
 
     fn finish_from_stdout(&mut self, worker_id: &str, stdout: &Stdout) {
         let Some(mut pending) = self.pending.remove(&stdout.cmd_id) else {
-            self.note_error(format!("忽略未知 cmd_id {} 的最终事件", stdout.cmd_id));
+            // 晚到终态（已超时/取消）：进环形 late_results 并在 status 可见，
+            // 不再污染 last_error（B8）。
+            let code = match stdout.phase {
+                Phase::Completed => "completed",
+                Phase::Failed => "failed",
+                _ => "ignored",
+            };
+            self.note_late_result(stdout.cmd_id, worker_id, code);
             return;
         };
         if pending.worker_id != worker_id {
@@ -1002,13 +1297,16 @@ impl ControlPlane {
                 "cmd {} 的 boot_id 不匹配：Worker可能已重启但未收到新 Hello",
                 stdout.cmd_id
             ));
+            let silent = pending.silent;
             let result = Self::failure_result(
                 pending,
                 self.last_mono_ms,
                 "worker_rebooted",
                 "Worker boot_id 变化",
             );
-            self.events.push_back(ControlEvent::CommandFinished(result));
+            if !silent {
+                self.events.push_back(ControlEvent::CommandFinished(result));
+            }
             self.decrement_inflight(worker_id);
             return;
         }
@@ -1032,6 +1330,7 @@ impl ControlPlane {
         } else {
             Vec::new()
         };
+        let silent = pending.silent;
         let result = CommandResult {
             cmd_id: pending.cmd_id,
             worker_id: pending.worker_id,
@@ -1042,7 +1341,9 @@ impl ControlPlane {
             elapsed_ms,
             failure,
         };
-        self.events.push_back(ControlEvent::CommandFinished(result));
+        if !silent {
+            self.events.push_back(ControlEvent::CommandFinished(result));
+        }
         self.decrement_inflight(worker_id);
     }
 
@@ -1060,6 +1361,11 @@ fn encode_payload(kind: CommandKind, name: &str, args: &[u8]) -> Result<Vec<u8>,
             .encode()
             .map_err(|error| ControlError::Protocol(error.to_string()))?,
         CommandKind::Task => TaskBody::new(name, args.to_vec())
+            .map_err(|error| ControlError::Protocol(error.to_string()))?
+            .encode()
+            .map_err(|error| ControlError::Protocol(error.to_string()))?,
+        // Jump 复用 name 承载目标（见 [`CommandRequest::jump`]）。
+        CommandKind::Jump => JumpBody::new(name)
             .map_err(|error| ControlError::Protocol(error.to_string()))?
             .encode()
             .map_err(|error| ControlError::Protocol(error.to_string()))?,
@@ -1144,9 +1450,52 @@ mod tests {
 
     #[test]
     fn command_kind_roundtrip() {
-        for kind in [CommandKind::Tool, CommandKind::Task] {
+        for kind in [CommandKind::Tool, CommandKind::Task, CommandKind::Jump] {
             assert_eq!(CommandKind::parse(kind.as_str()), Some(kind));
         }
-        assert_eq!(CommandKind::parse("jump"), None);
+        assert_eq!(CommandKind::parse("jump"), Some(CommandKind::Jump));
+        // Jump 走 Stdin Kind::Jump，且目标编码为 JumpBody 载荷。
+        assert_eq!(
+            CommandKind::Jump.stdin_kind(),
+            sekai::sekai_stdin::Kind::Jump
+        );
+        let payload = encode_payload(CommandKind::Jump, "peer-1", &[]).expect("Jump 载荷");
+        let body = JumpBody::decode(&payload).expect("JumpBody 解码");
+        assert_eq!(body.target, "peer-1");
+    }
+
+    #[test]
+    fn jump_request_uses_target_as_name() {
+        let request = CommandRequest::jump("dev", "peer-1");
+        assert_eq!(request.kind, CommandKind::Jump);
+        assert_eq!(request.name, "peer-1");
+        assert!(request.args.is_empty());
+    }
+
+    #[test]
+    fn cancel_unknown_command_is_stable_error() {
+        let mut plane = ControlPlane::new(config()).expect("plane");
+        let error = plane.cancel(42, 1_790_000_000_000, 0).unwrap_err();
+        assert_eq!(error, ControlError::UnknownCommand(42));
+        assert_eq!(error.code(), "unknown_command");
+    }
+
+    #[test]
+    fn diagnostics_default_is_empty() {
+        let plane = ControlPlane::new(config()).expect("plane");
+        let diagnostics = plane.diagnostics(0);
+        assert!(diagnostics.inflight.is_empty());
+        assert!(diagnostics.late_results.is_empty());
+        assert_eq!(diagnostics.counters.late_results, 0);
+        assert_eq!(diagnostics.counters.dropped_events, 0);
+        assert!(!diagnostics.clock_synced);
+        assert!(diagnostics.last_error.is_none());
+    }
+
+    #[test]
+    fn timeout_constants_match_budget() {
+        // B4.1：默认 DDL 10s + 5s 余量，覆盖 pc.exec 自身 10s 上限。
+        assert_eq!(TOOL_TIMEOUT_EXTRA_MS, 5_000);
+        assert!(u64::from(30_000u32) + TOOL_TIMEOUT_EXTRA_MS >= 10_000);
     }
 }

@@ -6,6 +6,7 @@
 //! 策略在**发布 Stdin 之前**强制执行：模型即使忽略 system prompt，也无法
 //! 绕过 --allow-write / --allow-tasks / --allow-admin / --worker 过滤。
 
+use sekai::sekai_stdout::JumpOutcome;
 use sekai::sekai_wire::{MAX_DDL_MS, truncate_utf8, validate_name, validate_worker_id};
 
 use crate::control::{CommandKind, CommandResult};
@@ -41,6 +42,10 @@ pub const NESTED_PROMPT_TOOL: &str = "pc.ask";
 /// 嵌套 prompt 拒绝时的能力描述（PolicyDenied::Forbidden 的 what）。
 pub const DENIED_NESTED_PROMPT_WHAT: &str = "嵌套 prompt（pc.ask）";
 
+/// 长任务类工具名：即使模型用 `worker_tool` 调用，也按 Task 下发（D5），
+/// 策略上要求 `allow_tasks`（不因为走了 WorkerTool 分支而变成 admin 工具）。
+pub const TASK_CLASS_TOOLS: &[&str] = &["pc.ask", "pc.job"];
+
 /// 工具结果 payload 的展示上限（约 3.5 KiB）；超过时截断并标 truncated。
 pub const PAYLOAD_TRUNCATE_BYTES: usize = 3_584;
 
@@ -64,7 +69,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: String::from(FN_WORKER_TOOL),
             description: String::from(
-                "Invoke a ToolCall on one connected Sekai worker. args is raw UTF-8 tool argument text, e.g. 'gpio.info help'. Returns the worker result or a structured error.",
+                "Invoke a ToolCall on one connected Sekai worker. args is raw UTF-8 tool argument text, e.g. 'gpio.info help'. Returns the worker result or a structured error. If the name is advertised as a Task by the worker (or is a long-running task such as pc.ask/pc.job), the call is routed as a Task automatically. Same worker allows up to 4 parallel commands, so a prompt can continue calling tools while a Task is running.",
             ),
             parameters: object_schema(
                 vec![
@@ -108,7 +113,9 @@ pub fn tool_defs() -> Vec<ToolDef> {
                             ("maximum", Json::num(i64::from(MAX_DDL_MS))),
                             (
                                 "description",
-                                Json::string("Optional execution budget; omit for default."),
+                                Json::string(
+                                    "Optional execution budget in ms (1..=300000); omit for the 10000ms default. Long commands must pass a larger value (pc.ask: 60000 recommended).",
+                                ),
                             ),
                         ]),
                     ),
@@ -119,7 +126,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: String::from(FN_WORKER_TASK),
             description: String::from(
-                "Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled. Returns the worker result or a structured error. Long-running tasks (e.g. pc.ask) must pass an explicit ddl_ms (>=60000 recommended): the default 1s budget will time out.",
+                "Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled. Returns the worker result or a structured error. Long-running tasks (e.g. pc.ask/pc.job) must pass an explicit ddl_ms (60000 recommended, at most 300000): the 10s default budget will time out. Up to 4 commands may run in parallel on the same worker.",
             ),
             parameters: object_schema(
                 vec![
@@ -163,7 +170,9 @@ pub fn tool_defs() -> Vec<ToolDef> {
                             ("maximum", Json::num(i64::from(MAX_DDL_MS))),
                             (
                                 "description",
-                                Json::string("Optional execution budget; omit for default."),
+                                Json::string(
+                                    "Optional execution budget in ms (1..=300000); omit for the 10000ms default. Long commands must pass a larger value (pc.ask: 60000 recommended).",
+                                ),
                             ),
                         ]),
                     ),
@@ -467,56 +476,74 @@ fn parse_ddl(value: &Json) -> Result<Option<u32>, ToolArgError> {
     }
 }
 
-/// 检查策略；发布命令前调用。
+/// 检查策略；发布命令前调用（无 Worker 能力快照，按名字分类）。
 pub fn check_policy(policy: &Policy, call: &ParsedCall) -> Result<(), PolicyDenied> {
+    check_policy_for_worker(policy, call, None)
+}
+
+/// 带 Worker 能力快照的策略检查（D5 动态路由用）。
+///
+/// 分类优先级按**名字**（与最终线类型解耦）：
+/// 1. `deny_llm_relay` 下的 `pc.ask` 一律拒绝（防递归）；
+/// 2. 写工具（gpio.config/gpio.write/pc.write/pc.exec）→ `allow_write`；
+/// 3. Task 类（显式 worker_task / pc.ask / pc.job / Worker 通告的 task 名）
+///    → `allow_tasks`；
+/// 4. 只读工具 → 允许；
+/// 5. 其余用户工具 → `allow_admin`。
+pub fn check_policy_for_worker(
+    policy: &Policy,
+    call: &ParsedCall,
+    worker: Option<&WorkerInfo>,
+) -> Result<(), PolicyDenied> {
     if let Some(worker_id) = call.worker_id()
         && let Some(filter) = &policy.worker_filter
         && filter != worker_id
     {
         return Err(PolicyDenied::WorkerFiltered(String::from(worker_id)));
     }
-    match call {
-        ParsedCall::ListWorkers => Ok(()),
-        ParsedCall::WorkerTask { name, .. } => {
-            // 嵌套 prompt 中继：即使 allow_tasks=true 也拒绝（防递归优先）。
-            if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
-                return Err(PolicyDenied::Forbidden {
-                    what: String::from(DENIED_NESTED_PROMPT_WHAT),
-                });
-            }
-            if policy.allow_tasks {
-                Ok(())
-            } else {
-                Err(PolicyDenied::Forbidden {
-                    what: format!("Task {name}"),
-                })
-            }
-        }
-        ParsedCall::WorkerTool { name, .. } => {
-            // 嵌套 prompt 中继：即使其余策略全开也拒绝（防递归优先）。
-            if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
-                return Err(PolicyDenied::Forbidden {
-                    what: String::from(DENIED_NESTED_PROMPT_WHAT),
-                });
-            }
-            if is_read_only_tool(name) {
-                Ok(())
-            } else if is_write_tool(name) {
-                if policy.allow_write {
-                    Ok(())
-                } else {
-                    Err(PolicyDenied::Forbidden {
-                        what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
-                    })
-                }
-            } else if policy.allow_admin {
-                Ok(())
-            } else {
-                Err(PolicyDenied::Forbidden {
-                    what: format!("工具 {name}"),
-                })
-            }
-        }
+    let (name, is_task_function) = match call {
+        ParsedCall::ListWorkers => return Ok(()),
+        ParsedCall::WorkerTask { name, .. } => (name, true),
+        ParsedCall::WorkerTool { name, .. } => (name, false),
+    };
+    // 嵌套 prompt 中继：即使其余策略全开也拒绝（防递归优先）。
+    if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
+        return Err(PolicyDenied::Forbidden {
+            what: String::from(DENIED_NESTED_PROMPT_WHAT),
+        });
+    }
+    // pc.exec 等写操作：无论用 worker_tool 还是 worker_task 下发都按写分类。
+    if is_write_tool(name) {
+        return if policy.allow_write {
+            Ok(())
+        } else {
+            Err(PolicyDenied::Forbidden {
+                what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
+            })
+        };
+    }
+    // Task 类：显式 worker_task、pc.ask/pc.job、或 Worker 通告的 task 名。
+    let task_like = is_task_function
+        || is_task_class_name(name)
+        || worker.map(|worker| worker.has_task(name)).unwrap_or(false);
+    if task_like {
+        return if policy.allow_tasks {
+            Ok(())
+        } else {
+            Err(PolicyDenied::Forbidden {
+                what: format!("Task {name}"),
+            })
+        };
+    }
+    if is_read_only_tool(name) {
+        return Ok(());
+    }
+    if policy.allow_admin {
+        Ok(())
+    } else {
+        Err(PolicyDenied::Forbidden {
+            what: format!("工具 {name}"),
+        })
     }
 }
 
@@ -530,25 +557,83 @@ pub fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
 
+/// 名字是否属于长任务类（`pc.ask` / `pc.job`）：自动按 Task 下发，且
+/// 策略上要求 `allow_tasks`（D5）。
+pub fn is_task_class_name(name: &str) -> bool {
+    TASK_CLASS_TOOLS.contains(&name)
+}
+
+/// 名字 → 线类型自动路由（D5）。
+///
+/// - 显式 Task 调用保持不变；
+/// - Tool 调用若名字在 Worker 的 `tasks` 列表里，或属于
+///   [`TASK_CLASS_TOOLS`]，改按 Task 下发；
+/// - Jump 不参与路由。
+///
+/// 策略分类仍由 [`check_policy`] 按名字执行（pc.exec=写、pc.ask/pc.job=Task），
+/// 与最终线类型解耦，避免「换函数名绕过 allow_tasks」。
+pub fn route_command_kind(
+    worker: Option<&WorkerInfo>,
+    name: &str,
+    requested: CommandKind,
+) -> CommandKind {
+    match requested {
+        CommandKind::Task => CommandKind::Task,
+        CommandKind::Jump => CommandKind::Jump,
+        CommandKind::Tool => {
+            if is_task_class_name(name)
+                || worker.map(|worker| worker.has_task(name)).unwrap_or(false)
+            {
+                CommandKind::Task
+            } else {
+                CommandKind::Tool
+            }
+        }
+    }
+}
+
 /// 成功/失败结果转 tool JSON（计划 §5.5）。
+///
+/// 成功：cmd_id / elapsed_ms / payload / encoding / phases；
+/// 失败也带 cmd_id / elapsed_ms / phases（B8 审计字段），错误细节在 error。
+/// Jump 成功额外把 Completed 载荷解码成 `jump_endpoint {host,port}`。
 pub fn command_result_json(result: &CommandResult) -> Json {
     let mut value = Json::object(Vec::new());
     value.set("ok", Json::Bool(result.ok()));
     value.set("worker_id", Json::string(result.worker_id.as_str()));
     value.set("kind", Json::string(result.kind.as_str()));
     value.set("name", Json::string(result.name.as_str()));
+    value.set("cmd_id", Json::num(saturating_i64(result.cmd_id)));
+    value.set("elapsed_ms", Json::num(saturating_i64(result.elapsed_ms)));
+    let phases: Vec<Json> = result.phase_names().into_iter().map(Json::string).collect();
+    value.set("phases", Json::Array(phases));
     match &result.failure {
         None => {
-            value.set("cmd_id", Json::num(saturating_i64(result.cmd_id)));
-            value.set("elapsed_ms", Json::num(saturating_i64(result.elapsed_ms)));
             let (payload, encoding, truncated) = encode_payload(&result.payload);
             value.set("payload", Json::string(payload));
             value.set("encoding", Json::string(encoding));
             if truncated {
                 value.set("truncated", Json::Bool(true));
             }
-            let phases: Vec<Json> = result.phase_names().into_iter().map(Json::string).collect();
-            value.set("phases", Json::Array(phases));
+            if result.kind == CommandKind::Jump {
+                match JumpOutcome::decode(&result.payload) {
+                    Ok(outcome) => {
+                        value.set(
+                            "jump_endpoint",
+                            Json::object(vec![
+                                ("host", Json::string(outcome.endpoint.host.as_str())),
+                                ("port", Json::num(i64::from(outcome.endpoint.port))),
+                            ]),
+                        );
+                    }
+                    Err(error) => {
+                        value.set(
+                            "jump_endpoint_error",
+                            Json::string(format!("JumpOutcome 解码失败：{error}")),
+                        );
+                    }
+                }
+            }
         }
         Some(failure) => {
             let mut error = Json::object(Vec::new());
@@ -1070,7 +1155,8 @@ mod tests {
                 "allow_write 应放开 {name}"
             );
         }
-        // pc.ask：既非只读也非写，默认拒绝（allow_admin 可放开）。
+        // pc.ask：按名字归类为 Task（D5），默认拒绝；allow_tasks 放开。
+        // 注意：allow_admin 不再能绕过（长任务必须显式 allow_tasks）。
         let ask = ParsedCall::WorkerTool {
             worker_id: String::from("pc-1"),
             name: String::from(NESTED_PROMPT_TOOL),
@@ -1080,12 +1166,18 @@ mod tests {
         assert_eq!(
             check_policy(&policy, &ask),
             Err(PolicyDenied::Forbidden {
-                what: String::from("工具 pc.ask"),
+                what: String::from("Task pc.ask"),
             })
         );
-        let mut admin = policy;
+        let mut admin = policy.clone();
         admin.allow_admin = true;
-        assert!(check_policy(&admin, &ask).is_ok());
+        assert!(
+            check_policy(&admin, &ask).is_err(),
+            "allow_admin 不能绕过 allow_tasks"
+        );
+        let mut tasks = policy;
+        tasks.allow_tasks = true;
+        assert!(check_policy(&tasks, &ask).is_ok());
     }
 
     #[test]
@@ -1358,5 +1450,167 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn failed_result_json_carries_audit_fields() {
+        let value = command_result_json(&failed_result());
+        assert_eq!(value.get("cmd_id").and_then(Json::as_u64), Some(7));
+        assert_eq!(value.get("elapsed_ms").and_then(Json::as_u64), Some(3));
+        let phases: Vec<&str> = value
+            .get("phases")
+            .and_then(Json::as_array)
+            .unwrap()
+            .iter()
+            .map(|item| item.as_str().unwrap())
+            .collect();
+        assert_eq!(phases, vec!["Accepted", "Failed"]);
+        assert!(value.get("payload").is_none(), "失败结果不带 payload");
+    }
+
+    #[test]
+    fn jump_result_json_decodes_target_endpoint() {
+        let endpoint = sekai::sekai_device_list::Endpoint::new("127.0.0.1", 1884).unwrap();
+        let payload = JumpOutcome::new(endpoint).encode().unwrap();
+        let result = CommandResult {
+            cmd_id: 9,
+            worker_id: String::from("esp32-1"),
+            kind: CommandKind::Jump,
+            name: String::from("peer-1"),
+            payload,
+            phases: vec![Phase::Accepted, Phase::Completed],
+            elapsed_ms: 12,
+            failure: None,
+        };
+        let value = command_result_json(&result);
+        assert_eq!(value.get("kind").and_then(Json::as_str), Some("jump"));
+        let jump = value.get("jump_endpoint").expect("应映射 JumpOutcome");
+        assert_eq!(jump.get("host").and_then(Json::as_str), Some("127.0.0.1"));
+        assert_eq!(jump.get("port").and_then(Json::as_u64), Some(1884));
+    }
+
+    #[test]
+    fn route_command_kind_prefers_task_for_advertised_names() {
+        let worker = sample_worker("host-gpio", true);
+        // explicit Task 保持不变；Jump 不参与路由。
+        assert_eq!(
+            route_command_kind(Some(&worker), "gpio.read", CommandKind::Task),
+            CommandKind::Task
+        );
+        assert_eq!(
+            route_command_kind(Some(&worker), "peer-1", CommandKind::Jump),
+            CommandKind::Jump
+        );
+        // 名字在 Worker tasks 列表 → Task。
+        assert_eq!(
+            route_command_kind(Some(&worker), "echo", CommandKind::Tool),
+            CommandKind::Task
+        );
+        // 长任务类名字固定 Task（即使该 Worker 未通告）。
+        assert_eq!(
+            route_command_kind(None, "pc.ask", CommandKind::Tool),
+            CommandKind::Task
+        );
+        // 普通工具仍为 Tool。
+        assert_eq!(
+            route_command_kind(Some(&worker), "gpio.read", CommandKind::Tool),
+            CommandKind::Tool
+        );
+    }
+
+    #[test]
+    fn check_policy_for_worker_routes_advertised_tasks() {
+        let worker = sample_worker("host-gpio", true); // tasks = ["echo"]
+        let echo_as_tool = ParsedCall::WorkerTool {
+            worker_id: String::from("host-gpio"),
+            name: String::from("echo"),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        // 无快照：按名字分类 → 用户工具，需要 allow_admin。
+        let admin = Policy {
+            allow_admin: true,
+            ..Policy::default()
+        };
+        assert!(check_policy(&admin, &echo_as_tool).is_ok());
+        // 有快照：名字在 Worker tasks 列表 → Task 类，需要 allow_tasks。
+        assert!(check_policy_for_worker(&admin, &echo_as_tool, Some(&worker)).is_err());
+        let tasks = Policy {
+            allow_tasks: true,
+            ..Policy::default()
+        };
+        assert!(check_policy_for_worker(&tasks, &echo_as_tool, Some(&worker)).is_ok());
+        // 显式 worker_task 不依赖快照，始终走 allow_tasks。
+        let echo_task = ParsedCall::WorkerTask {
+            worker_id: String::from("host-gpio"),
+            name: String::from("echo"),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert!(check_policy(&tasks, &echo_task).is_ok());
+        assert!(check_policy(&admin, &echo_task).is_err());
+    }
+
+    #[test]
+    fn task_class_tools_require_allow_tasks() {
+        let call = ParsedCall::WorkerTool {
+            worker_id: String::from("pc-1"),
+            name: String::from("pc.ask"),
+            args: String::from("hi"),
+            ddl_ms: None,
+        };
+        // 用 WorkerTool 调 pc.ask：默认策略拒绝（按名字归类为 Task）。
+        assert!(matches!(
+            check_policy(&Policy::default(), &call),
+            Err(PolicyDenied::Forbidden { .. })
+        ));
+        // allow_admin 不能绕过（长任务类仍要求 allow_tasks）。
+        let admin_only = Policy {
+            allow_admin: true,
+            ..Policy::default()
+        };
+        assert!(
+            check_policy(&admin_only, &call).is_err(),
+            "admin 不能绕过 allow_tasks"
+        );
+        let tasks = Policy {
+            allow_tasks: true,
+            ..Policy::default()
+        };
+        assert!(check_policy(&tasks, &call).is_ok());
+        // pc.exec 走 worker_tool 仍是写操作：allow_tasks 不够。
+        let exec_call = ParsedCall::WorkerTool {
+            worker_id: String::from("pc-1"),
+            name: String::from("pc.exec"),
+            args: String::from("echo hi"),
+            ddl_ms: None,
+        };
+        assert!(
+            check_policy(&tasks, &exec_call).is_err(),
+            "pc.exec 需要 allow_write"
+        );
+    }
+
+    #[test]
+    fn tool_descriptions_mention_parallelism_and_long_ddl() {
+        let defs = tool_defs();
+        let tool = defs.iter().find(|def| def.name == FN_WORKER_TOOL).unwrap();
+        assert!(
+            tool.description.contains("4 parallel"),
+            "{}",
+            tool.description
+        );
+        let task = defs.iter().find(|def| def.name == FN_WORKER_TASK).unwrap();
+        assert!(task.description.contains("pc.ask"), "{}", task.description);
+        assert!(task.description.contains("60000"), "{}", task.description);
+        // ddl_ms 参数说明写明明默认值 10000 与 60000 建议（B4.1）。
+        let task_ddl = task
+            .parameters
+            .get_path(&["properties", "ddl_ms"])
+            .and_then(|value| value.get("description"))
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        assert!(task_ddl.contains("10000"), "{task_ddl}");
+        assert!(task_ddl.contains("60000"), "{task_ddl}");
     }
 }

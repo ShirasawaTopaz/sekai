@@ -1,24 +1,29 @@
-//! 直连网关：把 [`DirectWorkerEndpoint`]（stdio / TCP listen）包装成线程化
+//! 直连网关：把直连链路（stdio 子进程 / TCP 监听 / 注入）包装成线程化
 //! [`WorkerGateway`]，与 [`MqttGateway`](crate::gateway::MqttGateway) 同构。
 //!
 //! ## 线程模型（与 MqttGateway 一致）
 //!
 //! 主线程（agent/CLI/REPL）经 [`WorkerGateway`] trait 调用；IO 线程独占
-//! 直连链路与 ControlPlane 端点，通过 mpsc 收 Call/Shutdown 请求，命令
-//! 结束事件经 `waiters` 通道回复，快照经 `Arc<Mutex<GatewaySnapshot>>` 共享。
+//! 直连链路与 ControlPlane 端点，通过 mpsc 收 Call/Cancel/Shutdown 请求，
+//! 命令结束事件经 `waiters` 通道回复，快照经 `Arc<Mutex<GatewaySnapshot>>`
+//! 共享、诊断经 `Arc<Mutex<GatewayDiagnostics>>` 共享。
 //!
 //! ## IO 线程状态机
 //!
 //! ```text
-//! listen_tcp:   Accepting ──Worker 连入──▶ Connected ──断链──▶ Accepting（等重连）
-//! spawn_stdio:  Connected（子进程）──子进程退出──▶ Closed（拒绝后续 call）
-//! over_link:    Connected ──链路关闭──▶ Closed（测试注入）
+//! listen_tcp:   Listening ──每连接一个端点──▶（常驻 accept，断链只移除该端点）
+//! spawn_stdio:  Single（子进程）──子进程退出──▶ Closed（拒绝后续 call）
+//! over_link:    Single ──链路关闭──▶ Closed（测试注入，单端点语义）
 //! ```
 //!
-//! - **tcp 断链不退出**：监听器随状态保留，Worker 侧自带指数退避重连，
-//!   重连后新 Hello 在全新 ControlPlane 注册表重新注册；
-//! - **stdio 子进程死亡是终态**：网关保持存活但 `ready=false`，后续 call
-//!   以 `link_lost` 拒绝；不自动重启子进程（由会话层重新 `/link stdio`）。
+//! - **tcp 多 Worker（B1）**：监听器常驻，每次 accept 建一条独立
+//!   [`DirectWorkerEndpoint`]（各自独立 ControlPlane 注册表/命令空间）；
+//!   派工按 Hello 上报的 `worker_id` **精确路由**到属主端点；
+//!   `list_workers` 聚合全部端点，`wait_ready`/`is_ready` 任一端点就绪即可；
+//!   同一 `worker_id` 的后来连接顶替旧连接（关闭旧连接并记录 `last_error`）；
+//! - **stdio 单端点**：行为与旧版一致，子进程死亡是终态，`ready=false`，
+//!   后续 call 以 `link_lost` 拒绝（由会话层重新 `/link stdio`）；
+//! - **跳-/断链**：tcp 端点断开只移除该端点，监听器与其它 Worker 不受影响。
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -29,15 +34,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sekai::sekai_device_list::Endpoint;
 use sekai_worker::link::Link;
 
-use crate::control::{CommandKind, CommandRequest, CommandResult, ControlPlaneConfig};
+use crate::control::{
+    CommandKind, CommandRequest, CommandResult, ControlPlaneConfig, GatewayDiagnostics,
+};
 use crate::direct::{AcceptedTcpLink, DirectListener, DirectWorkerEndpoint, StdioWorkerLink};
 use crate::gateway::{
-    CommandReceipt, GatewayError, GatewayOp, GatewaySnapshot, WorkerGateway, call_budget_ms,
+    CANCEL_ACK_TIMEOUT_MS, CommandReceipt, GatewayError, GatewayOp, GatewaySnapshot,
+    SUBMIT_ACCEPTED_TIMEOUT_MS, WorkerGateway, call_budget_ms,
 };
 
 /// 主线程等待就绪时的轮询间隔（毫秒）。
 const WAIT_READY_POLL_MS: u64 = 5;
-/// Accepting / Closed 状态下每轮最长睡眠（毫秒）。
+/// 无连接时 accept / Closed 状态下每轮最长睡眠（毫秒）。
 const IDLE_POLL_MS: u64 = 50;
 /// IO 线程名。
 const IO_THREAD_NAME: &str = "sekai-router-direct";
@@ -126,23 +134,90 @@ impl Link for ServerLink {
     }
 }
 
+/// 一条直连连接：端点 + 该连接自己的等待者表。
+///
+/// cmd_id 只在一条连接的 ControlPlane 命名空间内唯一，因此等待者必须按连接
+/// 隔离（不同连接的 ControlPlane 可能生成相同 cmd_id）。
+struct DirectConnection {
+    endpoint: DirectWorkerEndpoint<ServerLink>,
+    waiters: HashMap<u64, Sender<Result<CommandResult, GatewayError>>>,
+}
+
+impl DirectConnection {
+    fn new(endpoint: DirectWorkerEndpoint<ServerLink>) -> Self {
+        Self {
+            endpoint,
+            waiters: HashMap::new(),
+        }
+    }
+
+    /// 提交命令（`management` 为 true 时绕过每 Worker 在途上限）。
+    fn submit(
+        &mut self,
+        request: CommandRequest,
+        management: bool,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<u64, GatewayError> {
+        let result = if management {
+            self.endpoint
+                .submit_control(request, now_unix_ms, now_mono_ms)
+        } else {
+            self.endpoint.submit(request, now_unix_ms, now_mono_ms)
+        };
+        result.map_err(|error| GatewayError::from_control(&error))
+    }
+
+    /// 取消在途命令（透传 `ControlPlane::cancel`）。
+    fn cancel(
+        &mut self,
+        cmd_id: u64,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<(), GatewayError> {
+        self.endpoint
+            .cancel(cmd_id, now_unix_ms, now_mono_ms)
+            .map(|_| ())
+            .map_err(|error| GatewayError::from_control(&error))
+    }
+
+    /// 回收本连接的命令结束事件并回复等待者。
+    fn drain_events(&mut self) {
+        let mut finished = Vec::new();
+        for event in self.endpoint.take_events() {
+            if let crate::control::ControlEvent::CommandFinished(result) = event {
+                finished.push(result);
+            }
+        }
+        for result in finished {
+            if let Some(reply) = self.waiters.remove(&result.cmd_id) {
+                let _ = reply.send(Ok(result));
+            }
+        }
+    }
+
+    /// 失败本连接全部等待者（链路断开 / 被新连接顶替）。
+    fn fail_waiters(&mut self, code: &str, message: &str) {
+        let waiters = std::mem::take(&mut self.waiters);
+        for (_, reply) in waiters {
+            let _ = reply.send(Err(GatewayError::new(code, message)));
+        }
+    }
+}
+
 /// IO 线程状态。
-// Connected 变体（端点 + 可选监听器）显著大于其余变体：该枚举为 IO 线程
-// 独占、切换频率低，装箱省内存会牵动全部构造与 match 位点，得不偿失，
-// 此处显式豁免 large_enum_variant。
+// Listening/Single 变体都持有较大的端点状态：该枚举由 IO 线程独占、
+// 切换频率低，装箱会牵动全部构造与 match 位点，得不偿失，显式豁免。
 #[allow(clippy::large_enum_variant)]
 enum IoState {
-    /// tcp：等待 Worker 连入。
-    Accepting { listener: DirectListener },
-    /// 链路已建立（端点内含 ControlPlane）。
-    ///
-    /// `listener` 在 tcp 模式保留，断链后回到 [`IoState::Accepting`]；
-    /// stdio/注入为 `None`，断链即终态。
-    Connected {
-        endpoint: DirectWorkerEndpoint<ServerLink>,
-        listener: Option<DirectListener>,
+    /// tcp：常驻监听 + 多端点表（每条连接一个独立 ControlPlane）。
+    Listening {
+        listener: DirectListener,
+        connections: Vec<DirectConnection>,
     },
-    /// 终态（stdio 子进程退出 / 注入链路关闭）：拒绝后续 call。
+    /// stdio / 注入：单端点语义（链路断开即终态）。
+    Single { connection: DirectConnection },
+    /// 终态：只等请求，拒绝 call。
     Closed,
 }
 
@@ -152,6 +227,8 @@ pub struct DirectGateway {
     mode: DirectMode,
     requests: Sender<GatewayOp>,
     snapshot: Arc<Mutex<GatewaySnapshot>>,
+    /// IO 线程维护的控制面诊断快照（`diagnostics` 直接 clone）。
+    diagnostics: Arc<Mutex<GatewayDiagnostics>>,
     io_worker: Option<JoinHandle<()>>,
 }
 
@@ -174,14 +251,13 @@ impl DirectGateway {
             DirectMode::StdioSpawn {
                 program: program.to_string(),
             },
-            IoState::Connected {
-                endpoint,
-                listener: None,
+            IoState::Single {
+                connection: DirectConnection::new(endpoint),
             },
         )
     }
 
-    /// tcp listen 模式：监听 `addr` 等 Worker 连入；断链后回到等待状态。
+    /// tcp listen 模式：常驻监听 `addr`，每个连入的 Worker 一条独立端点。
     ///
     /// 绑定失败同步返回错误；实际地址（支持端口 0 自动分配）记录在
     /// [`DirectMode::TcpListen`]，可经 [`DirectGateway::mode`] 读取。
@@ -196,11 +272,14 @@ impl DirectGateway {
         Self::start(
             config,
             DirectMode::TcpListen { addr: local },
-            IoState::Accepting { listener },
+            IoState::Listening {
+                listener,
+                connections: Vec::new(),
+            },
         )
     }
 
-    /// 注入链路（测试）：直接包装一条已建立的链路。
+    /// 注入链路（测试）：直接包装一条已建立的链路（单端点语义）。
     pub fn over_link(
         link: Box<dyn Link + Send>,
         config: DirectGatewayConfig,
@@ -209,9 +288,8 @@ impl DirectGateway {
         Self::start(
             config,
             DirectMode::Injected,
-            IoState::Connected {
-                endpoint,
-                listener: None,
+            IoState::Single {
+                connection: DirectConnection::new(endpoint),
             },
         )
     }
@@ -229,8 +307,10 @@ impl DirectGateway {
         state: IoState,
     ) -> Result<Self, GatewayError> {
         let snapshot = Arc::new(Mutex::new(GatewaySnapshot::default()));
+        let diagnostics = Arc::new(Mutex::new(GatewayDiagnostics::default()));
         let (requests_tx, requests_rx) = mpsc::channel();
         let io_snapshot = Arc::clone(&snapshot);
+        let io_diagnostics = Arc::clone(&diagnostics);
         let io_config = config.clone();
         let io_worker = std::thread::Builder::new()
             .name(String::from(IO_THREAD_NAME))
@@ -239,8 +319,8 @@ impl DirectGateway {
                     config: io_config,
                     state,
                     snapshot: io_snapshot,
+                    diagnostics: io_diagnostics,
                     requests: requests_rx,
-                    waiters: HashMap::new(),
                     start: Instant::now(),
                 }
                 .run();
@@ -253,6 +333,7 @@ impl DirectGateway {
             mode,
             requests: requests_tx,
             snapshot,
+            diagnostics,
             io_worker: Some(io_worker),
         })
     }
@@ -267,6 +348,9 @@ impl DirectGateway {
                 snapshot.connected = false;
                 snapshot.workers.clear();
             }
+            if let Ok(mut diagnostics) = self.diagnostics.lock() {
+                *diagnostics = GatewayDiagnostics::default();
+            }
         }
     }
 
@@ -277,11 +361,79 @@ impl DirectGateway {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
+    /// 控制面诊断快照读取（IO 线程每轮刷新，直接 clone）。
+    fn diagnostics_snapshot(&self) -> GatewayDiagnostics {
+        self.diagnostics
+            .lock()
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
     fn worker_alive(&self) -> bool {
         self.io_worker
             .as_ref()
             .map(|io_worker| !io_worker.is_finished())
             .unwrap_or(false)
+    }
+
+    /// 提交命令的公共实现：规整 DDL/超时、发送 IO op、有界等待 cmd_id。
+    fn dispatch_request(
+        &mut self,
+        mut request: CommandRequest,
+        management: bool,
+    ) -> Result<CommandReceipt, GatewayError> {
+        if request.ddl_ms == 0 {
+            request.ddl_ms = self.config.default_ddl_ms.max(1);
+        }
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = match request.kind {
+                CommandKind::Tool => self.config.tool_timeout_ms,
+                CommandKind::Task | CommandKind::Jump => self.config.task_timeout_ms,
+            };
+        }
+        let budget = call_budget_ms(
+            self.config.default_ddl_ms,
+            self.config.tool_timeout_ms,
+            self.config.task_timeout_ms,
+            &request,
+        );
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        self.requests
+            .send(GatewayOp::Call {
+                request,
+                reply: reply_tx,
+                accepted: accepted_tx,
+                management,
+            })
+            .map_err(|_| GatewayError::new("link_lost", "直连 IO 线程已退出"))?;
+        // 有界等待 cmd_id（取消契约）：超时/失败都返回回执，最终事件语义不变。
+        let cmd_id = accepted_rx
+            .recv_timeout(Duration::from_millis(SUBMIT_ACCEPTED_TIMEOUT_MS))
+            .unwrap_or(0);
+        Ok(CommandReceipt::with_cmd_id(
+            reply_rx, budget, "直连", cmd_id,
+        ))
+    }
+
+    /// 发送 Cancel 操作并等待 IO 线程确认（有界）。
+    fn dispatch_cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.requests
+            .send(GatewayOp::Cancel {
+                cmd_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| GatewayError::new("link_lost", "直连 IO 线程已退出"))?;
+        match reply_rx.recv_timeout(Duration::from_millis(CANCEL_ACK_TIMEOUT_MS)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                Err(GatewayError::new("timeout", "等待直连 IO 线程确认取消超时"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(GatewayError::new("link_lost", "直连 IO 线程已退出"))
+            }
+        }
     }
 }
 
@@ -296,30 +448,20 @@ impl WorkerGateway for DirectGateway {
         self.snapshot().workers
     }
 
-    fn submit(&mut self, mut request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
-        if request.ddl_ms == 0 {
-            request.ddl_ms = self.config.default_ddl_ms.max(1);
-        }
-        if request.timeout_ms.is_none() {
-            request.timeout_ms = match request.kind {
-                CommandKind::Tool => self.config.tool_timeout_ms,
-                CommandKind::Task => self.config.task_timeout_ms,
-            };
-        }
-        let budget = call_budget_ms(
-            self.config.default_ddl_ms,
-            self.config.tool_timeout_ms,
-            self.config.task_timeout_ms,
-            &request,
-        );
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests
-            .send(GatewayOp::Call {
-                request,
-                reply: reply_tx,
-            })
-            .map_err(|_| GatewayError::new("link_lost", "直连 IO 线程已退出"))?;
-        Ok(CommandReceipt::new(reply_rx, budget, "直连"))
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.dispatch_request(request, false)
+    }
+
+    fn submit_control(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.dispatch_request(request, true)
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        self.dispatch_cancel(cmd_id)
+    }
+
+    fn diagnostics(&mut self) -> GatewayDiagnostics {
+        self.diagnostics_snapshot()
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
@@ -373,8 +515,8 @@ struct DirectIoWorker {
     config: DirectGatewayConfig,
     state: IoState,
     snapshot: Arc<Mutex<GatewaySnapshot>>,
+    diagnostics: Arc<Mutex<GatewayDiagnostics>>,
     requests: Receiver<GatewayOp>,
-    waiters: HashMap<u64, Sender<Result<CommandResult, GatewayError>>>,
     start: Instant,
 }
 
@@ -384,93 +526,134 @@ impl DirectIoWorker {
             if self.pump_ops() {
                 break;
             }
-            // 在状态借用内只做无自借用冲突的工作；事件排空/快照/迁移
-            // 统一放在 match 之后。
-            let mut note: Option<String> = None;
-            let mut drain = false;
-            let mut relisten: Option<DirectListener> = None;
-            let mut finalize = false;
+            let now_unix = now_ms();
             let now_mono = self.now_mono_ms();
-
-            // tcp：Accepting 状态限时等连入。监听器经 mem::replace 取出、
-            // 建立连接后随端点一起保留（断链时放回），否则连接一旦建立
-            // 监听器就被丢弃、无法回到等待状态。
-            if let IoState::Accepting { .. } = self.state {
-                let listener = match std::mem::replace(&mut self.state, IoState::Closed) {
-                    IoState::Accepting { listener } => listener,
-                    _ => unreachable!("上方已判定为 Accepting"),
-                };
-                match listener.accept_link_timeout(Duration::from_millis(IDLE_POLL_MS)) {
-                    Ok(Some(link)) => match build_endpoint(&self.config, ServerLink::Tcp(link)) {
-                        Ok(endpoint) => {
-                            self.state = IoState::Connected {
-                                endpoint,
-                                listener: Some(listener),
-                            };
-                        }
-                        Err(error) => {
-                            note = Some(format!("建立直连端点失败：{error}"));
-                            self.state = IoState::Accepting { listener };
-                        }
-                    },
-                    Ok(None) => self.state = IoState::Accepting { listener },
-                    Err(error) => {
-                        note = Some(format!("accept 失败：{error}"));
-                        std::thread::sleep(Duration::from_millis(IDLE_POLL_MS));
-                        self.state = IoState::Accepting { listener };
-                    }
-                }
-            }
-
+            // 本轮要记录的 last_error（在 state 借用结束后统一写入）。
+            let mut notes: Vec<String> = Vec::new();
+            // Single 端点链路关闭：借用结束后把状态切到 Closed。
+            let mut single_closed = false;
             match &mut self.state {
-                IoState::Accepting { .. } => {
-                    // accept 已在上方处理，这里无事可做。
-                }
-                IoState::Connected { endpoint, listener } => {
-                    let now_unix = now_ms();
-                    if let Err(error) = endpoint.pump(now_unix, now_mono) {
-                        note = Some(format!("控制平面错误：{error}"));
-                    }
-                    let open = endpoint.is_open();
-                    drain = true;
-                    if !open && let Some(back) = listener.take() {
-                        relisten = Some(back);
-                    } else if !open {
-                        finalize = true;
-                    }
-                }
-                IoState::Closed => {
-                    // 终态：只等请求，保持线程可关停。
-                    match self
-                        .requests
-                        .recv_timeout(Duration::from_millis(IDLE_POLL_MS))
-                    {
-                        Ok(op) => {
-                            if self.handle_op(op) {
+                IoState::Listening {
+                    listener,
+                    connections,
+                } => {
+                    // 1) 排空待接受的连接；没有连接时用限时 accept 给线程留出
+                    //    处理 Shutdown/Call 的节奏。监听器常驻，永不移交。
+                    loop {
+                        let accept_wait = if connections.is_empty() {
+                            Duration::from_millis(IDLE_POLL_MS)
+                        } else {
+                            Duration::ZERO
+                        };
+                        match listener.accept_link_timeout(accept_wait) {
+                            Ok(Some(link)) => {
+                                match build_endpoint(&self.config, ServerLink::Tcp(link)) {
+                                    Ok(endpoint) => {
+                                        connections.push(DirectConnection::new(endpoint));
+                                    }
+                                    Err(error) => {
+                                        notes.push(format!("建立直连端点失败：{error}"));
+                                    }
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                notes.push(format!("accept 失败：{error}"));
                                 break;
                             }
                         }
-                        Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+                    }
+                    // 2) 泵每条连接（入站帧 → ControlPlane → 出站帧）。
+                    for connection in connections.iter_mut() {
+                        if let Err(error) = connection.endpoint.pump(now_unix, now_mono) {
+                            notes.push(format!("控制平面错误：{error}"));
+                        }
+                    }
+                    // 3) 回收事件（先回复已完成的命令，再处理断链）。
+                    for connection in connections.iter_mut() {
+                        connection.drain_events();
+                    }
+                    // 4) 断开的连接 + 同一 worker_id 被新连接顶替的旧连接。
+                    let mut removals: Vec<(usize, &'static str, String)> = Vec::new();
+                    for (index, connection) in connections.iter().enumerate() {
+                        if connection.endpoint.is_open() {
+                            continue;
+                        }
+                        if let Some(last_error) = connection.endpoint.last_error() {
+                            notes.push(format!("直连链路断开：{last_error}"));
+                        }
+                        removals.push((
+                            index,
+                            "link_lost",
+                            String::from("直连链路断开，等待 Worker 重连"),
+                        ));
+                    }
+                    // 按连接建立顺序扫描：先入表者让位给后来者（后来者胜）。
+                    let mut owner: HashMap<String, usize> = HashMap::new();
+                    for (index, connection) in connections.iter().enumerate() {
+                        for worker in connection.endpoint.workers() {
+                            if let Some(previous) = owner.insert(worker.worker_id.clone(), index)
+                                && previous != index
+                            {
+                                notes.push(format!(
+                                    "Worker {} 的新连接顶替了旧连接",
+                                    worker.worker_id
+                                ));
+                                removals.push((
+                                    previous,
+                                    "link_lost",
+                                    format!(
+                                        "Worker {} 已被新连接顶替，旧连接关闭",
+                                        worker.worker_id
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    removals.sort_by_key(|(index, _, _)| *index);
+                    removals.dedup_by_key(|(index, _, _)| *index);
+                    // 5) 关闭并移除（倒序删除避免下标漂移）。
+                    for (index, code, message) in removals.into_iter().rev() {
+                        let mut connection = connections.remove(index);
+                        connection.endpoint.close(now_unix);
+                        connection.fail_waiters(code, &message);
+                    }
+                    // 无连接时不要空转：限时 accept 依赖 listener 状态，此处已
+                    // 在下一轮 1) 中以 IDLE_POLL_MS 限时等待。
+                }
+                IoState::Single { connection } => {
+                    if let Err(error) = connection.endpoint.pump(now_unix, now_mono) {
+                        notes.push(format!("控制平面错误：{error}"));
+                    }
+                    connection.drain_events();
+                    if !connection.endpoint.is_open() {
+                        if let Some(last_error) = connection.endpoint.last_error() {
+                            notes.push(format!("直连链路断开：{last_error}"));
+                        }
+                        connection.fail_waiters("link_lost", "直连链路已断开");
+                        single_closed = true;
                     }
                 }
+                IoState::Closed => match self
+                    .requests
+                    .recv_timeout(Duration::from_millis(IDLE_POLL_MS))
+                {
+                    Ok(op) => {
+                        if self.handle_op(op) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+                },
             }
-            if let Some(message) = note {
+            if single_closed {
+                self.state = IoState::Closed;
+            }
+            for message in notes {
                 self.note(message);
             }
-            if drain {
-                self.drain_events();
-            }
-            if relisten.is_some() || finalize {
-                self.publish_snapshot();
-                if let Some(listener) = relisten {
-                    self.fail_waiters("link_lost", "直连链路断开，等待 Worker 重连");
-                    self.state = IoState::Accepting { listener };
-                } else {
-                    self.fail_waiters("link_lost", "直连链路已断开");
-                    self.state = IoState::Closed;
-                }
-            }
             self.publish_snapshot();
+            self.publish_diagnostics();
         }
         self.shutdown_state();
     }
@@ -492,83 +675,124 @@ impl DirectIoWorker {
     /// 处理一个请求；返回 true 表示 Shutdown。
     fn handle_op(&mut self, op: GatewayOp) -> bool {
         match op {
-            GatewayOp::Call { request, reply } => self.dispatch_call(request, reply),
+            GatewayOp::Call {
+                request,
+                reply,
+                accepted,
+                management,
+            } => self.dispatch_call(request, reply, accepted, management),
+            GatewayOp::Cancel { cmd_id, reply } => self.dispatch_cancel(cmd_id, reply),
             GatewayOp::Shutdown => return true,
         }
         false
     }
 
+    /// 派工：按 `worker_id` 路由到属主连接。
     fn dispatch_call(
         &mut self,
         request: CommandRequest,
         reply: Sender<Result<CommandResult, GatewayError>>,
+        accepted: Sender<u64>,
+        management: bool,
     ) {
         let now_unix = now_ms();
         let now_mono = self.now_mono_ms();
-        // 先在端点借用内完成 submit，避免与 self.waiters/snapshot 重叠借用。
-        enum Outcome {
-            Submitted(Result<u64, crate::control::ControlError>),
-            Rejected(&'static str),
-        }
-        let outcome = match &mut self.state {
-            IoState::Connected { endpoint, .. } => {
-                Outcome::Submitted(endpoint.submit(request, now_unix, now_mono))
+        let worker_id = request.worker_id.clone();
+        match &mut self.state {
+            IoState::Listening { connections, .. } => {
+                let target = connections.iter().position(|connection| {
+                    connection
+                        .endpoint
+                        .worker(&worker_id)
+                        .map(|worker| worker.online)
+                        .unwrap_or(false)
+                });
+                match target {
+                    Some(index) => {
+                        match connections[index].submit(request, management, now_unix, now_mono) {
+                            Ok(cmd_id) => {
+                                // 先回传 cmd_id（调用方据此取消），再等最终事件。
+                                let _ = accepted.send(cmd_id);
+                                connections[index].waiters.insert(cmd_id, reply);
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                            }
+                        }
+                    }
+                    None => {
+                        let any_open = connections
+                            .iter()
+                            .any(|connection| connection.endpoint.is_open());
+                        let error = if any_open {
+                            GatewayError::new(
+                                "worker_not_found",
+                                format!("Worker {worker_id} 不存在"),
+                            )
+                        } else {
+                            GatewayError::new("link_lost", "直连链路未就绪（等待 Worker 连入）")
+                        };
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
-            IoState::Accepting { .. } => Outcome::Rejected("直连链路未就绪（等待 Worker 连入）"),
-            IoState::Closed => Outcome::Rejected("直连链路已断开"),
-        };
-        match outcome {
-            Outcome::Submitted(Ok(cmd_id)) => {
-                self.waiters.insert(cmd_id, reply);
+            IoState::Single { connection } => {
+                if !connection.endpoint.is_open() {
+                    let _ = reply.send(Err(GatewayError::new("link_lost", "直连链路已断开")));
+                } else {
+                    match connection.submit(request, management, now_unix, now_mono) {
+                        Ok(cmd_id) => {
+                            let _ = accepted.send(cmd_id);
+                            connection.waiters.insert(cmd_id, reply);
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                        }
+                    }
+                }
             }
-            Outcome::Submitted(Err(error)) => {
-                let _ = reply.send(Err(GatewayError::new(error.code(), error.to_string())));
-            }
-            Outcome::Rejected(message) => {
-                let _ = reply.send(Err(GatewayError::new("link_lost", message)));
+            IoState::Closed => {
+                let _ = reply.send(Err(GatewayError::new("link_lost", "直连链路已断开")));
             }
         }
         self.publish_snapshot();
     }
 
-    fn drain_events(&mut self) {
-        let IoState::Connected { endpoint, .. } = &mut self.state else {
-            return;
-        };
-        let mut finished = Vec::new();
-        for event in endpoint.take_events() {
-            if let crate::control::ControlEvent::CommandFinished(result) = event {
-                finished.push(result);
+    /// 取消：找到 cmd_id 的属主连接后透传 `ControlPlane::cancel`。
+    fn dispatch_cancel(&mut self, cmd_id: u64, reply: Sender<Result<(), GatewayError>>) {
+        let now_unix = now_ms();
+        let now_mono = self.now_mono_ms();
+        let result = match &mut self.state {
+            IoState::Listening { connections, .. } => {
+                let any_open = connections
+                    .iter()
+                    .any(|connection| connection.endpoint.is_open());
+                let target = connections
+                    .iter()
+                    .position(|connection| connection.waiters.contains_key(&cmd_id));
+                match (target, any_open) {
+                    (Some(index), _) => connections[index].cancel(cmd_id, now_unix, now_mono),
+                    (None, true) => Err(GatewayError::new(
+                        "unknown_command",
+                        format!("命令 {cmd_id} 不在在途账本中"),
+                    )),
+                    (None, false) => Err(GatewayError::new(
+                        "link_lost",
+                        "直连链路未就绪（等待 Worker 连入）",
+                    )),
+                }
             }
-        }
-        for result in finished {
-            if let Some(reply) = self.waiters.remove(&result.cmd_id) {
-                let _ = reply.send(Ok(result));
+            IoState::Single { connection } => {
+                if connection.endpoint.is_open() {
+                    connection.cancel(cmd_id, now_unix, now_mono)
+                } else {
+                    Err(GatewayError::new("link_lost", "直连链路已断开"))
+                }
             }
-        }
-    }
-
-    fn fail_waiters(&mut self, code: &str, message: &str) {
-        let waiters = std::mem::take(&mut self.waiters);
-        for (_, reply) in waiters {
-            let _ = reply.send(Err(GatewayError::new(code, message)));
-        }
-    }
-
-    fn publish_snapshot(&mut self) {
-        let (workers, ready, connected) = match &self.state {
-            IoState::Connected { endpoint, .. } => (
-                endpoint.workers(),
-                endpoint.is_ready() && endpoint.is_open(),
-                endpoint.is_open(),
-            ),
-            IoState::Accepting { .. } | IoState::Closed => (Vec::new(), false, false),
+            IoState::Closed => Err(GatewayError::new("link_lost", "直连链路已断开")),
         };
-        if let Ok(mut snapshot) = self.snapshot.lock() {
-            snapshot.workers = workers;
-            snapshot.ready = ready;
-            snapshot.connected = connected;
-        }
+        let _ = reply.send(result);
+        self.publish_snapshot();
     }
 
     fn note(&mut self, message: String) {
@@ -577,16 +801,93 @@ impl DirectIoWorker {
         }
     }
 
+    fn publish_snapshot(&mut self) {
+        let (workers, ready, connected) = match &self.state {
+            IoState::Listening { connections, .. } => {
+                let mut workers = Vec::new();
+                for connection in connections {
+                    workers.extend(connection.endpoint.workers());
+                }
+                // 任一端点就绪即 ready（多 Worker 只需连上一个即可派工）；
+                // connected 表示至少有一条链路打开。
+                let ready = connections.iter().any(|connection| {
+                    connection.endpoint.is_ready() && connection.endpoint.is_open()
+                });
+                let connected = connections
+                    .iter()
+                    .any(|connection| connection.endpoint.is_open());
+                (workers, ready, connected)
+            }
+            IoState::Single { connection } => (
+                connection.endpoint.workers(),
+                connection.endpoint.is_ready() && connection.endpoint.is_open(),
+                connection.endpoint.is_open(),
+            ),
+            IoState::Closed => (Vec::new(), false, false),
+        };
+        if let Ok(mut snapshot) = self.snapshot.lock() {
+            snapshot.workers = workers;
+            snapshot.ready = ready;
+            snapshot.connected = connected;
+        }
+    }
+
+    /// 聚合各端点的 ControlPlane 诊断（多端点时合并 inflight/late_results/计数）。
+    fn publish_diagnostics(&mut self) {
+        let now_mono = self.now_mono_ms();
+        let merged = match &self.state {
+            IoState::Listening { connections, .. } => {
+                let mut merged = GatewayDiagnostics::default();
+                let mut clocks_synced = !connections.is_empty();
+                for connection in connections {
+                    let diagnostics = connection.endpoint.plane().diagnostics(now_mono);
+                    if merged.last_error.is_none() {
+                        merged.last_error = diagnostics.last_error;
+                    }
+                    merged.inflight.extend(diagnostics.inflight);
+                    merged.late_results.extend(diagnostics.late_results);
+                    merged.counters.late_results = merged
+                        .counters
+                        .late_results
+                        .saturating_add(diagnostics.counters.late_results);
+                    merged.counters.dropped_events = merged
+                        .counters
+                        .dropped_events
+                        .saturating_add(diagnostics.counters.dropped_events);
+                    clocks_synced &= diagnostics.clock_synced;
+                }
+                merged.clock_synced = clocks_synced;
+                merged
+            }
+            IoState::Single { connection } => connection.endpoint.plane().diagnostics(now_mono),
+            IoState::Closed => GatewayDiagnostics::default(),
+        };
+        if let Ok(mut slot) = self.diagnostics.lock() {
+            *slot = merged;
+        }
+    }
+
     fn now_mono_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
 
     fn shutdown_state(&mut self) {
-        if let IoState::Connected { endpoint, .. } = &mut self.state {
-            endpoint.close(now_ms());
+        let now_unix = now_ms();
+        match &mut self.state {
+            IoState::Listening { connections, .. } => {
+                for connection in connections.iter_mut() {
+                    connection.endpoint.close(now_unix);
+                    connection.fail_waiters("link_lost", "网关已关闭");
+                }
+                connections.clear();
+            }
+            IoState::Single { connection } => {
+                connection.endpoint.close(now_unix);
+                connection.fail_waiters("link_lost", "网关已关闭");
+            }
+            IoState::Closed => {}
         }
         self.state = IoState::Closed;
-        self.fail_waiters("link_lost", "网关已关闭");
         self.publish_snapshot();
     }
 }

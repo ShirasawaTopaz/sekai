@@ -6,11 +6,12 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use sekai::sekai_stdout::Phase;
 use sekai::sekai_wire::ErrorCode;
 
-use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentStatus};
+use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentStatus, CancelToken};
 use sekai_router::control::{CommandFailure, CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
 use sekai_router::json::Json;
@@ -1003,4 +1004,130 @@ fn trace_records_redacted_events() {
             .and_then(Json::as_u64),
         Some(7)
     );
+}
+
+// ---------------------------------------------------------------------------
+// 取消（B2：CancelToken / 50ms 轮询 / sekai.cancel）
+// ---------------------------------------------------------------------------
+
+/// 提交后永不给最终事件的网关（模拟长命令在途），记录取消调用。
+struct BlockingGateway {
+    workers: Vec<WorkerInfo>,
+    calls: Arc<Mutex<Vec<CommandRequest>>>,
+    cancelled: Arc<Mutex<Vec<u64>>>,
+    /// 保持 reply 发送端存活，让 `CommandReceipt::wait` 一直阻塞。
+    held: Mutex<Vec<std::sync::mpsc::Sender<Result<CommandResult, GatewayError>>>>,
+}
+
+impl BlockingGateway {
+    fn new(
+        workers: Vec<WorkerInfo>,
+        calls: Arc<Mutex<Vec<CommandRequest>>>,
+        cancelled: Arc<Mutex<Vec<u64>>>,
+    ) -> Self {
+        Self {
+            workers,
+            calls,
+            cancelled,
+            held: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl WorkerGateway for BlockingGateway {
+    fn list_workers(&mut self) -> Vec<WorkerInfo> {
+        self.workers.clone()
+    }
+
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.calls.lock().unwrap().push(request);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.held.lock().unwrap().push(sender);
+        Ok(CommandReceipt::with_cmd_id(receiver, 60_000, "内存", 99))
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        self.cancelled.lock().unwrap().push(cmd_id);
+        Ok(())
+    }
+
+    fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+/// 已置位的取消令牌：第一步之前即中止，不调用 LLM。
+#[test]
+fn pre_cancelled_token_aborts_before_llm_call() {
+    let requests = new_requests();
+    let calls = new_calls();
+    let chat = ScriptedChat::new(vec![], requests.clone());
+    let gateway = FakeGateway::new(vec![worker("pc-1", true)], vec![], calls.clone());
+    let token = CancelToken::new();
+    token.cancel();
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        agent_config(4),
+        TraceWriter::disabled(),
+    )
+    .with_cancel(token);
+
+    let error = agent.run("读 IO4").expect_err("应被取消");
+    match error {
+        AgentError::Gateway(message) => assert!(message.contains("cancelled"), "{message}"),
+        other => panic!("期望 cancelled，实际 {other}"),
+    }
+    assert!(requests.lock().unwrap().is_empty(), "取消后不应调用 LLM");
+}
+
+/// 工具等待期间置位取消：50ms 轮询内中断，先下发 `sekai.cancel` 再返回
+/// `cancelled`（不等 Worker 最终事件）。
+#[test]
+fn cancel_during_tool_wait_dispatches_sekai_cancel() {
+    let requests = new_requests();
+    let calls = new_calls();
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let chat = ScriptedChat::new(
+        vec![Ok(tool_response(
+            vec![tool_call(
+                "call_1",
+                "worker_tool",
+                r#"{"worker_id":"pc-1","tool":"gpio.info","args":"IO4"}"#,
+            )],
+            usage(1, 1, 2),
+        ))],
+        requests.clone(),
+    );
+    let gateway =
+        BlockingGateway::new(vec![worker("pc-1", true)], calls.clone(), cancelled.clone());
+    let token = CancelToken::new();
+    let remote = token.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        remote.cancel();
+    });
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        agent_config(4),
+        TraceWriter::disabled(),
+    )
+    .with_cancel(token);
+
+    let error = agent.run("读 IO4").expect_err("Tool 等待应被取消");
+    canceller.join().expect("取消线程");
+    match error {
+        AgentError::Gateway(message) => assert!(message.contains("cancelled"), "{message}"),
+        other => panic!("期望 cancelled，实际 {other}"),
+    }
+    // 取消在 50ms 轮询内生效：先下发 sekai.cancel（cmd_id 99）再放弃等待。
+    assert_eq!(*cancelled.lock().unwrap(), vec![99], "应下发 sekai.cancel");
+    assert_eq!(calls.lock().unwrap().len(), 1);
 }

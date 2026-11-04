@@ -47,7 +47,10 @@ impl LinkOptions {
             format!("sekai-router-{tag}-{}-{unix_ms}", std::process::id()),
             self.topic_root.clone(),
         );
-        plane.max_inflight_per_worker = 1;
+        // 每 Worker 允许 4 条在途命令：prompt 内层工具调用（`pc.ask` 之外的
+        // 普通 Tool）可在长 Task 在途时复用同一 Worker（B5）；每条命令的
+        // 超时/取消各自独立计数，互不顶替。
+        plane.max_inflight_per_worker = 4;
         plane.default_ddl_ms = self.default_ddl_ms.max(1);
         plane
     }

@@ -21,7 +21,7 @@ use sekai::sekai_device_list::Endpoint;
 
 use crate::control::{
     CommandKind, CommandRequest, CommandResult, ControlError, ControlEvent, ControlPlane,
-    ControlPlaneConfig, TASK_TIMEOUT_EXTRA_MS, TOOL_TIMEOUT_EXTRA_MS,
+    ControlPlaneConfig, GatewayDiagnostics, TASK_TIMEOUT_EXTRA_MS, TOOL_TIMEOUT_EXTRA_MS,
 };
 use crate::host_link::{Backoff, Link, LinkError, StreamDecoder, TcpLink};
 use crate::topic::TopicRoot;
@@ -41,6 +41,13 @@ const WAIT_READY_POLL_MS: u64 = 5;
 const CALL_REPLY_GRACE_MS: u64 = 5_000;
 /// 断链退避期间等待请求的最长睡眠（毫秒）。
 const BACKOFF_OP_POLL_MS: u64 = 50;
+/// `submit` 等待 IO 线程回传 cmd_id 的上限（毫秒）。
+///
+/// 超时仍返回回执（cmd_id=0，原有等待语义不变），只是调用方拿不到
+/// 可取消的 cmd_id；链路断开时 IO 线程会立即回错误，不会因此挂住。
+pub(crate) const SUBMIT_ACCEPTED_TIMEOUT_MS: u64 = 200;
+/// `cancel` 等待 IO 线程确认的上限（毫秒）。
+pub(crate) const CANCEL_ACK_TIMEOUT_MS: u64 = 1_000;
 
 /// 网关错误（带稳定错误码，供 tool 结果 JSON 使用）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +92,29 @@ pub trait WorkerGateway: Send {
     ///
     /// 实现必须快速返回：等待最终事件由调用方持 [`CommandReceipt`] 进行，
     /// 以便在 [`GatewayHandle`] 形态下**锁外等待**（见 [`CommandReceipt`]）。
+    /// 实现最多等待 200ms 拿到 cmd_id（取消契约），超时不影响回执的最终
+    /// 事件等待语义。
     fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError>;
+    /// 提交管理/控制命令（绕过每 Worker 在途上限）。
+    ///
+    /// 默认与 [`WorkerGateway::submit`] 相同；Direct/Mqtt 覆写为走
+    /// `ControlPlane::submit_control`，保证长 Task 在途时控制命令仍可送达。
+    fn submit_control(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.submit(request)
+    }
+    /// 取消一条已提交的命令（按 [`CommandReceipt::cmd_id`]）。
+    ///
+    /// 默认实现返回 `unsupported`；Direct/Mqtt 覆写为把 Cancel 操作发给
+    /// IO 线程并调用 `ControlPlane::cancel`（原命令的最终事件仍由 Worker 回传）。
+    fn cancel(&mut self, _cmd_id: u64) -> Result<(), GatewayError> {
+        Err(GatewayError::new("unsupported", "该链路不支持取消"))
+    }
+    /// 控制面诊断快照（在途命令 / 晚到终态 / 计数 / 时钟状态）。
+    ///
+    /// 默认返回空快照；Direct/Mqtt 覆写为读取 IO 线程维护的快照（不阻塞）。
+    fn diagnostics(&mut self) -> GatewayDiagnostics {
+        GatewayDiagnostics::default()
+    }
     /// 执行一条命令并等待最终事件（默认实现：提交后等待回执）。
     fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
         self.submit(request)?.wait()
@@ -108,25 +137,45 @@ pub struct CommandReceipt {
     budget_ms: u64,
     /// 链路断开错误文案里的 IO 线程名（如 "MQTT"/"直连"）。
     io_name: &'static str,
+    /// 提交被 ControlPlane 接受后的命令 id（0 = 未知，无法取消）。
+    cmd_id: u64,
 }
 
 impl CommandReceipt {
     /// 构造：`budget_ms` 为等待预算，`io_name` 用于 Disconnected 错误文案。
+    ///
+    /// cmd_id 未知（0）；已知时用 [`CommandReceipt::with_cmd_id`]。
     pub fn new(
         reply: Receiver<Result<CommandResult, GatewayError>>,
         budget_ms: u64,
         io_name: &'static str,
     ) -> Self {
+        Self::with_cmd_id(reply, budget_ms, io_name, 0)
+    }
+
+    /// 构造并带上已接受的 cmd_id（取消/诊断契约用）。
+    pub fn with_cmd_id(
+        reply: Receiver<Result<CommandResult, GatewayError>>,
+        budget_ms: u64,
+        io_name: &'static str,
+        cmd_id: u64,
+    ) -> Self {
         Self {
             reply,
             budget_ms,
             io_name,
+            cmd_id,
         }
     }
 
     /// 等待预算（毫秒）。
     pub fn budget_ms(&self) -> u64 {
         self.budget_ms
+    }
+
+    /// 已接受的命令 id；0 表示 IO 线程未在 accepted 上限内确认（不可取消）。
+    pub fn cmd_id(&self) -> u64 {
+        self.cmd_id
     }
 
     /// 阻塞等待最终事件（预算内）；超时/断链映射为网关错误。
@@ -202,6 +251,15 @@ pub(crate) enum GatewayOp {
     Call {
         request: CommandRequest,
         reply: Sender<Result<CommandResult, GatewayError>>,
+        /// 提交被 ControlPlane 接受后回传 cmd_id（取消契约）；失败时丢弃。
+        accepted: Sender<u64>,
+        /// true：走 `ControlPlane::submit_control`（管理命令绕过在途上限）。
+        management: bool,
+    },
+    /// 取消一条在途命令：IO 线程调 `ControlPlane::cancel`。
+    Cancel {
+        cmd_id: u64,
+        reply: Sender<Result<(), GatewayError>>,
     },
     Shutdown,
 }
@@ -222,6 +280,18 @@ impl WorkerGateway for Box<dyn WorkerGateway> {
 
     fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         (**self).submit(request)
+    }
+
+    fn submit_control(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        (**self).submit_control(request)
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        (**self).cancel(cmd_id)
+    }
+
+    fn diagnostics(&mut self) -> GatewayDiagnostics {
+        (**self).diagnostics()
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
@@ -247,6 +317,21 @@ impl WorkerGateway for GatewayHandle {
         gateway.submit(request)
     }
 
+    fn submit_control(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        gateway.submit_control(request)
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        gateway.cancel(cmd_id)
+    }
+
+    fn diagnostics(&mut self) -> GatewayDiagnostics {
+        let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        gateway.diagnostics()
+    }
+
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
         let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         gateway.wait_ready(timeout_ms)
@@ -270,7 +355,7 @@ pub(crate) fn call_budget_ms(
 ) -> u64 {
     let kind_timeout = match request.kind {
         CommandKind::Tool => tool_timeout_ms,
-        CommandKind::Task => task_timeout_ms,
+        CommandKind::Task | CommandKind::Jump => task_timeout_ms,
     };
     let timeout_ms = match request.timeout_ms.or(kind_timeout) {
         Some(value) => value,
@@ -282,7 +367,7 @@ pub(crate) fn call_budget_ms(
             };
             let extra = match request.kind {
                 CommandKind::Tool => TOOL_TIMEOUT_EXTRA_MS,
-                CommandKind::Task => TASK_TIMEOUT_EXTRA_MS,
+                CommandKind::Task | CommandKind::Jump => TASK_TIMEOUT_EXTRA_MS,
             };
             ddl.saturating_add(extra)
         }
@@ -295,6 +380,8 @@ pub struct MqttGateway {
     config: MqttGatewayConfig,
     requests: Sender<GatewayOp>,
     snapshot: Arc<Mutex<GatewaySnapshot>>,
+    /// IO 线程维护的控制面诊断快照（`diagnostics` 直接 clone，不过 IO 线程）。
+    diagnostics: Arc<Mutex<GatewayDiagnostics>>,
     io_worker: Option<JoinHandle<()>>,
 }
 
@@ -321,9 +408,11 @@ impl MqttGateway {
         })?;
 
         let snapshot = Arc::new(Mutex::new(GatewaySnapshot::default()));
+        let diagnostics = Arc::new(Mutex::new(GatewayDiagnostics::default()));
         let (requests_tx, requests_rx) = mpsc::channel();
         let io_config = config.clone();
         let io_snapshot = Arc::clone(&snapshot);
+        let io_diagnostics = Arc::clone(&diagnostics);
         let io_worker = std::thread::Builder::new()
             .name(String::from("sekai-router-mqtt"))
             .spawn(move || {
@@ -331,6 +420,7 @@ impl MqttGateway {
                     config: io_config,
                     plane,
                     snapshot: io_snapshot,
+                    diagnostics: io_diagnostics,
                     requests: requests_rx,
                     waiters: HashMap::new(),
                     start: Instant::now(),
@@ -349,6 +439,7 @@ impl MqttGateway {
             config,
             requests: requests_tx,
             snapshot,
+            diagnostics,
             io_worker: Some(io_worker),
         })
     }
@@ -371,6 +462,70 @@ impl MqttGateway {
             .lock()
             .map(|snapshot| snapshot.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// 控制面诊断快照读取（IO 线程每轮刷新，直接 clone）。
+    fn diagnostics_snapshot(&self) -> GatewayDiagnostics {
+        self.diagnostics
+            .lock()
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// 提交命令的公共实现：规整 DDL/超时、发送 IO op、有界等待 cmd_id。
+    fn dispatch_request(
+        &mut self,
+        mut request: CommandRequest,
+        management: bool,
+    ) -> Result<CommandReceipt, GatewayError> {
+        if request.ddl_ms == 0 {
+            request.ddl_ms = self.config.default_ddl_ms.max(1);
+        }
+        if request.timeout_ms.is_none() {
+            request.timeout_ms = match request.kind {
+                CommandKind::Tool => self.config.tool_timeout_ms,
+                CommandKind::Task | CommandKind::Jump => self.config.task_timeout_ms,
+            };
+        }
+        let budget = self.wait_budget_ms(&request);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        self.requests
+            .send(GatewayOp::Call {
+                request,
+                reply: reply_tx,
+                accepted: accepted_tx,
+                management,
+            })
+            .map_err(|_| GatewayError::new("link_lost", "MQTT IO 线程已退出"))?;
+        // 有界等待 cmd_id（取消契约）：超时/失败都返回回执，最终事件语义不变。
+        let cmd_id = accepted_rx
+            .recv_timeout(Duration::from_millis(SUBMIT_ACCEPTED_TIMEOUT_MS))
+            .unwrap_or(0);
+        Ok(CommandReceipt::with_cmd_id(
+            reply_rx, budget, "MQTT", cmd_id,
+        ))
+    }
+
+    /// 发送 Cancel 操作并等待 IO 线程确认（有界）。
+    fn dispatch_cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.requests
+            .send(GatewayOp::Cancel {
+                cmd_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| GatewayError::new("link_lost", "MQTT IO 线程已退出"))?;
+        match reply_rx.recv_timeout(Duration::from_millis(CANCEL_ACK_TIMEOUT_MS)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(GatewayError::new(
+                "timeout",
+                "等待 MQTT IO 线程确认取消超时",
+            )),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(GatewayError::new("link_lost", "MQTT IO 线程已退出"))
+            }
+        }
     }
 
     fn worker_alive(&self) -> bool {
@@ -402,25 +557,20 @@ impl WorkerGateway for MqttGateway {
         self.snapshot().workers
     }
 
-    fn submit(&mut self, mut request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
-        if request.ddl_ms == 0 {
-            request.ddl_ms = self.config.default_ddl_ms.max(1);
-        }
-        if request.timeout_ms.is_none() {
-            request.timeout_ms = match request.kind {
-                CommandKind::Tool => self.config.tool_timeout_ms,
-                CommandKind::Task => self.config.task_timeout_ms,
-            };
-        }
-        let budget = self.wait_budget_ms(&request);
-        let (reply_tx, reply_rx) = mpsc::channel();
-        self.requests
-            .send(GatewayOp::Call {
-                request,
-                reply: reply_tx,
-            })
-            .map_err(|_| GatewayError::new("link_lost", "MQTT IO 线程已退出"))?;
-        Ok(CommandReceipt::new(reply_rx, budget, "MQTT"))
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.dispatch_request(request, false)
+    }
+
+    fn submit_control(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        self.dispatch_request(request, true)
+    }
+
+    fn cancel(&mut self, cmd_id: u64) -> Result<(), GatewayError> {
+        self.dispatch_cancel(cmd_id)
+    }
+
+    fn diagnostics(&mut self) -> GatewayDiagnostics {
+        self.diagnostics_snapshot()
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
@@ -472,6 +622,8 @@ struct IoWorker {
     config: MqttGatewayConfig,
     plane: ControlPlane,
     snapshot: Arc<Mutex<GatewaySnapshot>>,
+    /// 控制面诊断快照（每轮刷新；`diagnostics()` 直接 clone）。
+    diagnostics: Arc<Mutex<GatewayDiagnostics>>,
     requests: Receiver<GatewayOp>,
     waiters: HashMap<u64, Sender<Result<CommandResult, GatewayError>>>,
     start: Instant,
@@ -500,8 +652,20 @@ impl IoWorker {
                     let wait =
                         (self.next_attempt - now).min(Duration::from_millis(BACKOFF_OP_POLL_MS));
                     match self.requests.recv_timeout(wait) {
-                        Ok(GatewayOp::Call { request, reply }) => {
-                            self.reject_call(request, reply);
+                        Ok(GatewayOp::Call {
+                            request,
+                            reply,
+                            accepted,
+                            management,
+                        }) => {
+                            let _ = accepted; // 链路未就绪：回错误，无 cmd_id
+                            self.reject_call(request, reply, management);
+                        }
+                        Ok(GatewayOp::Cancel { reply, .. }) => {
+                            let _ = reply.send(Err(GatewayError::new(
+                                "link_lost",
+                                "MQTT 链路未就绪（正在连接或退避重连）",
+                            )));
                         }
                         Ok(GatewayOp::Shutdown) => break,
                         Err(RecvTimeoutError::Timeout) => {}
@@ -571,7 +735,13 @@ impl IoWorker {
     fn pump_ops(&mut self) -> bool {
         loop {
             match self.requests.try_recv() {
-                Ok(GatewayOp::Call { request, reply }) => self.dispatch_call(request, reply),
+                Ok(GatewayOp::Call {
+                    request,
+                    reply,
+                    accepted,
+                    management,
+                }) => self.dispatch_call(request, reply, accepted, management),
+                Ok(GatewayOp::Cancel { cmd_id, reply }) => self.dispatch_cancel(cmd_id, reply),
                 Ok(GatewayOp::Shutdown) => return true,
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => return true,
@@ -583,6 +753,8 @@ impl IoWorker {
         &mut self,
         request: CommandRequest,
         reply: Sender<Result<CommandResult, GatewayError>>,
+        accepted: Sender<u64>,
+        management: bool,
     ) {
         if !self.transport_up {
             let _ = reply.send(Err(GatewayError::new(
@@ -593,8 +765,22 @@ impl IoWorker {
         }
         let now_unix = self.now_unix_ms();
         let now_mono = self.now_mono_ms();
-        match self.plane.submit(request, now_unix, now_mono) {
+        let result = if management {
+            // 管理命令：Tool 语义、绕过在途上限（ControlPlane::submit_control）。
+            self.plane.submit_control(
+                &request.worker_id,
+                &request.name,
+                request.args,
+                now_unix,
+                now_mono,
+            )
+        } else {
+            self.plane.submit(request, now_unix, now_mono)
+        };
+        match result {
             Ok(cmd_id) => {
+                // 先回传 cmd_id（调用方据此取消），再等最终事件。
+                let _ = accepted.send(cmd_id);
                 self.waiters.insert(cmd_id, reply);
             }
             Err(error) => {
@@ -608,11 +794,34 @@ impl IoWorker {
         &mut self,
         _request: CommandRequest,
         reply: Sender<Result<CommandResult, GatewayError>>,
+        _management: bool,
     ) {
         let _ = reply.send(Err(GatewayError::new(
             "link_lost",
             "MQTT 链路未就绪（正在连接或退避重连）",
         )));
+    }
+
+    /// 取消一条在途命令：`ControlPlane::cancel` 下发 Worker 侧 `sekai.cancel`。
+    ///
+    /// 原命令的最终事件仍由 Worker 回传，经 `drain_events` 交给原等待者。
+    fn dispatch_cancel(&mut self, cmd_id: u64, reply: Sender<Result<(), GatewayError>>) {
+        if !self.transport_up {
+            let _ = reply.send(Err(GatewayError::new(
+                "link_lost",
+                "MQTT 链路未就绪（正在连接或退避重连）",
+            )));
+            return;
+        }
+        let now_unix = self.now_unix_ms();
+        let now_mono = self.now_mono_ms();
+        let result = self
+            .plane
+            .cancel(cmd_id, now_unix, now_mono)
+            .map(|_cancel_cmd_id| ())
+            .map_err(|error| GatewayError::from_control(&error));
+        let _ = reply.send(result);
+        self.publish_snapshot();
     }
 
     fn fail_waiters(&mut self, code: &str, message: &str) {
@@ -642,6 +851,8 @@ impl IoWorker {
         let ready = self.plane.is_ready();
         let connected = self.plane.is_connected();
         let plane_error = self.plane.last_error().map(String::from);
+        let now_mono = self.now_mono_ms();
+        let diagnostics = self.plane.diagnostics(now_mono);
         if let Ok(mut snapshot) = self.snapshot.lock() {
             snapshot.workers = workers;
             snapshot.ready = ready;
@@ -650,6 +861,9 @@ impl IoWorker {
             if plane_error.is_some() {
                 snapshot.last_error = plane_error;
             }
+        }
+        if let Ok(mut slot) = self.diagnostics.lock() {
+            *slot = diagnostics;
         }
     }
 

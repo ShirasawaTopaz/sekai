@@ -7,19 +7,21 @@
 //! 超时与事件回收全部长在 MQTT 客户端状态机内部。协议文档 §1.2 明确
 //! 「MQTT 只是一种载体」；直连链路就是替代载体：本模块在 Router 进程内
 //! 充当**最小虚拟 broker 适配器**，让 ControlPlane 原样运转，而链路上
-//! 只出现 V1 Stdin/Stdout 帧：
+//! 只出现 V1 Stdin/Stdout 帧（外加真正跨链路的 MQTT 保活报文）：
 //!
 //! - 下行（ControlPlane → 链路）：ControlPlane 出站的 PUBLISH（发往
 //!   `{root}/dev/{worker_id}/in` 的 Stdin 帧）剥出载荷写链路，并就地
-//!   PUBACK 确认；CONNECT/SUBSCRIBE/PINGREQ 由适配器就地回
-//!   CONNACK/SUBACK/PINGRESP，这些 MQTT 报文**从不出现在链路上**；
+//!   PUBACK 确认；CONNECT/SUBSCRIBE 由适配器就地回 CONNACK/SUBACK，
+//!   **PINGREQ 则作为保活报文真正写链路**（P10），由 Worker 侧回 PINGRESP；
 //! - 上行（链路 → ControlPlane）：收到的 V1 Stdout 帧按阶段包装成
 //!   `out`（命令事件）或 `state`（Hello/Offline，对应 retained 语义）
 //!   主题的 QoS1 PUBLISH 喂给 `ControlPlane::feed`，Worker id 取自
-//!   最近一次 Hello（首帧 Hello 自带 worker id）。
+//!   最近一次 Hello（首帧 Hello 自带 worker id）；收到的 PINGREQ 由适配器
+//!   回 PINGRESP，收到的 PINGRESP 喂回 ControlPlane 刷新保活等待。
 //!
-//! 这样 Hello/能力快照/派发/超时/断链失败/重启检测与 MQTT 承载时
-//! 完全一致——`ControlPlane` 与 `WorkerRegistry` 一行不改。
+//! 读空闲判定：超过 1.5 × `keep_alive` 没有收到任何链路帧（含保活报文）
+//! 即视为对端静默死亡（拔网线/休眠），端点转 `link_lost` 并按既有退避
+//! 语义等待 Worker 重连（P10）。
 //!
 //! ## 传输实现
 //!
@@ -38,6 +40,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use sekai::mqtt::packet::{Ack, Connack, Packet, Publish, Suback};
 use sekai::mqtt::property::Properties;
@@ -47,7 +50,10 @@ use sekai::mqtt::topic::TopicName;
 use sekai::sekai_device_list::Endpoint;
 use sekai::sekai_runtime::CONTENT_TYPE_STDOUT;
 use sekai::sekai_stdout::{Hello, Phase, Stdout};
-use sekai_worker::link::{Link, LinkError, MAX_FRAME_LEN, read_frame_stream, write_frame_stream};
+use sekai_worker::link::{
+    KeepAlive, Link, LinkError, MAX_FRAME_LEN, decode_keepalive, encode_keepalive,
+    read_frame_stream, write_frame_stream,
+};
 
 use crate::control::{
     CommandRequest, ControlError, ControlEvent, ControlPlane, ControlPlaneConfig,
@@ -107,6 +113,12 @@ pub struct DirectWorkerEndpoint<L: Link> {
     last_error: Option<String>,
     frames_rx: u64,
     frames_tx: u64,
+    /// 最近一次收到完整链路帧的时刻（含保活报文）。
+    last_rx: Instant,
+    /// 读空闲判定阈值（1.5 × keep_alive；keep_alive=0 时关闭）。
+    read_idle_timeout: Option<Duration>,
+    /// 最近一次向链路写出保活 PINGREQ 的时刻（诊断/判定用，P10）。
+    last_ping_sent: Option<Instant>,
 }
 
 impl<L: Link> DirectWorkerEndpoint<L> {
@@ -122,6 +134,12 @@ impl<L: Link> DirectWorkerEndpoint<L> {
         now_unix_ms: u64,
     ) -> Result<Self, DirectError> {
         let topic_root = config.topic_root.clone();
+        // 读空闲判定阈值与 MQTT keep_alive 对齐：1.5 倍（P10）。
+        let read_idle_timeout = if config.keep_alive == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(u64::from(config.keep_alive) * 1_500))
+        };
         let mut plane = ControlPlane::new(config)?;
         plane
             .link_up(endpoint, now_unix_ms)
@@ -137,6 +155,9 @@ impl<L: Link> DirectWorkerEndpoint<L> {
             last_error: None,
             frames_rx: 0,
             frames_tx: 0,
+            last_rx: Instant::now(),
+            read_idle_timeout,
+            last_ping_sent: None,
         };
         endpoint.pump_outgoing(now_unix_ms)?;
         Ok(endpoint)
@@ -148,16 +169,27 @@ impl<L: Link> DirectWorkerEndpoint<L> {
     /// 语义失败在途命令并标记 Worker 离线），用
     /// [`DirectWorkerEndpoint::is_open`] / [`DirectWorkerEndpoint::last_error`]
     /// 观察。只有 ControlPlane 协议错误上抛 [`DirectError::Plane`]。
+    ///
+    /// ControlPlane 因 MQTT 保活超时（PINGRESP 未按时返回）或读空闲超过
+    /// 1.5 × keep_alive 时，端点同样转 `link_lost`（P10）。
     pub fn pump(&mut self, now_unix_ms: u64, now_mono_ms: u64) -> Result<(), DirectError> {
         if self.link_open {
             self.pump_inbound(now_unix_ms)?;
         }
         self.pump_outgoing(now_unix_ms)?;
-        self.plane
-            .poll(now_unix_ms, now_mono_ms)
-            .map_err(DirectError::Plane)?;
+        let poll_result = self.plane.poll(now_unix_ms, now_mono_ms);
         // poll 可能吐出 PINGREQ 等出站报文，再消费一轮。
         self.pump_outgoing(now_unix_ms)?;
+        if let Err(error) = poll_result {
+            self.link_down(now_unix_ms, "控制平面协议错误");
+            return Err(DirectError::Plane(error));
+        }
+        // ControlPlane 自己发现保活超时（PINGRESP 未回）时不会上抛错误，
+        // 而是断开客户端状态：此时链路已不可信，按断链处理。
+        if self.link_open && !self.plane.is_connected() {
+            self.link_down(now_unix_ms, "MQTT 保活超时");
+        }
+        self.check_read_idle(now_unix_ms);
         Ok(())
     }
 
@@ -171,6 +203,41 @@ impl<L: Link> DirectWorkerEndpoint<L> {
         let cmd_id = self.plane.submit(request, now_unix_ms, now_mono_ms)?;
         let _ = self.pump_outgoing(now_unix_ms);
         Ok(cmd_id)
+    }
+
+    /// 提交管理命令（绕过每 Worker 在途上限），并把 Stdin 帧立刻写链路。
+    ///
+    /// `request.kind` 在管理命令语义下固定为 Tool（与
+    /// [`ControlPlane::submit_control`] 一致），`ddl_ms`/`timeout_ms` 取默认值。
+    pub fn submit_control(
+        &mut self,
+        request: CommandRequest,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<u64, ControlError> {
+        let cmd_id = self.plane.submit_control(
+            &request.worker_id,
+            &request.name,
+            request.args,
+            now_unix_ms,
+            now_mono_ms,
+        )?;
+        let _ = self.pump_outgoing(now_unix_ms);
+        Ok(cmd_id)
+    }
+
+    /// 取消一条在途命令（下发 Worker 侧 `sekai.cancel`）。
+    ///
+    /// 返回 `sekai.cancel` 自身的 cmd_id；原命令最终事件仍由 Worker 回传。
+    pub fn cancel(
+        &mut self,
+        cmd_id: u64,
+        now_unix_ms: u64,
+        now_mono_ms: u64,
+    ) -> Result<u64, ControlError> {
+        let cancel_id = self.plane.cancel(cmd_id, now_unix_ms, now_mono_ms)?;
+        let _ = self.pump_outgoing(now_unix_ms);
+        Ok(cancel_id)
     }
 
     /// 订阅是否就绪（虚拟 SUBACK 已确认）。
@@ -227,11 +294,36 @@ impl<L: Link> DirectWorkerEndpoint<L> {
     // ---- 内部 ----
 
     /// 读链路直到空闲（Timeout）或关闭；帧包装为 PUBLISH 喂 ControlPlane。
+    ///
+    /// MQTT 保活报文（PINGREQ/PINGRESP）真正跨链路：入站 PINGREQ 由本端
+    /// （虚拟 broker）回 PINGRESP，入站 PINGRESP 喂回 ControlPlane（P10）。
     fn pump_inbound(&mut self, now_unix_ms: u64) -> Result<(), DirectError> {
         loop {
             match self.link.read_frame() {
                 Ok(Some(frame)) => {
                     self.frames_rx += 1;
+                    self.last_rx = Instant::now();
+                    if let Some(keepalive) = decode_keepalive(&frame) {
+                        match keepalive {
+                            KeepAlive::Pingreq => {
+                                if !self.link_open {
+                                    continue;
+                                }
+                                let pong = encode_keepalive(KeepAlive::Pingresp);
+                                if let Err(error) = self.link.write_frame(&pong) {
+                                    self.link_down(now_unix_ms, &format!("写链路失败：{error}"));
+                                    return Ok(());
+                                }
+                                self.frames_tx += 1;
+                            }
+                            KeepAlive::Pingresp => {
+                                if let Err(error) = self.plane.feed(Packet::Pingresp, now_unix_ms) {
+                                    self.note(format!("ControlPlane 拒绝 PINGRESP：{error}"));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Err(error) = self.feed_frame(&frame, now_unix_ms) {
                         // ControlPlane 协议错误：其内部已按断链处理；记录并停止读。
                         self.note(format!("ControlPlane 拒绝入站帧：{error}"));
@@ -352,12 +444,24 @@ impl<L: Link> DirectWorkerEndpoint<L> {
                         }
                     }
                 }
-                // 保活：就地回应。
+                // 保活：PINGREQ 真正跨链路，由 Worker 侧虚拟 broker 回 PINGRESP
+                // （P10）；不再就地合成 PINGRESP。
                 Packet::Pingreq => {
-                    if let Err(error) = self.plane.feed(Packet::Pingresp, now_unix_ms) {
-                        return Err(DirectError::Plane(error));
+                    if !self.link_open {
+                        self.note(String::from("链路已关闭，丢弃出站 PINGREQ"));
+                        continue;
                     }
+                    let ping = encode_keepalive(KeepAlive::Pingreq);
+                    if let Err(error) = self.link.write_frame(&ping) {
+                        self.link_down(now_unix_ms, &format!("写链路失败：{error}"));
+                        continue;
+                    }
+                    self.frames_tx += 1;
+                    self.last_ping_sent = Some(Instant::now());
                 }
+                // ControlPlane 是 MQTT 客户端，正常只发 PINGREQ；收到 PINGRESP
+                // 已在入站方向处理，这里防御性忽略。
+                Packet::Pingresp => {}
                 // ControlPlane 主动断开（Jump/迁移，当前预留）：关闭链路。
                 Packet::Disconnect(_) => {
                     self.link.close();
@@ -384,6 +488,28 @@ impl<L: Link> DirectWorkerEndpoint<L> {
 
     fn note(&mut self, message: String) {
         self.last_error = Some(message);
+    }
+
+    /// 读空闲判定（P10）：超过 1.5 × keep_alive 没有入站帧即判死。
+    ///
+    /// 健康连接每 keep_alive 至少有一次保活报文跨链路，因此阈值留 0.5 倍余量；
+    /// 只有「确实长时间没有任何入站报文」才触发，避免误杀正常空闲连接。
+    fn check_read_idle(&mut self, now_unix_ms: u64) {
+        let Some(timeout) = self.read_idle_timeout else {
+            return;
+        };
+        if !self.link_open || self.last_rx.elapsed() < timeout {
+            return;
+        }
+        let idle_ms = self.last_rx.elapsed().as_millis();
+        let ping_note = match self.last_ping_sent {
+            Some(at) => format!("，最近一次 PINGREQ 在 {}ms 前", at.elapsed().as_millis()),
+            None => String::from("，期间未发出 PINGREQ"),
+        };
+        self.link_down(
+            now_unix_ms,
+            &format!("读空闲超时（{idle_ms}ms 未收到对端帧，保活超时{ping_note}）"),
+        );
     }
 
     /// 分配合成 PUBLISH 的包 id（1..=65535 循环，跳过 0）。

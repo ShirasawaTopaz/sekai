@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sekai_router::agent::AgentConfig;
 use sekai_router::control::CommandRequest;
@@ -331,4 +332,84 @@ fn session_syncs_policy_and_gateway_into_prompt_hub() {
     let result = hub.run_prompt("hi", None).expect("注入网关后应成功");
     assert_eq!(result.answer, "unused");
     assert_eq!(result.status, "completed");
+}
+
+// ---- B3：后台目标 + 事件通道；B2：/cancel ----
+
+/// 前端 submit_line：'/' 命令同步执行，自然语言目标在后台线程跑，
+/// poll 消费完成事件（回答 + 统计行），不阻塞提交线程。
+#[test]
+fn background_goal_runs_through_event_channel() {
+    let chat = ScriptedChat::one(text_response("IO4 已拉高。"));
+    let mut session = session(chat);
+    session.set_gateway(fake_handle(vec![worker("pc-1", true)]), "测试链路");
+
+    let start = lines(&session.submit_line("把 IO4 拉高"));
+    assert!(
+        start.iter().any(|line| line.contains("已开始执行")),
+        "{start:?}"
+    );
+    assert!(session.goal_running(), "提交后应有后台目标");
+    assert!(session.goal_elapsed_ms() <= 5_000);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut out = Vec::new();
+    while session.goal_running() && Instant::now() < deadline {
+        out.extend(lines(&session.poll()));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!session.goal_running(), "目标应已完成");
+    assert!(
+        out.iter().any(|line| line.contains("IO4 已拉高")),
+        "poll 应交付回答行：{out:?}"
+    );
+    assert!(
+        out.iter().any(|line| line.contains("步数=1")),
+        "poll 应交付统计行：{out:?}"
+    );
+    // 再次 poll 为空（事件只交付一次）。
+    assert!(session.poll().is_empty(), "完成事件不应重复交付");
+}
+
+/// '/' 命令仍同步执行：submit_line 对 /status 立即返回输出。
+#[test]
+fn submit_line_routes_slash_commands_synchronously() {
+    let mut session = session(ScriptedChat::one(text_response("unused")));
+    let out = lines(&session.submit_line("/status"));
+    assert!(out.iter().any(|line| line.contains("链路：")), "{out:?}");
+    assert!(!session.goal_running(), "斜杠命令不应启动后台目标");
+}
+
+/// /cancel：无目标时提示；非法参数报错；带 cmd_id 时经网关取消。
+#[test]
+fn cancel_command_handles_idle_and_worker_ids() {
+    let mut session = session(ScriptedChat::one(text_response("unused")));
+    let idle = lines(&session.execute("/cancel"));
+    assert!(
+        idle.iter()
+            .any(|line| line.contains("没有在后台执行的目标")),
+        "{idle:?}"
+    );
+    assert!(!session.cancel_goal(), "空闲时 cancel_goal 返回 false");
+
+    let bad = lines(&session.execute("/cancel abc"));
+    assert!(bad.iter().any(|line| line.contains("cmd_id")), "{bad:?}");
+
+    session.set_gateway(fake_handle(vec![worker("pc-1", true)]), "测试链路");
+    let out = lines(&session.execute("/cancel 42"));
+    assert!(
+        out.iter()
+            .any(|line| line.contains("取消命令 42 失败") || line.contains("已请求取消命令 42")),
+        "带 cmd_id 的取消应给出结果：{out:?}"
+    );
+}
+
+/// /status 暴露 B8 诊断字段（最近错误 / 在途 / 时钟校准 / 晚到终态）。
+#[test]
+fn status_reports_diagnostics_snapshot() {
+    let mut session = session(ScriptedChat::one(text_response("unused")));
+    session.set_gateway(fake_handle(vec![worker("pc-1", true)]), "测试链路");
+    let out = lines(&session.execute("/status")).join("\n");
+    assert!(out.contains("时钟校准："), "{out}");
+    assert!(out.contains("晚到终态：0 条"), "{out}");
 }
