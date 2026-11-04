@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-/// `sekai-start` 中 `esp32` 驱动所针对的芯片。
+/// `sekai-embedded` 中 `esp32` 驱动所针对的芯片。
 const CHIP: &str = "esp32";
 /// 该芯片的 target triple。
 const TARGET: &str = "xtensa-esp32-none-elf";
@@ -52,7 +52,50 @@ ENVIRONMENT:
     SEKAI_TOOLCHAIN    Rust toolchain to build with (default: esp)
 
 `esp` comes from `espup install -t esp32` and is required: the upstream Xtensa
-LLVM backend cannot compile `compiler_builtins`.";
+LLVM backend cannot compile `compiler_builtins`.
+
+COMPILE-TIME FIRMWARE ENVIRONMENT:
+The firmware reads these with `option_env!` when it is built, so they must be
+set for `build` (not when flashing). Missing required variables only produce
+warnings, so CI can still compile an image that reports the configuration error
+over serial at startup.
+
+    SEKAI_WIFI_SSID        required   2.4GHz SSID
+    SEKAI_WIFI_PASSWORD    optional   empty = Open, non-empty = WPA2 Personal
+    SEKAI_MQTT_ADDR        required   IPv4:port, e.g. 192.168.1.10:1883 (no DNS)
+    SEKAI_MQTT_USERNAME    optional   MQTT username
+    SEKAI_MQTT_PASSWORD    optional   MQTT password
+    SEKAI_DEVICE_ID        optional   worker id (default: sekai-esp32)
+    SEKAI_TOPIC_ROOT       optional   MQTT topic root (default: sekai/v1)
+    SEKAI_DEVICES          optional   jump targets, name=IPv4:port,...";
+
+/// 构建前提示缺失的必填固件环境变量：只警告不失败，方便 CI 只编译。
+///
+/// 固件通过 `option_env!` 在编译期读取这些变量；缺失时构建仍会成功，
+/// 但固件启动后会打印配置错误并空转。
+fn warn_missing_firmware_env() {
+    const REQUIRED: [&str; 2] = ["SEKAI_WIFI_SSID", "SEKAI_MQTT_ADDR"];
+
+    let missing: Vec<&str> = REQUIRED
+        .into_iter()
+        .filter(|name| {
+            std::env::var(name)
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    for name in &missing {
+        eprintln!("warning: required firmware environment variable `{name}` is not set");
+    }
+    eprintln!(
+        "warning: the built firmware will report a configuration error over serial at startup; \
+         see the COMPILE-TIME FIRMWARE ENVIRONMENT section of \
+         `cargo run -p sekai-build -- help`"
+    );
+}
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -115,6 +158,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 
 /// 编译固件镜像，并返回生成的 ELF 路径。
 fn build(options: &Options) -> Result<PathBuf, String> {
+    warn_missing_firmware_env();
     preflight_toolchain(&options.toolchain)?;
 
     let root = workspace_root()?;
@@ -128,7 +172,7 @@ fn build(options: &Options) -> Result<PathBuf, String> {
             "sekai-build",
             "--bin",
             FIRMWARE_BIN,
-            // 只选中 `sekai-start` 的 `esp32` 驱动，不选任何其他驱动：
+            // 只选中 `sekai-embedded` 的 `esp32` 驱动，不选任何其他驱动：
             // `x86` 驱动与 `esp32` 驱动互斥。
             "--no-default-features",
             "--features",

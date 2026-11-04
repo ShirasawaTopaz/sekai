@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sekai 桥接",
+    "description": "面向 dsh 的 Sekai 双插件：驱动 sekai-router --serve（stdio JSONL）与 sekai-worker connect 生命周期，并发布 sekai_* 工具。"
+  }
+}

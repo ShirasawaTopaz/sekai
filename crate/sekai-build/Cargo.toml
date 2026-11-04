@@ -18,9 +18,9 @@ path = "src/firmware.rs"
 required-features = ["esp32"]
 
 [dependencies]
-# `default-features = false` 让 `x86` 驱动不进入固件构建。
-sekai-start = { path = "../sekai-start", default-features = false, optional = true }
+# `default-features = false` 让宿主侧模块不进入固件构建。
+sekai-embedded = { path = "../sekai-embedded", default-features = false, optional = true }
 
 [features]
 default = []
-esp32 = ["dep:sekai-start", "sekai-start/esp32"]
+esp32 = ["dep:sekai-embedded", "sekai-embedded/esp32"]

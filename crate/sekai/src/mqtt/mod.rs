@@ -25,7 +25,8 @@
 //! 4. 用 `Client::next_event` 取出应用事件。
 
 pub mod client;
-mod codec;
+// 控制平面协议（`sekai_stdin` / `sekai_stdout`）也复用这套编解码工具。
+pub(crate) mod codec;
 pub mod error;
 pub mod header;
 pub mod packet;

@@ -1,0 +1,24 @@
+[package]
+name = "sekai-router"
+edition = "2024"
+description = "Sekai Router：常驻路由器，把自然语言目标评估/派工给 Worker 并汇总回答（DeepSeek function tools）"
+
+[lib]
+name = "sekai_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sekai-router"
+path = "src/bin/sekai-router.rs"
+
+[dependencies]
+# 全屏 TUI 前端（src/tui.rs）：ratatui 渲染 + crossterm 终端控制/事件。
+crossterm = "0.28"
+ratatui = "0.29"
+sekai = { path = "../sekai" }
+# 直连链路传输层（Link trait / 内存链路 / 帧编解码）：Router 直连端点与
+# PC Worker 共用同一抽象（见 crate/sekai-worker/src/link.rs）。
+sekai-worker = { path = "../sekai-worker" }
+
+[dev-dependencies]
+sekai-gpio = { path = "../sekai-gpio" }

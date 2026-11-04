@@ -1,0 +1,33 @@
+[package]
+name = "sekai-gpio"
+version = "0.1.0"
+edition = "2024"
+description = "Sekai 家族无关 GPIO 抽象、引脚表、虚拟后端与 AI 用户工具"
+
+[dependencies]
+# 协议/运行时只依赖 `sekai`；该 crate 不修改协议层。
+sekai = { path = "../sekai", default-features = false }
+# send 特性下的共享句柄；host 测试由 dev-dependency 的 std 实现提供。
+critical-section = { version = "1.2.0", optional = true }
+# ESP32 classic 真实 GPIO 后端（esp-hal Flex）。
+esp-hal = { version = "1.2.2", features = ["esp32", "unstable"], optional = true }
+# STM32F1/F4 真实 GPIO 后端（直接使用 PAC 寄存器）。
+# 关闭 PAC 默认的 rt 特性：本 crate 是库，不自带运行时/中断向量表；
+# 板级固件会自行启用 cortex-m-rt，避免宿主测试链接时缺少 device 中断符号。
+stm32f1 = { version = "0.16", default-features = false, features = ["stm32f103", "critical-section"], optional = true }
+stm32f4 = { version = "0.16", default-features = false, features = ["stm32f407", "critical-section"], optional = true }
+
+[dev-dependencies]
+# 宿主测试需要 critical-section 的标准库实现。
+critical-section = { version = "1.2.0", features = ["std"] }
+
+[features]
+default = []
+# 注册表要求处理器 `Send`，共享句柄改用 Arc + critical-section。
+send = ["sekai/send", "dep:critical-section"]
+# ESP32 classic 真实 GPIO 后端（隐含 send，供 Embassy 异步运行时使用）。
+esp32 = ["dep:esp-hal", "send"]
+# STM32F103C8 PAC 后端。
+stm32f1 = ["dep:stm32f1"]
+# STM32F407VG PAC 后端。
+stm32f4 = ["dep:stm32f4"]

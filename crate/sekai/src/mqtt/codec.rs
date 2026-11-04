@@ -1,6 +1,6 @@
-//! MQTT 编解码内部基础设施。
+//! MQTT 报文与控制平面协议共用的基础编解码工具。
 //!
-//! 仅供 `mqtt` 模块内部使用：
+//! 只在本 crate 内部使用：
 //! - [Reader]：从完整报文体中按顺序读取基本字段；
 //! - [Sink]：编码输出抽象。`CountSink` 只统计长度，`VecSink` 写入字节，
 //!   两者共用同一套编码逻辑，避免“计算长度”和“真正编码”两份实现分叉。
@@ -57,6 +57,14 @@ impl<'a> Reader<'a> {
     pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
         let bytes = self.take(4)?;
         Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// 读取大端无符号 64 位整数。
+    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     /// 读取 Variable Byte Integer。
@@ -180,6 +188,11 @@ pub(crate) fn write_u16<S: Sink + ?Sized>(sink: &mut S, value: u16) {
 
 /// 写入大端无符号 32 位整数。
 pub(crate) fn write_u32<S: Sink + ?Sized>(sink: &mut S, value: u32) {
+    sink.write(&value.to_be_bytes());
+}
+
+/// 写入大端无符号 64 位整数。
+pub(crate) fn write_u64<S: Sink + ?Sized>(sink: &mut S, value: u64) {
     sink.write(&value.to_be_bytes());
 }
 

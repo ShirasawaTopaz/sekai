@@ -7,4 +7,7 @@ description = "framework"
 
 [features]
 x86 = []
-esp32 = []
+# 异步运行时（ESP32 Embassy task）前置：注册表强制处理器 `Send`。
+esp32 = ["send"]
+# 注册表强制 `Send` 处理器；默认关闭，宿主测试行为不变。
+send = []

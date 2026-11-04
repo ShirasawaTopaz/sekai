@@ -1,0 +1,52 @@
+{
+  "name": "@sekai/dsh-plugin",
+  "version": "0.1.0",
+  "description": "Sekai bridge plugins for dsh (DeepSeek Harness): drives `sekai-router --serve` (JSONL over stdio) and the `sekai-worker connect` lifecycle, publishing sekai_* tools.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./lib/index.js",
+    "./router": "./lib/router.js",
+    "./worker": "./lib/worker.js",
+    "./locale/*.json": "./locale/*.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "scripts",
+    "README.md",
+    "cordis.patch.yml",
+    "icon.svg"
+  ],
+  "scripts": {
+    "check": "node --check lib/index.js && node --check lib/shared.js && node --check lib/router.js && node --check lib/worker.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "keywords": [
+    "sekai",
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "iot"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    }
+  },
+  "dependencies": {},
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

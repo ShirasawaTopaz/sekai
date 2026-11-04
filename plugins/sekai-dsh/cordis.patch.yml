@@ -1,0 +1,20 @@
+# sekai-dsh bundle patch：把 router 与 worker 两个 Host 插件挂进 DSH。
+#
+# 把本包加入 profile 的 bundles（dsh plugin add @sekai/dsh-plugin，或在
+# profile 的 cordis.patch.yml / bundles 配置中列出）即自动应用本补丁——
+# 无需手工编辑任何 patch 文件。两行默认 config 见下；已保存的 profile
+# 行覆盖优先于本补丁默认值生效。
+
+- insert:
+    - id: sekai-router
+      name: '@sekai/dsh-plugin/router'
+      config:
+        enabled: true
+        # 开发机默认：指向本仓库构建产物；换机器请覆盖本行 config
+        # （或让 sekai-router 出现在 PATH / 设置 SEKAI_ROUTER_BIN）。
+        routerBin: D:/Source/seika/sekai/target/release/sekai-router.exe
+    - id: sekai-worker
+      name: '@sekai/dsh-plugin/worker'
+      config:
+        enabled: true
+        workerBin: D:/Source/seika/sekai/target/release/sekai-worker.exe

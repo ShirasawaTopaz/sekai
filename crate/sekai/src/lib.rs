@@ -12,9 +12,11 @@ extern crate alloc;
 extern crate std;
 
 pub mod mqtt;
+pub mod sekai_clock;
+pub mod sekai_device_list;
+pub mod sekai_runtime;
 pub mod sekai_stdin;
 pub mod sekai_stdout;
-
-trait Looper {
-    fn looper() -> !;
-}
+pub mod sekai_task;
+pub mod sekai_tool;
+pub mod sekai_wire;

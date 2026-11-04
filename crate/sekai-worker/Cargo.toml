@@ -1,0 +1,16 @@
+[package]
+name = "sekai-worker"
+edition = "2024"
+description = "Sekai PC Worker 启动层：宿主进程 Worker，通过直连链路（stdio/TCP，V1 帧，非 MQTT broker）与 Router 通信"
+
+[lib]
+name = "sekai_worker"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sekai-worker"
+path = "src/bin/sekai-worker.rs"
+
+[dependencies]
+sekai = { path = "../sekai" }
+sekai-gpio = { path = "../sekai-gpio" }

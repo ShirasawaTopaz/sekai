@@ -1,0 +1,45 @@
+[package]
+name = "sekai-embedded"
+edition = "2024"
+description = "Sekai 嵌入式 Worker 启动层（ESP32 固件）：MQTT 传输、硬件时间与真实 GPIO"
+
+[dependencies]
+# 控制平面运行时：嵌入式 Worker 链接；默认 feature 关闭，固件构建时由 esp32 feature 拉起。
+sekai = { path = "../sekai", default-features = false }
+# GPIO 抽象与 gpio.* 工具：esp32 用真实后端。
+sekai-gpio = { path = "../sekai-gpio", default-features = false, optional = true }
+# esp32 相关依赖（只被 esp32 feature 拉起）。
+esp-hal = { version = "1.2.2", features = ["esp32", "unstable"], optional = true }
+esp-rtos = { version = "0.4.0", features = ["esp-alloc", "esp-radio", "esp32", "embassy"], optional = true }
+esp-radio = { version = "1.0.0-beta.1", features = ["wifi", "esp-alloc", "esp32", "unstable"], optional = true }
+esp-alloc = { version = "0.11.0", features = ["esp32"], optional = true }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32"], optional = true }
+critical-section = { version = "1.2.0", optional = true }
+embedded-io = { version = "0.7.1", optional = true }
+embassy-executor = { version = "0.10", optional = true }
+embassy-net = { version = "0.9", features = ["tcp", "dhcpv4", "proto-ipv4", "medium-ethernet"], optional = true }
+embassy-time = { version = "0.5", optional = true }
+static_cell = { version = "2", optional = true }
+esp-println = { version = "0.17", features = ["esp32"], optional = true }
+
+[features]
+default = []
+# ESP32 firmware：真实 GPIO + WiFi/TCP + 异步运行时。
+# 宿主（无 feature）构建只编译共享的 no_std 兼容模块（config/clock/framing/time）。
+"esp32" = [
+    "dep:sekai-gpio",
+    "dep:esp-hal",
+    "dep:esp-rtos",
+    "dep:esp-radio",
+    "dep:esp-alloc",
+    "dep:esp-bootloader-esp-idf",
+    "dep:critical-section",
+    "dep:embedded-io",
+    "dep:embassy-executor",
+    "dep:embassy-net",
+    "dep:embassy-time",
+    "dep:static_cell",
+    "dep:esp-println",
+    "sekai/esp32",
+    "sekai-gpio/esp32",
+]

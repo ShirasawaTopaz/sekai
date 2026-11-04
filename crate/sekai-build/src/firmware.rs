@@ -1,6 +1,6 @@
 //! ESP32 固件镜像。
 //!
-//! 该二进制刻意保持为空：`sekai-start` 是一个 `no_std` 库，
+//! 该二进制刻意保持为空：`sekai-embedded` 是一个 `no_std` 库，
 //! 它持有复位向量（`#[esp_hal::main] fn main()`）、panic handler
 //! 和 app descriptor，因此这个 target 只需把它链接进来。
 //!
@@ -11,4 +11,4 @@
 #![no_main]
 
 // 将启动层保留在链接结果中。
-use sekai_start as _;
+use sekai_embedded as _;
