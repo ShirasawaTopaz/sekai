@@ -35,6 +35,13 @@ use crate::sekai_wire::{
 /// Stdout 帧固定头长度（字节）。
 pub const STDOUT_HEADER_LEN: usize = 34;
 
+/// LWT（遗嘱）`Offline` 专用的 `seq` 值。
+///
+/// 帧本身没有字段区分「Jump 时的正常 Offline」与「broker 代发的 LWT
+/// Offline」，唯一约定是 LWT 的 `seq = 0`（协议 §4.6/§5.7）。正常 Offline
+/// 由 [`Stdout::new`] 强制非 0，LWT 必须用 [`Stdout::lwt_offline`] 构造。
+const LWT_SEQ: u32 = 0;
+
 /// Stdout 事件阶段。
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +122,9 @@ pub struct Stdout {
 
 impl Stdout {
     /// 构造 Stdout 帧并校验阶段规则。
+    ///
+    /// 正常 `Offline`（Jump 时主动发布）必须带非 0 `seq`；LWT 用途请用
+    /// [`Stdout::lwt_offline`]。
     pub fn new(
         boot_id: u64,
         cmd_id: u64,
@@ -141,6 +151,24 @@ impl Stdout {
         Ok(frame)
     }
 
+    /// 构造 LWT（遗嘱）`Offline` 帧：`seq = 0`、`cmd_id = 0`、载荷为空。
+    ///
+    /// LWT 在 CONNECT 时固定，broker 在 Worker 异常掉线时代发；它与 Jump
+    /// 时的正常 Offline 只能靠 `seq = 0` 区分，因此单独开一个构造入口，
+    /// 防止正常 Offline 误用 `seq = 0`（审计 K8）。
+    pub fn lwt_offline(boot_id: u64, timestamp: u64) -> Result<Self, ProtocolError> {
+        let frame = Self {
+            boot_id,
+            cmd_id: 0,
+            seq: LWT_SEQ,
+            phase: Phase::Offline,
+            timestamp,
+            payload: Vec::new(),
+        };
+        frame.validate_lwt().map_err(ProtocolError::InvalidField)?;
+        Ok(frame)
+    }
+
     /// 是否是最终事件（Completed/Failed）。
     pub fn is_final(&self) -> bool {
         self.phase.is_final()
@@ -154,7 +182,8 @@ impl Stdout {
                 max: MAX_PAYLOAD,
             });
         }
-        self.validate().map_err(ProtocolEncodeError::InvalidField)?;
+        self.validate_for_wire()
+            .map_err(ProtocolEncodeError::InvalidField)?;
         let total = STDOUT_HEADER_LEN.checked_add(self.payload.len()).ok_or(
             ProtocolEncodeError::TooLarge {
                 len: usize::MAX,
@@ -206,7 +235,27 @@ impl Stdout {
         if !reader.is_empty() {
             return Err(ProtocolError::TrailingBytes);
         }
-        Self::new(boot_id, cmd_id, seq, phase, timestamp, payload)
+        let frame = Self {
+            boot_id,
+            cmd_id,
+            seq,
+            phase,
+            timestamp,
+            payload,
+        };
+        frame
+            .validate_for_wire()
+            .map_err(ProtocolError::InvalidField)?;
+        Ok(frame)
+    }
+
+    /// 按帧形态选择校验规则：`Offline + seq=0` 走 LWT 规则，其余走普通规则。
+    fn validate_for_wire(&self) -> Result<(), &'static str> {
+        if self.phase == Phase::Offline && self.seq == LWT_SEQ {
+            self.validate_lwt()
+        } else {
+            self.validate()
+        }
     }
 
     fn validate(&self) -> Result<(), &'static str> {
@@ -229,8 +278,33 @@ impl Stdout {
             if !self.payload.is_empty() {
                 return Err("Offline 载荷必须为空");
             }
-        } else if self.seq == 0 {
+            // K8：正常 Offline（Jump 时主动发布）必须消耗非 0 seq；
+            // seq=0 只属于 LWT，必须经 `Stdout::lwt_offline` 构造。
+            if self.seq == LWT_SEQ {
+                return Err("正常 Offline 的 seq 不能为 0（LWT 请用 lwt_offline）");
+            }
+        } else if self.seq == LWT_SEQ {
             return Err("除 LWT Offline 外 seq 不能为 0");
+        }
+        Ok(())
+    }
+
+    /// LWT Offline 专用校验：`seq = 0`、`cmd_id = 0`、载荷为空。
+    fn validate_lwt(&self) -> Result<(), &'static str> {
+        if self.boot_id == 0 {
+            return Err("boot_id 不能为 0");
+        }
+        if self.phase != Phase::Offline {
+            return Err("LWT 帧必须是 Offline");
+        }
+        if self.cmd_id != 0 {
+            return Err("LWT Offline 的 cmd_id 必须为 0");
+        }
+        if self.seq != LWT_SEQ {
+            return Err("LWT Offline 的 seq 必须为 0");
+        }
+        if !self.payload.is_empty() {
+            return Err("LWT Offline 载荷必须为空");
         }
         Ok(())
     }
@@ -605,10 +679,26 @@ mod tests {
         assert!(Stdout::new(1, 0, 1, Phase::Completed, 0, vec![]).is_err());
         // 非 Offline 的 seq 不能为 0。
         assert!(Stdout::new(1, 1, 0, Phase::Completed, 0, vec![]).is_err());
-        // LWT Offline 允许 seq=0。
-        assert!(Stdout::new(1, 0, 0, Phase::Offline, 0, vec![]).is_ok());
+        // K8：正常 Offline 必须带非 0 seq，seq=0 只属于 LWT 构造入口。
+        assert!(Stdout::new(1, 0, 0, Phase::Offline, 0, vec![]).is_err());
+        assert!(Stdout::lwt_offline(1, 0).is_ok());
         // Offline 载荷必须为空。
         assert!(Stdout::new(1, 0, 1, Phase::Offline, 0, vec![1]).is_err());
+    }
+
+    #[test]
+    fn lwt_offline_roundtrip_and_decode() {
+        let frame = Stdout::lwt_offline(7, 1_700_000_000_000).unwrap();
+        assert_eq!(frame.seq, 0);
+        assert_eq!(frame.cmd_id, 0);
+        assert_eq!(frame.phase, Phase::Offline);
+        let encoded = frame.encode().unwrap();
+        assert_eq!(encoded.len(), STDOUT_HEADER_LEN);
+        assert_eq!(Stdout::decode(&encoded).unwrap(), frame);
+        // 非 Offline 的 seq=0 仍然拒绝。
+        let mut wrong_phase = encoded.clone();
+        wrong_phase[1] = Phase::Hello.as_u8();
+        assert!(Stdout::decode(&wrong_phase).is_err());
     }
 
     #[test]

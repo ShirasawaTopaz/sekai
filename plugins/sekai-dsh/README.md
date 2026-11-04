@@ -115,7 +115,8 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 约定（镜像 router `tools.rs` 的语义）：**先调 `sekai_list_workers`，worker id、工具名、任务名
 必须来自其结果**。`args` 是原始 UTF-8 文本（如 `gpio.info help`）；`ddl_ms` ∈ [1, 300000]。
 长任务（`pc.job`、`pc.ask`）请显式传 `ddl_ms`（建议 ≥60000）：不传时 Router 默认预算
-只有 1s（见[缺口审计](../../docs/sekai-gap-audit.md) B4）。
+只有 1s（见[缺口审计](../../docs/sekai-gap-audit.md) B4）。`sekai_worker_task` 与
+`ddl_ms` 字段的模型侧描述已写明这一点（`LONG_TASK_DDL_HINT_MS`）。
 
 错误一律以 `{error:{code, message, hint?}}` 信封返回、不向 DSH 抛异常：
 
@@ -141,6 +142,10 @@ router 插件与 `sekai-router --serve` 之间的协议（与 Rust 侧任务冻�
   `prompt{text,max_steps?}`（**v1.1 追加，additive**：把 prompt 交给 Router 内置 LLM 回路，
   响应 `result:{answer,status,steps,usage}`，需 API key）
 - 客户端对无法匹配 id、也无 event 的行丢弃并 `logger.warn`；人类日志走 stderr。
+- `link` 响应的实际地址在 `result.addr`（插件优先读取，兼容旧版 `listen_addr`/`mqtt_addr`
+  字段）；`link_state` 只在 `link`/`link_off` 时由 serve 主动发。
+- 为覆盖「TCP 对端断开但 serve 未补发 `link_state`」，router 插件每 3s 用 `status`
+  做兜底探测：连续两次看到未就绪才把 `ready` 修正为 false（幂等：同类状态不重复告警）。
 
 ## prompt 中转（worker 插件，`llm:'dsh'`）
 

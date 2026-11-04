@@ -59,6 +59,23 @@ export const ROUTER_DEFAULTS = Object.freeze({
 /** router 重启退避上限（毫秒）；config 未暴露此键，属守护参数。 */
 const RESTART_BACKOFF_MAX_MS = 30000
 
+/**
+ * 链路状态兜底轮询间隔（毫秒）。
+ *
+ * serve 的 `link_state` 通知只在 link/link_off 时发；TCP 对端（Worker）断开后
+ * serve 的 poll 线程只 diff Worker 集合，插件 `ready` 会一直停在 true。
+ * 这里定期用 `status` 探测做防御性补偿：旧 serve 也能工作；新 serve 补发
+ * `link_state` 时 watcher 幂等（同状态不重复更新/告警）。
+ */
+const LINK_WATCH_INTERVAL_MS = 3000
+/** 单次 status 探测超时（毫秒）：serve 串行 dispatcher 被长命令占用时不能误判。 */
+const LINK_WATCH_TIMEOUT_MS = 2000
+/** 连续多少次“status 显示未就绪”才认定链路断开（过滤瞬时抖动）。 */
+const LINK_WATCH_DOWN_SAMPLES = 2
+
+/** 长任务（pc.ask / pc.job）建议的最小 ddl_ms：Router 默认预算只有 1s。 */
+export const LONG_TASK_DDL_HINT_MS = 60000
+
 /** spawn 失败的可操作提示（工具信封与日志共用）。 */
 export const ROUTER_SPAWN_HINT = 'Run `cargo build --release` in the sekai repo, then either add target/release to PATH, set the routerBin config to the absolute path of target/release/sekai-router(.exe), or set SEKAI_ROUTER_BIN.'
 
@@ -190,7 +207,7 @@ function workerCallParameters(kind) {
         type: 'integer',
         minimum: 1,
         maximum: MAX_DDL_MS,
-        description: 'Optional execution budget in milliseconds; omit for the worker default.',
+        description: `Optional execution budget in milliseconds; omit only for short commands. Long tasks (pc.job / pc.ask) must pass ddl_ms >= ${LONG_TASK_DDL_HINT_MS}: the Router default budget is 1000ms and would time out first.`,
       },
     },
   }
@@ -273,6 +290,11 @@ export class SekaiRouterPlugin {
     this.restartTimer = null
     this.stopped = false
     this.autoLinkBusy = false
+    // 链路状态兜底探测（B11）：serve 不在 TCP 对端断开时补发 link_state 时，
+    // 由 status 轮询把插件状态修正回来。
+    this.watchTimer = null
+    this.watchBusy = false
+    this.linkDownSamples = 0
 
     const plugin = this
     ctx?.effect?.(function* () {
@@ -282,6 +304,7 @@ export class SekaiRouterPlugin {
       }
       const stopTools = plugin.registerTools()
       plugin.start()
+      plugin.startLinkWatch()
       yield () => {
         plugin.stop()
         stopTools()
@@ -346,9 +369,11 @@ export class SekaiRouterPlugin {
         void this.runAutoLink()
         break
       case 'link_state':
-        this.state.ready = event.ready === true
-        if (typeof event.desc === 'string' && event.desc !== '') this.state.linkDesc = event.desc
-        this.log('info', `sekai-router link_state: ${event.desc ?? ''} (ready=${this.state.ready})`)
+        this.applyLinkState({
+          ready: event.ready === true,
+          desc: typeof event.desc === 'string' && event.desc !== '' ? event.desc : null,
+          source: 'event',
+        })
         break
       case 'worker_online':
         this.state.workerCount += 1
@@ -374,9 +399,14 @@ export class SekaiRouterPlugin {
       const linked = await this.request('link', linkParams)
       if (linked && typeof linked === 'object') {
         if (typeof linked.mode === 'string' && linked.mode !== '') this.state.mode = linked.mode
-        const addr = linked.listen_addr ?? linked.mqtt_addr
-        if (typeof addr === 'string' && addr !== '') this.state.linkDesc = `${this.state.mode} ${addr}`
-        this.state.ready = true
+        // serve 的 link 响应实际地址字段是 `addr`；`listen_addr`/`mqtt_addr`
+        // 是请求侧参数名（旧版本/兼容路径也可能回显），按优先级兼容读取（B11）。
+        const addr = firstString(linked.addr, linked.listen_addr, linked.mqtt_addr)
+        this.applyLinkState({
+          ready: true,
+          desc: addr ? `${this.state.mode} ${addr}` : null,
+          source: 'event',
+        })
       }
       const policyParams = {}
       const policy = this.config.policy
@@ -392,6 +422,87 @@ export class SekaiRouterPlugin {
       this.log('warn', `sekai-router autoLink failed: ${describeError(error)}`)
     } finally {
       this.autoLinkBusy = false
+    }
+  }
+
+  /**
+   * 应用一次链路状态（serve `link_state` 通知或 status 探测）。
+   *
+   * 幂等：只有 `ready`/`linkDesc` 真的变化才更新状态并记日志；重复的同类
+   * 状态（新旧 serve 都可能发）不会重复告警或重复事件。
+   * `ready=false` 同时清空链路描述并清零 Worker 计数（在线表已失效）。
+   *
+   * @param {{ready: boolean, desc?: string|null, source?: 'event'|'watch'}} update
+   * @returns {boolean} 状态是否发生变化
+   */
+  applyLinkState({ ready, desc = null, source = 'event' }) {
+    const nextReady = ready === true
+    const nextDesc = nextReady ? (desc ?? this.state.linkDesc) : ''
+    if (this.state.ready === nextReady && this.state.linkDesc === nextDesc) return false
+    this.state.ready = nextReady
+    this.state.linkDesc = nextDesc
+    if (!nextReady) this.state.workerCount = 0
+    this.linkDownSamples = 0
+    const origin = source === 'watch' ? '（status 探测补发）' : ''
+    this.log(
+      nextReady ? 'info' : 'warn',
+      `sekai-router link_state: ${nextDesc || (nextReady ? '(link up)' : '(offline)')} (ready=${nextReady})${origin}`,
+    )
+    return true
+  }
+
+  /** 启动链路状态兜底轮询（生命周期内常驻；进程不在时自动空转）。 */
+  startLinkWatch() {
+    if (this.watchTimer) return
+    const timer = setInterval(() => {
+      void this.pollLinkState()
+    }, LINK_WATCH_INTERVAL_MS)
+    timer.unref?.()
+    this.watchTimer = timer
+  }
+
+  /** 停止兜底轮询（幂等）。 */
+  stopLinkWatch() {
+    if (!this.watchTimer) return
+    clearInterval(this.watchTimer)
+    this.watchTimer = null
+  }
+
+  /**
+   * 用 `status` 探测链路真实状态（B11：serve 不补发 link_state 时的兜底）。
+   *
+   * 只在明确拿到 `ready !== true` 且连续 [`LINK_WATCH_DOWN_SAMPLES`] 次采样
+   * 一致时才把状态改为断开：单次超时/失败可能只是 serve 的串行 dispatcher
+   * 被长命令占用，不能误判。状态更新统一走 [`applyLinkState`]（幂等）。
+   */
+  async pollLinkState() {
+    if (this.stopped || this.watchBusy) return
+    const proc = this.proc
+    if (!proc || proc.exited) return
+    this.watchBusy = true
+    try {
+      const raw = await proc.request('status', {}, { timeoutMs: LINK_WATCH_TIMEOUT_MS })
+      if (!isPlainObject(raw)) return
+      if (raw.ready === true) {
+        this.linkDownSamples = 0
+        const desc = firstString(raw.link, raw.link_desc, raw.linkDesc, raw.desc)
+        if (!this.state.ready) {
+          this.applyLinkState({ ready: true, desc, source: 'watch' })
+        } else if (desc && desc !== this.state.linkDesc) {
+          // 描述变化不影响就绪性、不发事件，只同步展示文本。
+          this.state.linkDesc = desc
+        }
+        return
+      }
+      this.linkDownSamples += 1
+      if (this.linkDownSamples >= LINK_WATCH_DOWN_SAMPLES) {
+        this.linkDownSamples = 0
+        this.applyLinkState({ ready: false, desc: null, source: 'watch' })
+      }
+    } catch {
+      // 请求失败（超时 / not_ready 等）保持现状：进程退出由 handleExit 统一处理。
+    } finally {
+      this.watchBusy = false
     }
   }
 
@@ -442,6 +553,7 @@ export class SekaiRouterPlugin {
     // router 进程死亡意味着旧链路与在线表全部失效：计数清零，重启后由
     // worker_online 通知与 workers 响应重建。
     this.state.workerCount = 0
+    this.linkDownSamples = 0
     if (info?.spawnError) {
       this.log('warn', `sekai-router spawn failed: ${describeError(info.spawnError)} — ${ROUTER_SPAWN_HINT}`)
     } else {
@@ -467,6 +579,7 @@ export class SekaiRouterPlugin {
   stop() {
     if (this.stopped) return
     this.stopped = true
+    this.stopLinkWatch()
     if (this.restartTimer) {
       clearTimeout(this.restartTimer)
       this.restartTimer = null
@@ -528,7 +641,7 @@ export class SekaiRouterPlugin {
       },
       {
         name: 'sekai_worker_task',
-        description: 'Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled (policy.allowTasks). Call sekai_list_workers first; worker ids and task names must come from its result. Calls are forwarded serially through one sekai-router --serve process; aborting this call only stops waiting locally — the command keeps running on the worker.',
+        description: `Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled (policy.allowTasks). Call sekai_list_workers first; worker ids and task names must come from its result. Long tasks (pc.job / pc.ask) need an explicit ddl_ms >= ${LONG_TASK_DDL_HINT_MS}; the Router default budget is 1000ms. Calls are forwarded serially through one sekai-router --serve process; aborting this call only stops waiting locally — the command keeps running on the worker.`,
         parameters: workerCallParameters('task'),
         output: passthroughOutput(COMMAND_RESULT_DOCUMENTED),
         async execute(args, exec) {

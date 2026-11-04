@@ -603,15 +603,7 @@ impl Harness {
     /// 以Worker身份发布 retained Offline（LWT 语义），返回记录索引。
     pub fn publish_retained_offline(&mut self, worker_id: &str) -> usize {
         let boot_id = self.worker(worker_id).expect("未知Worker").boot_id();
-        let frame = Stdout::new(
-            boot_id,
-            0,
-            0,
-            Phase::Offline,
-            self.now_unix_ms(),
-            Vec::new(),
-        )
-        .expect("Offline 帧合法");
+        let frame = Stdout::lwt_offline(boot_id, self.now_unix_ms()).expect("Offline 帧合法");
         self.inject_stdout(worker_id, &frame, true, Some(CONTENT_TYPE_STDOUT))
     }
 

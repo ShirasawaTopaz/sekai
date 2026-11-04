@@ -1,7 +1,15 @@
 //! MQTT 5.0 客户端会话状态机。
 //!
-//! 本模块不做 I/O，也不读取时钟：所有超时判定都使用调用方传入的 `now`
-//! （Unix 毫秒）。调用方负责：
+//! 本模块不做 I/O，也不读取时钟：所有超时判定都使用调用方传入的 `now`。
+//! `now` 是**调用方自定义的单调毫秒时基**（运行时传入
+//! `crate::sekai_clock::Clock::monotonic_ms` 的值），不要求是 Unix 时间；
+//! 客户端内部只使用它的差值（截止时刻、Keep Alive）。调用方不要混用两个
+//! 时间基准：整条客户端调用链（`connect` / `handle_packet` / `poll` /
+//! `next_outgoing` / `disconnect`）必须传同一时基的 `now`。需要线上时间戳
+//! （如 LWT 的 `timestamp`）时由运行时从 `Clock::unix_ms` 单独读取，与这里的
+//! `now` 无关。
+//!
+//! 调用方负责：
 //!
 //! 1. 用 [`Client::connect`] 发起连接，把 [`Client::next_outgoing`] 取出的报文写入传输层；
 //! 2. 把收到的报文交给 [`Client::handle_packet`]；
@@ -26,7 +34,7 @@ use alloc::vec::Vec;
 use crate::mqtt::error::EncodeError;
 use crate::mqtt::packet::{
     Ack, Auth, Connack, Connect, Disconnect, Packet, Publish, Suback, Subscribe, Unsuback,
-    Unsubscribe,
+    Unsubscribe, Will,
 };
 use crate::mqtt::property::Properties;
 use crate::mqtt::qos::QoS;
@@ -104,6 +112,20 @@ impl Client {
     /// 供传输层使用的入站最大包长（客户端在 CONNECT 中广告的 Maximum Packet Size）。
     pub fn max_incoming_packet_size(&self) -> Option<u32> {
         self.config.maximum_packet_size
+    }
+
+    /// 替换下一次 CONNECT 使用的遗嘱消息（`None` 表示不带遗嘱）。
+    ///
+    /// 遗嘱载荷在 CONNECT 时固定，因此调用方必须在每次 [`Client::connect`]
+    /// 之前重设，才能让载荷里的时间戳等字段反映「这一次连接」。
+    /// 只允许在 [`State::Disconnected`] 调用；连接中/已连接返回
+    /// [`ClientError::AlreadyConnected`]。
+    pub fn set_will(&mut self, will: Option<Will>) -> Result<(), ClientError> {
+        if self.state != State::Disconnected {
+            return Err(ClientError::AlreadyConnected);
+        }
+        self.config.will = will;
+        Ok(())
     }
 
     /// 发起连接：校验配置、构造 CONNECT 并入队，状态转为 [`State::Connecting`]。
@@ -196,7 +218,8 @@ impl Client {
         self.events.pop_front()
     }
 
-    /// 下一次需要调用 [`Client::poll`] 的时刻（Unix 毫秒）；无需定时器时返回 `None`。
+    /// 下一次需要调用 [`Client::poll`] 的时刻（与调用方传入的 `now` 同一时基，
+    /// 运行时为单调毫秒）；无需定时器时返回 `None`。
     pub fn next_deadline(&self) -> Option<u64> {
         match self.state {
             State::Connecting => Some(self.conn.connect_deadline),
@@ -351,6 +374,14 @@ impl Client {
     }
 
     /// 发送 UNSUBSCRIBE 报文，返回分配的包标识符。
+    ///
+    /// # V1 运行时取舍
+    ///
+    /// `Runtime` 当前**不调用**本方法：V1 没有「连接内取消订阅」的需求，
+    /// Jump 迁移直接发 `DISCONNECT(session_expiry_interval=0)` 丢弃旧会话，
+    /// 不需要先 UNSUBSCRIBE。该 API 保留给上层/嵌入式集成与测试；若将来
+    /// 需要动态收缩订阅，应在这里接入并同步运行时的订阅意图
+    /// （`Runtime::subscribed` 与退避重订阅状态）。
     pub fn unsubscribe(
         &mut self,
         filters: Vec<TopicFilter>,

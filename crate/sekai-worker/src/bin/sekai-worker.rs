@@ -39,8 +39,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sekai::sekai_device_list::{DeviceList, Endpoint};
 use sekai::sekai_runtime::{LinkAction, RuntimeConfig};
-use sekai_gpio::ChipFamily;
-use sekai_worker::capability::{LlmMode, SystemClock, agent_registries_for};
+use sekai_gpio::{ChipFamily, Level, PinId, parse_external_levels};
+use sekai_worker::capability::{LlmMode, SystemClock, agent_registries_for_inputs};
 use sekai_worker::host::WorkerHost;
 use sekai_worker::link::{
     Backoff, Link, LinkError, StdioLink, TcpLink, connect_hint, read_frame_stream,
@@ -68,6 +68,9 @@ sekai-worker：Sekai PC Worker（直连链路，非 MQTT broker）
                           端口 7422，如 connect 10.0.0.5:7421 → 10.0.0.5:7422）
   --gpio esp32|stm32f1|stm32f4
                           opt-in 追加 virtual GPIO 工具（默认不注册 gpio.*）
+  --gpio-inputs IO4=1,PA5=0
+                          虚拟 GPIO 的初始外部电平（逗号分隔，0/1 或 low/high；
+                          需同时给 --gpio；配置为输入后 gpio.read 返回该值）
   --boot-id N             启动周期 id（默认按时间+pid 生成，跨重启必变）
   -h, --help              显示本帮助
 
@@ -91,6 +94,8 @@ struct Args {
     router_addr: Option<String>,
     worker_id: String,
     gpio: Option<ChipFamily>,
+    /// `--gpio-inputs` 解析后的初始外部电平（P12）。
+    gpio_inputs: Vec<(PinId, Level)>,
     llm: LlmMode,
     prompt_addr: Option<String>,
     boot_id: u64,
@@ -132,6 +137,7 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
     let mut router_addr: Option<String> = None;
     let mut worker_id = String::from("pc-worker");
     let mut gpio: Option<ChipFamily> = None;
+    let mut gpio_inputs_text: Option<String> = None;
     let mut llm: Option<LlmMode> = None;
     let mut prompt_addr: Option<String> = None;
     let mut boot_id = generate_boot_id();
@@ -227,6 +233,14 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
                     }
                 });
             }
+            // --gpio-inputs 依赖 --gpio（家族决定引脚表），取值在参数循环后统一解析。
+            "--gpio-inputs" => {
+                let value = take_value("--gpio-inputs")?;
+                if gpio_inputs_text.is_some() {
+                    return Err(UsageError(String::from("--gpio-inputs 重复")));
+                }
+                gpio_inputs_text = Some(value);
+            }
             "--boot-id" => {
                 let value = take_value("--boot-id")?;
                 boot_id = value
@@ -272,11 +286,24 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
             "--prompt-addr 仅在 --llm router 时有效",
         )));
     }
+    // P12：初始 GPIO 外部电平必须能按所选家族解析（--gpio 决定引脚表）。
+    let gpio_inputs = match (&gpio, gpio_inputs_text) {
+        (None, None) => Vec::new(),
+        (None, Some(_)) => {
+            return Err(UsageError(String::from(
+                "--gpio-inputs 需要同时指定 --gpio esp32|stm32f1|stm32f4",
+            )));
+        }
+        (Some(_), None) => Vec::new(),
+        (Some(family), Some(text)) => parse_external_levels(family.spec(), &text)
+            .map_err(|error| UsageError(format!("--gpio-inputs 非法：{error}")))?,
+    };
     Ok(Parsed::Run(Box::new(Args {
         mode,
         router_addr,
         worker_id,
         gpio,
+        gpio_inputs,
         llm,
         prompt_addr,
         boot_id,
@@ -327,7 +354,7 @@ fn build_host(
     args: &Args,
     llm: Option<Arc<dyn PromptTransport>>,
 ) -> Result<WorkerHost<SystemClock>, String> {
-    let (tasks, tools) = agent_registries_for(llm, args.llm, args.gpio)?;
+    let (tasks, tools) = agent_registries_for_inputs(llm, args.llm, args.gpio, &args.gpio_inputs)?;
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(args.worker_id.clone(), args.boot_id);
     config.firmware = format!("sekai-worker/{}", env!("CARGO_PKG_VERSION"));
@@ -766,6 +793,38 @@ mod tests {
         assert_eq!(args.gpio, Some(ChipFamily::Stm32F1));
         assert!(parse_err(&["--gpio", "avr"]).contains("--gpio"));
         assert!(parse_err(&["--family", "avr"]).contains("--family"));
+    }
+
+    // ---- 虚拟 GPIO 初始输入注入（P12） ----
+
+    #[test]
+    fn gpio_inputs_parse_to_levels() {
+        let args = parse_ok(&["--gpio", "esp32", "--gpio-inputs", "IO4=1,IO5=0"]);
+        assert_eq!(
+            args.gpio_inputs,
+            vec![(PinId::io(4), Level::High), (PinId::io(5), Level::Low),]
+        );
+        // --family 别名同样生效；电平接受 low/high 文本。
+        let args = parse_ok(&["--family", "stm32f4", "--gpio-inputs", "PA5=high,PB5=low"]);
+        assert_eq!(
+            args.gpio_inputs,
+            vec![
+                (PinId::port(sekai_gpio::Port::A, 5), Level::High),
+                (PinId::port(sekai_gpio::Port::B, 5), Level::Low),
+            ]
+        );
+        // 未给 --gpio-inputs：空表（不影响旧行为）。
+        assert!(parse_ok(&["--gpio", "esp32"]).gpio_inputs.is_empty());
+    }
+
+    #[test]
+    fn gpio_inputs_require_family_and_reject_bad_values() {
+        let message = parse_err(&["--gpio-inputs", "IO4=1"]);
+        assert!(message.contains("--gpio"), "{message}");
+        for bad in ["IO4=2", "IO99=1", "junk", "IO6=1"] {
+            let message = parse_err(&["--gpio", "esp32", "--gpio-inputs", bad]);
+            assert!(message.contains("--gpio-inputs"), "{bad}: {message}");
+        }
     }
 
     // ---- connect 模式阶段文案 ----

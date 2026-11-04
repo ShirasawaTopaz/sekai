@@ -8,7 +8,7 @@ use sekai::sekai_device_list::DeviceList;
 use sekai::sekai_tool::{RegistryError, ToolContext, ToolHandler, ToolRegistry};
 use sekai::sekai_wire::{CommandError, ErrorCode};
 use sekai_gpio::virtual_gpio::VirtualGpio;
-use sekai_gpio::{ChipFamily, Level, PinId, register_tools};
+use sekai_gpio::{ChipFamily, Level, PinId, parse_external_levels, register_tools};
 
 /// 计划 §5.3 的 `gpio.info help` 固定文本（逐字，末尾无换行）。
 const EXPECTED_HELP: &str = "gpio tools v1\n\
@@ -444,6 +444,30 @@ fn config_requires_pin() {
     let mut registry = registry(ChipFamily::Esp32);
     let error = call_err(&mut registry, "gpio.config", "   ");
     assert_invalid(&error);
+}
+
+#[test]
+fn injected_inputs_are_readable_through_tools() {
+    // P12：`--gpio-inputs` 的等价路径——初始外部电平在注册前注入，配置为
+    // 输入后 `gpio.read` 返回注入值（覆盖高/低两种）。
+    let inputs = parse_external_levels(ChipFamily::Esp32.spec(), "IO4=1, IO5=0").unwrap();
+    let mut registry = ToolRegistry::new();
+    register_tools(
+        &mut registry,
+        VirtualGpio::with_inputs(ChipFamily::Esp32, &inputs).expect("注入初始电平"),
+    )
+    .expect("注册 GPIO 工具");
+
+    call(&mut registry, "gpio.config", "IO4 in").unwrap();
+    call(&mut registry, "gpio.config", "IO5 in").unwrap();
+    assert_eq!(
+        call(&mut registry, "gpio.read", "IO4").unwrap(),
+        "pin=IO4 level=1"
+    );
+    assert_eq!(
+        call(&mut registry, "gpio.read", "IO5").unwrap(),
+        "pin=IO5 level=0"
+    );
 }
 
 #[test]

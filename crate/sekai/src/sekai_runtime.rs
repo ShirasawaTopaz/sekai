@@ -23,7 +23,7 @@ use core::fmt;
 
 use crate::mqtt::client::{Client, ClientConfig, ClientError, Event, PublishOptions, State};
 use crate::mqtt::error::EncodeError;
-use crate::mqtt::packet::{Connack, Disconnect, Packet, Publish, Suback, Will};
+use crate::mqtt::packet::{Auth, Connack, Disconnect, Packet, Publish, Suback, Will};
 use crate::mqtt::property::Properties;
 use crate::mqtt::qos::QoS;
 use crate::mqtt::reason::ReasonCode;
@@ -57,6 +57,17 @@ pub const BUILTIN_TOOLS: &[&str] = &[
 /// 最终事件去重缓存的总字节上限。
 const FINAL_CACHE_BYTES: usize = 4 * 1024;
 
+/// 订阅失败后的重试退避下限（毫秒）；之后按 2 倍递增。
+const SUBSCRIBE_RETRY_MIN_MS: u64 = 1_000;
+/// 订阅失败后的重试退避上限（毫秒）。
+const SUBSCRIBE_RETRY_MAX_MS: u64 = 30_000;
+/// 两次 `sekai.set_time` 校准之间的最小间隔（单调毫秒）。
+///
+/// [`Clock::calibrate_unix_ms`](crate::sekai_clock::Clock::calibrate_unix_ms)
+/// 的契约是「运行时负责限制校准频率」；这里取 1 秒，既允许 Router 重连后
+/// 立即对时，又避免同一批命令反复回拨墙上时间。
+const MIN_CALIBRATION_INTERVAL_MS: u64 = 1_000;
+
 /// 运行时配置。
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -69,6 +80,9 @@ pub struct RuntimeConfig {
     /// 主题根，默认 `sekai/v1`。
     pub topic_root: String,
     /// MQTT 客户端配置；`client_id` 会被 worker_id 覆盖。
+    ///
+    /// 默认走 Clean Start + `session_expiry_interval = 0`（K4）：Worker 不依赖
+    /// broker 侧会话，停机期间 broker 不会缓存/重放 `in` 主题的 Stdin。
     pub mqtt: ClientConfig,
     /// `ddl_ms == 0` 时的默认执行预算（毫秒）。
     pub default_ddl_ms: u32,
@@ -86,14 +100,32 @@ pub struct RuntimeConfig {
     pub max_inbox: usize,
     /// Outbox 条目上限。
     pub max_outbox: usize,
-    /// Outbox 载荷字节上限。
+    /// Outbox 载荷字节上限（只统计非最终事件）。
     pub outbox_bytes: usize,
+    /// Outbox 中**最终事件**的独立条目预算。
+    ///
+    /// 最终事件不与该预算之外的中间事件互相挤占：中间事件写满时只能淘汰
+    /// 中间事件，最终事件写满自己的预算时只淘汰最老的排队最终事件（见
+    /// `Outbox`）。因此 Router 不能假设中间事件完整，但应能拿到每条命令的
+    /// 最终事件（协议 §9.6）。
+    pub max_outbox_final: usize,
+    /// Outbox 中**最终事件**的独立字节预算。
+    ///
+    /// 与 [`Self::outbox_bytes`] 分开计数，默认至少能容纳一条满额
+    /// （4096 字节）最终事件；更多大结果会把更老的排队最终事件挤出去。
+    pub final_outbox_bytes: usize,
     /// 去重 id 窗口。
     pub dedup_window: usize,
     /// 最终事件缓存条数。
     pub final_cache: usize,
     /// Jump 排空发件箱的最长等待（毫秒）。
     pub jump_drain_ms: u64,
+    /// Jump 回退（`FallingBack`）的最长等待（毫秒）。
+    ///
+    /// 目标端点不可达时先回退原端点；若回退链路也连不上/不回 CONNACK，
+    /// 超过该时限必须结束 Jump 状态并给原命令补发 `JumpUnreachable` 终态，
+    /// 避免「Jump 一直活跃 → 后续命令全部被拒」的死锁（审计 K3）。
+    pub jump_fallback_ms: u64,
     /// 连续服务器迁移上限。
     pub max_consecutive_server_moves: u8,
     /// 是否允许 Jump 目标直接写 `host:port`。
@@ -106,10 +138,14 @@ impl RuntimeConfig {
     /// 用合理的控制平面默认值创建配置。
     pub fn new(worker_id: impl Into<String>, boot_id: u64) -> Self {
         let mqtt = ClientConfig {
-            clean_start: false,
+            // K4：Worker 不依赖 broker 侧会话。Clean Start + session expiry 0
+            // 保证 broker 在 Worker 停机期间不会缓存/重放 `in` 主题上的
+            // Stdin（cmd_id 去重窗口只是内存态，重启后为空，重放会重复执行）。
+            // 重连后由运行时重新 SUBSCRIBE 并发布 Hello，无需会话恢复。
+            clean_start: true,
             keep_alive: 30,
             connect_timeout: 5_000,
-            session_expiry_interval: Some(300),
+            session_expiry_interval: Some(0),
             receive_maximum: Some(8),
             maximum_packet_size: Some(16 * 1024),
             ..ClientConfig::default()
@@ -129,9 +165,12 @@ impl RuntimeConfig {
             max_inbox: 4,
             max_outbox: 8,
             outbox_bytes: 16 * 1024,
+            max_outbox_final: 4,
+            final_outbox_bytes: 8 * 1024,
             dedup_window: 32,
             final_cache: 8,
             jump_drain_ms: 1_500,
+            jump_fallback_ms: 5_000,
             max_consecutive_server_moves: 3,
             allow_arbitrary_jump_targets: false,
             will_offline: true,
@@ -173,10 +212,24 @@ impl RuntimeConfig {
             || self.max_inbox == 0
             || self.max_outbox == 0
             || self.outbox_bytes == 0
+            || self.max_outbox_final == 0
+            || self.final_outbox_bytes == 0
             || self.dedup_window == 0
             || self.final_cache == 0
         {
             return Err(RuntimeError::InvalidConfig("运行时上限不能为 0"));
+        }
+        if self.jump_fallback_ms == 0 {
+            return Err(RuntimeError::InvalidConfig("jump_fallback_ms 不能为 0"));
+        }
+        // K4：Clean Start 为假且会话不过期时，broker 可能在 Worker 停机期间
+        // 缓存 `in` 主题的 Stdin 并在重连后重放；而运行时去重窗口是纯内存的，
+        // 重启后为空 → 命令会被重复执行。默认配置走 Clean Start；调用方若
+        // 坚持会话恢复，必须先自行把去重状态持久化。
+        if !self.mqtt.clean_start && self.mqtt.session_expiry_interval.unwrap_or(0) > 0 {
+            return Err(RuntimeError::InvalidConfig(
+                "clean_start=false 且 session_expiry>0 会让 broker 重放停机期间的 Stdin",
+            ));
         }
         if self.mqtt.receive_maximum == Some(0) {
             return Err(RuntimeError::InvalidConfig("receive_maximum 不能为 0"));
@@ -301,6 +354,11 @@ pub struct RuntimeStatus {
     pub pending_acks: usize,
     /// 是否已订阅输入主题。
     pub subscribed: bool,
+    /// 最近一次 SUBACK 的错误码；`None` 表示最近一次订阅成功（或尚未收到
+    /// SUBACK）。供 `status`/日志观测「订阅被 broker 拒绝」（审计 K5）。
+    pub subscribe_error: Option<ReasonCode>,
+    /// 订阅尝试次数：SUBACK 错误与客户端本地发送失败都计数（K5）。
+    pub subscribe_attempts: u32,
     /// 当前 Unix 毫秒。
     pub clock_unix_ms: Option<u64>,
     /// 被丢弃的出站事件数。
@@ -327,6 +385,10 @@ pub struct Runtime<C: Clock> {
     dedup: Dedup,
     next_seq: u32,
     subscribed: bool,
+    /// 下一次重试 SUBSCRIBE 的单调毫秒时刻（K5）。
+    subscribe_retry_at: Option<u64>,
+    /// 最近一次成功发起对时的单调毫秒时刻（K8 限频）。
+    last_calibration: Option<u64>,
     link: LinkState,
     jump: JumpState,
     link_actions: VecDeque<LinkAction>,
@@ -363,29 +425,19 @@ impl<C: Clock> Runtime<C> {
             mqtt.maximum_packet_size = Some(16 * 1024);
         }
         if mqtt.session_expiry_interval.is_none() {
-            mqtt.session_expiry_interval = Some(300);
-        }
-        if config.will_offline {
-            let offline = Stdout::new(
-                config.boot_id,
-                0,
-                0,
-                Phase::Offline,
-                clock.unix_ms().unwrap_or(0),
-                Vec::new(),
-            )?;
-            mqtt.will = Some(Will {
-                topic: topics.state.clone(),
-                payload: offline.encode()?,
-                qos: QoS::AtLeastOnce,
-                retain: true,
-                properties: stdout_properties(),
-            });
+            // 未显式配置时按 MQTT 默认值 0（会话随连接结束）；Clean Start
+            // 语义下不会出现「旧会话补发消息」（K4）。
+            mqtt.session_expiry_interval = Some(0);
         }
         let client = Client::new(mqtt);
-        let outbox = Outbox::new(config.max_outbox, config.outbox_bytes);
+        let outbox = Outbox::new(
+            config.max_outbox,
+            config.outbox_bytes,
+            config.max_outbox_final,
+            config.final_outbox_bytes,
+        );
         let dedup = Dedup::new(config.dedup_window, config.final_cache);
-        Ok(Self {
+        let mut runtime = Self {
             clock,
             config,
             client,
@@ -400,23 +452,50 @@ impl<C: Clock> Runtime<C> {
             dedup,
             next_seq: 1,
             subscribed: false,
+            subscribe_retry_at: None,
+            last_calibration: None,
             link: LinkState::default(),
             jump: JumpState::Idle,
             link_actions: VecDeque::new(),
             expect_link_close: false,
             metrics: Metrics::default(),
-        })
+        };
+        // 构造时先按当前时钟生成一份 LWT；每次 CONNECT 前会在 link_up 中重建
+        // （K6：时间戳取 CONNECT 时刻，而不是 Runtime 创建时刻）。
+        runtime.refresh_will()?;
+        Ok(runtime)
+    }
+
+    /// 按当前时钟重建 LWT `Offline` 载荷（K6）。
+    ///
+    /// 遗嘱消息在 CONNECT 时固定，因此必须在每次 `connect` 之前重建：
+    /// 时间戳取「这一次 CONNECT」的墙上时间（未校准为 0），`seq = 0`。
+    fn refresh_will(&mut self) -> Result<(), RuntimeError> {
+        if !self.config.will_offline {
+            return Ok(());
+        }
+        let offline = Stdout::lwt_offline(self.config.boot_id, self.clock.unix_ms().unwrap_or(0))?;
+        let will = Will {
+            topic: self.topics.state.clone(),
+            payload: offline.encode()?,
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            properties: stdout_properties(),
+        };
+        self.client.set_will(Some(will))?;
+        Ok(())
     }
 
     // ---- 链路生命周期（start 层调用） ----
 
-    /// TCP 连接建立后调用：记录端点并发起 MQTT CONNECT。
+    /// TCP 连接建立后调用：记录端点、重建 LWT 并发起 MQTT CONNECT。
     pub fn link_up(&mut self, endpoint: Endpoint) -> Result<(), RuntimeError> {
         if self.client.state() != State::Disconnected {
             return Err(RuntimeError::InvalidConfig("链路已连接"));
         }
         self.link.current = Some(endpoint);
         let now = self.clock.monotonic_ms();
+        self.refresh_will()?;
         self.client.connect(now).map_err(RuntimeError::Client)?;
         Ok(())
     }
@@ -448,13 +527,26 @@ impl<C: Clock> Runtime<C> {
         }
     }
 
-    /// TCP 连接失败（尚未发出 MQTT CONNECT）；如果目标是 Jump 目标则回退。
+    /// TCP 连接失败（尚未发出 MQTT CONNECT）。
+    ///
+    /// - 目标是 Jump 目标（`Switching`）→ 回退原端点；
+    /// - 目标是回退端点（`FallingBack`）→ 原端点也不可达，Jump 以
+    ///   `JumpUnreachable` 终态收场（K3）。
     pub fn link_failed(&mut self, endpoint: Endpoint) {
-        if let JumpState::Switching { target, .. } = &self.jump
-            && *target == endpoint
-        {
-            let now = self.clock.monotonic_ms();
+        let now = self.clock.monotonic_ms();
+        let switching_to_target = matches!(
+            &self.jump,
+            JumpState::Switching { target, .. } if *target == endpoint
+        );
+        let failing_back_to_home = matches!(
+            &self.jump,
+            JumpState::FallingBack { home, .. } if *home == endpoint
+        );
+        if switching_to_target {
             let _ = self.begin_fallback(now);
+        } else if failing_back_to_home {
+            let cmd_id = self.jump.cmd_id();
+            let _ = self.finish_fallback(cmd_id);
         }
     }
 
@@ -475,10 +567,14 @@ impl<C: Clock> Runtime<C> {
         let poll_result = self.client.poll(now);
         let drain_result = self.drain_events();
         if let Err(error) = poll_result {
-            if matches!(&self.jump, JumpState::Switching { .. }) {
-                self.begin_fallback(now)?;
-            } else {
-                return Err(RuntimeError::Client(error));
+            match self.jump.phase() {
+                Some(JumpPhase::Switching) => self.begin_fallback(now)?,
+                // 回退连接也超时/报错：Jump 必须有终态，不能一直吞掉错误（K3）。
+                Some(JumpPhase::FallingBack) => {
+                    let cmd_id = self.jump.cmd_id();
+                    self.finish_fallback(cmd_id)?;
+                }
+                _ => return Err(RuntimeError::Client(error)),
             }
         }
         drain_result?;
@@ -486,6 +582,7 @@ impl<C: Clock> Runtime<C> {
         if !self.jump.is_active() {
             self.process_inbox(now)?;
         }
+        self.retry_subscribe_if_due(now);
         self.start_due(now)?;
         self.step_tasks(now)?;
         self.flush_outbox(now)?;
@@ -522,8 +619,14 @@ impl<C: Clock> Runtime<C> {
                 running.started_at.saturating_add(u64::from(running.ddl_ms)),
             );
         }
-        if let JumpState::Draining { until, .. } = &self.jump {
-            deadline = fold_deadline(deadline, *until);
+        if let Some(until) = self.jump.until() {
+            deadline = fold_deadline(deadline, until);
+        }
+        if self.client.state() == State::Connected
+            && !self.subscribed
+            && let Some(retry_at) = self.subscribe_retry_at
+        {
+            deadline = fold_deadline(deadline, retry_at);
         }
         if !self.jump.is_active() && !self.inbox.is_empty() {
             deadline = fold_deadline(deadline, self.clock.monotonic_ms());
@@ -551,9 +654,11 @@ impl<C: Clock> Runtime<C> {
             scheduled: self.scheduled.len(),
             running: self.running.len(),
             outbox: self.outbox.entries.len(),
-            outbox_bytes: self.outbox.bytes,
+            outbox_bytes: self.outbox.bytes_total(),
             pending_acks: self.outbox.pending_acks.len(),
             subscribed: self.subscribed,
+            subscribe_error: self.metrics.last_suback_error,
+            subscribe_attempts: self.metrics.subscribe_attempts,
             clock_unix_ms: self.clock.unix_ms(),
             dropped_events: self.metrics.dropped_events,
             rejected_commands: self.metrics.rejected_commands,
@@ -572,13 +677,45 @@ impl<C: Clock> Runtime<C> {
                 Event::Disconnected(disconnect) => self.on_disconnected(disconnect)?,
                 Event::Publish(publish) => self.on_publish(publish)?,
                 Event::Puback(ack) => self.outbox.on_puback(ack.packet_id),
-                Event::Suback(suback) => self.on_suback(&suback),
+                Event::Suback(suback) => self.on_suback(&suback, now),
                 Event::SessionReset { lost_packet_ids } => {
                     self.outbox.on_session_reset(&lost_packet_ids);
                 }
-                Event::Pubrec(_) | Event::Pubcomp(_) | Event::Unsuback(_) | Event::Auth(_) => {}
+                Event::Auth(auth) => self.on_auth(auth)?,
+                Event::Pubrec(_) | Event::Pubcomp(_) | Event::Unsuback(_) => {}
             }
         }
+        Ok(())
+    }
+
+    /// MQTT 5 增强认证应答（K2）。
+    ///
+    /// 运行时没有逐轮计算凭据的能力：对服务端的 challenge/re-auth 直接回送
+    /// CONNECT 中配置的 `authentication_method/data`。对静态令牌型认证这足以
+    /// 完成握手；需要客户端按 challenge 计算的方案会在后续轮次被 broker
+    /// 拒绝（连接以 CONNACK/DISCONNECT 错误收场），而不是像以前那样把 AUTH
+    /// 事件丢掉、一直挂到 CONNECT 超时。未配置认证方式时忽略（服务端本不应
+    /// 在客户端未请求时发 AUTH）。
+    fn on_auth(&mut self, auth: Auth) -> Result<(), RuntimeError> {
+        let Some(method) = self.config.mqtt.authentication_method.clone() else {
+            return Ok(());
+        };
+        // 只有服务端继续挑战/要求重认证时才需要客户端再发 AUTH；Success 或
+        // 错误原因码意味着该轮认证已结束。
+        if !matches!(
+            auth.reason_code,
+            ReasonCode::ContinueAuthentication | ReasonCode::ReAuthenticate
+        ) {
+            return Ok(());
+        }
+        let mut properties = Properties::new();
+        properties.authentication_method = Some(method);
+        properties.authentication_data = self.config.mqtt.authentication_data.clone();
+        let response = Auth {
+            reason_code: ReasonCode::ContinueAuthentication,
+            properties,
+        };
+        self.client.auth(response, self.clock.monotonic_ms())?;
         Ok(())
     }
 
@@ -587,24 +724,23 @@ impl<C: Clock> Runtime<C> {
             self.link.last_good = Some(current);
         }
         let was_jump = core::mem::replace(&mut self.jump, JumpState::Idle);
-        let jump_completed = match was_jump {
-            JumpState::Switching { cmd_id, target, .. } => Some((cmd_id, target)),
+        let jump_completed = match &was_jump {
+            JumpState::Switching { cmd_id, target, .. } => Some((*cmd_id, target.clone())),
+            _ => None,
+        };
+        // 回退链路重新连上：Jump 以失败收场；失败帧与 Hello 一起进发件箱，
+        // 重连后按 seq 顺序送达原 Router（K3）。
+        let fallback_cmd = match &was_jump {
+            JumpState::FallingBack { cmd_id, .. } => Some(*cmd_id),
             _ => None,
         };
         if connack.session_present {
             self.subscribed = true;
+            self.subscribe_retry_at = None;
         }
         if !self.subscribed {
-            let options = SubscriptionOptions::new(QoS::AtLeastOnce, true, false, 0)
-                .map_err(RuntimeError::InvalidConfig)?;
-            let subscription = Subscription {
-                filter: self.topics.input.clone(),
-                options,
-            };
-            // 订阅失败（例如服务端拒绝）不致命；下一次 Connected 会重试。
-            let _ = self
-                .client
-                .subscribe(vec![subscription], Properties::new(), now);
+            let subscription = self.input_subscription()?;
+            self.try_subscribe(subscription, now);
         }
         self.emit_hello(now)?;
         if let Some((cmd_id, target)) = jump_completed
@@ -613,19 +749,97 @@ impl<C: Clock> Runtime<C> {
             let payload = JumpOutcome::new(target).encode()?;
             self.emit(Phase::Completed, cmd_id, payload)?;
         }
+        if let Some(cmd_id) = fallback_cmd
+            && cmd_id != 0
+            && self.dedup.final_for(cmd_id).is_none()
+        {
+            self.emit_failed(cmd_id, ErrorCode::JumpUnreachable, "跳转目标不可达，已回退")?;
+        }
         self.expect_link_close = false;
         Ok(())
     }
 
     fn on_connection_refused(&mut self, now: u64) -> Result<(), RuntimeError> {
-        if matches!(&self.jump, JumpState::Switching { .. }) {
-            self.begin_fallback(now)?;
+        match self.jump.phase() {
+            Some(JumpPhase::Switching) => self.begin_fallback(now)?,
+            // 回退端点也拒绝连接：原端点不可达，Jump 立即以失败终态收场。
+            Some(JumpPhase::FallingBack) => {
+                let cmd_id = self.jump.cmd_id();
+                self.finish_fallback(cmd_id)?;
+            }
+            _ => {}
         }
         Ok(())
     }
 
-    fn on_suback(&mut self, suback: &Suback) {
-        self.subscribed = suback.reason_codes.iter().any(|code| !code.is_error());
+    /// 构造 `in` 主题订阅（QoS1；`no_local=false`、`retain_as_published=false`）。
+    fn input_subscription(&self) -> Result<Subscription, RuntimeError> {
+        let options = SubscriptionOptions::new(QoS::AtLeastOnce, true, false, 0)
+            .map_err(RuntimeError::InvalidConfig)?;
+        Ok(Subscription {
+            filter: self.topics.input.clone(),
+            options,
+        })
+    }
+
+    /// 发送 SUBSCRIBE；本地发送失败时记录并安排退避重试（K5）。
+    fn try_subscribe(&mut self, subscription: Subscription, now: u64) {
+        match self
+            .client
+            .subscribe(vec![subscription], Properties::new(), now)
+        {
+            Ok(_) => {
+                self.subscribe_retry_at = None;
+            }
+            Err(_) => self.record_subscribe_failure(None, now),
+        }
+    }
+
+    /// 记录一次订阅失败（SUBACK 错误码或本地发送错误）并安排下次退避重试。
+    fn record_subscribe_failure(&mut self, error: Option<ReasonCode>, now: u64) {
+        self.metrics.subscribe_attempts = self.metrics.subscribe_attempts.saturating_add(1);
+        if let Some(code) = error {
+            self.metrics.last_suback_error = Some(code);
+        }
+        let delay = subscribe_backoff_ms(self.metrics.subscribe_attempts);
+        self.subscribe_retry_at = Some(now.saturating_add(delay));
+    }
+
+    /// 到达退避时刻后重订阅（只在已连接状态尝试）。
+    fn retry_subscribe_if_due(&mut self, now: u64) {
+        if self.subscribed || self.client.state() != State::Connected {
+            return;
+        }
+        let Some(retry_at) = self.subscribe_retry_at else {
+            return;
+        };
+        if now < retry_at {
+            return;
+        }
+        if let Ok(subscription) = self.input_subscription() {
+            self.try_subscribe(subscription, now);
+        }
+    }
+
+    /// 处理 SUBACK：记录错误码并安排退避重订阅（K5）。
+    ///
+    /// 之前只把 `subscribed` 设为「任一 non-error」，订阅被拒后错误码被吞掉，
+    /// 只能等下一次 CONNECT 重试。现在错误码进 `status().subscribe_error`
+    /// 并在 `(attempts)` 退避后重发 SUBSCRIBE。
+    fn on_suback(&mut self, suback: &Suback, now: u64) {
+        let error = suback
+            .reason_codes
+            .iter()
+            .copied()
+            .find(|code| code.is_error());
+        self.subscribed = error.is_none();
+        match error {
+            Some(code) => self.record_subscribe_failure(Some(code), now),
+            None => {
+                self.metrics.last_suback_error = None;
+                self.subscribe_retry_at = None;
+            }
+        }
     }
 
     fn on_disconnected(&mut self, disconnect: Disconnect) -> Result<(), RuntimeError> {
@@ -680,11 +894,6 @@ impl<C: Clock> Runtime<C> {
         }
         if publish.retain {
             // `in` 主题禁止 retained；否则Worker重连/重新订阅会重复执行旧命令。
-            self.metrics.rejected_commands = self.metrics.rejected_commands.saturating_add(1);
-            return Ok(());
-        }
-        if self.jump.is_active() {
-            // Jump 期间不接受新命令，避免污染发件箱排空。
             self.metrics.rejected_commands = self.metrics.rejected_commands.saturating_add(1);
             return Ok(());
         }
@@ -751,6 +960,16 @@ impl<C: Clock> Runtime<C> {
             ddl_ms: stdin.ddl_ms,
             timestamp: stdin.timestamp,
         };
+        if self.jump.is_active() {
+            // K3：Jump 期间不接受新命令，但**不能静默丢弃**——立即回一帧
+            // `Failed(Busy)` 并记住该 id，Router 才能明确知道命令未被受理。
+            // （旧行为是只计内部拒绝计数、不回包，审计 K3 已指出其后果。）
+            // 走 `fail_parse` 而不是直接 `remember_fail`：若 id 恰是正在
+            // Jump 的命令（重复投递），按去重规则忽略，避免同一命令出现
+            // 两个最终事件。
+            self.metrics.rejected_commands = self.metrics.rejected_commands.saturating_add(1);
+            return self.fail_parse(command.id, ErrorCode::Busy, "跳转进行中，命令未被受理");
+        }
         self.push_inbound(command)
     }
 
@@ -882,7 +1101,7 @@ impl<C: Clock> Runtime<C> {
             return Ok(());
         }
         if let Some(final_stdout) = self.dedup.final_for(id).cloned() {
-            self.outbox.enqueue(final_stdout);
+            self.enqueue_event(final_stdout);
         } else {
             self.metrics.rejected_commands = self.metrics.rejected_commands.saturating_add(1);
         }
@@ -1131,6 +1350,17 @@ impl<C: Clock> Runtime<C> {
                     )));
                 }
                 let previous = self.clock.unix_ms().unwrap_or(0);
+                // K8：实现 `Clock::calibrate_unix_ms` 契约里的「运行时限频」，
+                // 避免同一批命令把墙上时间反复回拨/前跳。
+                if let Some(last) = self.last_calibration
+                    && now.saturating_sub(last) < MIN_CALIBRATION_INTERVAL_MS
+                {
+                    return Some(Err(CommandError::new(
+                        ErrorCode::InvalidArgument,
+                        "校准过于频繁：两次 sekai.set_time 至少间隔 1 秒",
+                    )));
+                }
+                self.last_calibration = Some(now);
                 self.clock.calibrate_unix_ms(value);
                 Some(Ok(previous.to_be_bytes().to_vec()))
             }
@@ -1232,15 +1462,23 @@ impl<C: Clock> Runtime<C> {
     }
 
     fn advance_jump(&mut self, now: u64) -> Result<(), RuntimeError> {
-        let should = match &self.jump {
-            JumpState::Draining { until, .. } => {
-                (self.outbox.entries.is_empty() && self.outbox.pending_acks.is_empty())
-                    || now >= *until
+        match self.jump.phase() {
+            Some(JumpPhase::Draining) => {
+                let until = self.jump.until().unwrap_or(u64::MAX);
+                let drained = self.outbox.entries.is_empty() && self.outbox.pending_acks.is_empty();
+                if drained || now >= until {
+                    self.begin_disconnect(now)?;
+                }
             }
-            _ => false,
-        };
-        if should {
-            self.begin_disconnect(now)?;
+            // 回退重连也超时：结束 Jump 并补发失败终态（K3）。
+            Some(JumpPhase::FallingBack) => {
+                let until = self.jump.until().unwrap_or(u64::MAX);
+                if now >= until {
+                    let cmd_id = self.jump.cmd_id();
+                    self.finish_fallback(cmd_id)?;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1293,6 +1531,12 @@ impl<C: Clock> Runtime<C> {
         Ok(())
     }
 
+    /// 目标端点不可达：切回原端点，进入 `FallingBack` 等待重连（K3）。
+    ///
+    /// 失败帧**不在这里发**：等回退重连成功（`on_connected`）、再次失败
+    /// （`link_failed`/`on_connection_refused`）或超时（`advance_jump`）时
+    /// 才补发 `JumpUnreachable` 终态，保证一条命令至多一个最终事件，且
+    /// 回退也失败时状态不会永远卡在 `FallingBack`。
     fn begin_fallback(&mut self, now: u64) -> Result<(), RuntimeError> {
         let JumpState::Switching {
             cmd_id,
@@ -1302,19 +1546,30 @@ impl<C: Clock> Runtime<C> {
         else {
             return Ok(());
         };
-        if cmd_id != 0 {
-            self.emit_failed(cmd_id, ErrorCode::JumpUnreachable, "跳转目标不可达，已回退")?;
-        }
         self.jump = JumpState::FallingBack {
             cmd_id,
             failed: target,
             home: previous.clone(),
+            until: now.saturating_add(self.config.jump_fallback_ms),
         };
         self.link_actions.push_back(LinkAction::Switch {
             endpoint: previous,
             reason: SwitchReason::Fallback,
         });
-        let _ = now;
+        Ok(())
+    }
+
+    /// 结束失败的 Jump 回退：清空状态，并为 Jump 命令补发失败终态（幂等）。
+    ///
+    /// 去重缓存里已有最终事件时不再补发（协议要求一条命令至多一个最终帧）。
+    fn finish_fallback(&mut self, cmd_id: u64) -> Result<(), RuntimeError> {
+        if !matches!(&self.jump, JumpState::FallingBack { .. }) {
+            return Ok(());
+        }
+        self.jump = JumpState::Idle;
+        if cmd_id != 0 && self.dedup.final_for(cmd_id).is_none() {
+            self.emit_failed(cmd_id, ErrorCode::JumpUnreachable, "跳转目标不可达，已回退")?;
+        }
         Ok(())
     }
 
@@ -1334,8 +1589,23 @@ impl<C: Clock> Runtime<C> {
         if stdout.is_final() {
             self.dedup.remember_final(&stdout);
         }
-        self.outbox.enqueue(stdout);
+        self.enqueue_event(stdout);
         Ok(())
+    }
+
+    /// 入发件箱并把淘汰/拒收计入 `dropped_events`（K7）。
+    ///
+    /// 以前 `emit`（以及重复命令重放）忽略 `Outbox::enqueue` 的返回值，
+    /// 发件箱满时事件静默消失且没有计数；现在每一次淘汰或拒收都记到
+    /// [`RuntimeStatus::dropped_events`]，供 Router/运维判断事件完整性。
+    fn enqueue_event(&mut self, stdout: Stdout) {
+        let outcome = self.outbox.enqueue(stdout);
+        let rejected: u64 = if outcome.accepted { 0 } else { 1 };
+        self.metrics.dropped_events = self
+            .metrics
+            .dropped_events
+            .saturating_add(outcome.evicted)
+            .saturating_add(rejected);
     }
 
     fn emit_failed(
@@ -1413,6 +1683,14 @@ fn fold_deadline(current: Option<u64>, candidate: u64) -> Option<u64> {
     Some(current.map_or(candidate, |value| value.min(candidate)))
 }
 
+/// 订阅失败的退避时长：1s 起步按 2 倍递增，30s 封顶。
+fn subscribe_backoff_ms(attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(5);
+    SUBSCRIBE_RETRY_MIN_MS
+        .saturating_mul(1u64 << shift)
+        .min(SUBSCRIBE_RETRY_MAX_MS)
+}
+
 fn is_builtin_tool(name: &str) -> bool {
     BUILTIN_TOOLS.contains(&name)
 }
@@ -1485,6 +1763,10 @@ struct Metrics {
     dropped_events: u64,
     rejected_commands: u64,
     consecutive_moves: u8,
+    /// 订阅尝试总次数（含 SUBACK 失败与本地发送失败）。
+    subscribe_attempts: u32,
+    /// 最近一次 SUBACK 错误码（成功后清空）。
+    last_suback_error: Option<ReasonCode>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1511,6 +1793,8 @@ enum JumpState {
         cmd_id: u64,
         failed: Endpoint,
         home: Endpoint,
+        /// 回退期限（单调毫秒）。回退链路也不可达时必须在此之前给出终态。
+        until: u64,
     },
 }
 
@@ -1529,6 +1813,24 @@ impl JumpState {
             Self::Draining { .. } => Some(JumpPhase::Draining),
             Self::Switching { .. } => Some(JumpPhase::Switching),
             Self::FallingBack { .. } => Some(JumpPhase::FallingBack),
+        }
+    }
+
+    /// 当前 Jump 关联的命令 id；没有 Jump 时为 0。
+    fn cmd_id(&self) -> u64 {
+        match self {
+            Self::Idle => 0,
+            Self::Draining { cmd_id, .. }
+            | Self::Switching { cmd_id, .. }
+            | Self::FallingBack { cmd_id, .. } => *cmd_id,
+        }
+    }
+
+    /// 当前阶段的截止时刻（`Draining` 排空上限 / `FallingBack` 回退上限）。
+    fn until(&self) -> Option<u64> {
+        match self {
+            Self::Draining { until, .. } | Self::FallingBack { until, .. } => Some(*until),
+            Self::Idle | Self::Switching { .. } => None,
         }
     }
 }
@@ -1605,9 +1907,25 @@ struct Outbox {
     entries: BTreeMap<u32, OutboxEntry>,
     queued: BTreeSet<u32>,
     pending_acks: BTreeMap<u16, u32>,
-    bytes: usize,
+    /// 非最终事件的条目/字节占用。
+    non_final_entries: usize,
+    non_final_bytes: usize,
+    /// 最终事件的条目/字节占用（独立预算，K7）。
+    final_entries: usize,
+    final_bytes: usize,
     limit_entries: usize,
     limit_bytes: usize,
+    final_limit_entries: usize,
+    final_limit_bytes: usize,
+}
+
+/// [`Outbox::enqueue`] 的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnqueueOutcome {
+    /// 事件是否真的进入了发件箱。
+    accepted: bool,
+    /// 为腾出预算而淘汰的事件数（这些事件会丢，计入 `dropped_events`）。
+    evicted: u64,
 }
 
 #[derive(Debug)]
@@ -1646,32 +1964,80 @@ impl Target {
 }
 
 impl Outbox {
-    fn new(limit_entries: usize, limit_bytes: usize) -> Self {
+    fn new(
+        limit_entries: usize,
+        limit_bytes: usize,
+        final_limit_entries: usize,
+        final_limit_bytes: usize,
+    ) -> Self {
         Self {
             entries: BTreeMap::new(),
             queued: BTreeSet::new(),
             pending_acks: BTreeMap::new(),
-            bytes: 0,
+            non_final_entries: 0,
+            non_final_bytes: 0,
+            final_entries: 0,
+            final_bytes: 0,
             limit_entries,
             limit_bytes,
+            final_limit_entries,
+            final_limit_bytes,
         }
     }
 
-    fn enqueue(&mut self, stdout: Stdout) -> bool {
+    /// 发件箱当前占用的载荷字节数（非最终 + 最终）。
+    fn bytes_total(&self) -> usize {
+        self.non_final_bytes.saturating_add(self.final_bytes)
+    }
+
+    /// 入队一个事件；必要时淘汰同预算内的旧事件。
+    ///
+    /// 预算分层（K7）：
+    /// - 中间事件（含 Hello/Offline）用 `limit_entries/limit_bytes`；
+    /// - 最终事件用 `final_limit_entries/final_limit_bytes`，两者互不挤占，
+    ///   因此中间事件的洪峰不会把最终事件挤掉；
+    /// - 只淘汰 `Queued` 条目：in-flight 条目正等 PUBACK，淘汰会破坏 QoS 记账；
+    /// - 淘汰/拒收都会体现在返回值里，由调用方计入 `dropped_events`。
+    fn enqueue(&mut self, stdout: Stdout) -> EnqueueOutcome {
         let seq = stdout.seq;
         if self.entries.contains_key(&seq) {
-            return false;
+            return EnqueueOutcome {
+                accepted: false,
+                evicted: 0,
+            };
         }
         let len = stdout.payload.len();
-        while self.entries.len() >= self.limit_entries
-            || self.bytes.saturating_add(len) > self.limit_bytes
-        {
-            if !self.evict_one() {
-                return false;
+        let mut evicted = 0u64;
+        if stdout.is_final() {
+            while self.final_entries >= self.final_limit_entries
+                || self.final_bytes.saturating_add(len) > self.final_limit_bytes
+            {
+                if !self.evict_queued_final() {
+                    return EnqueueOutcome {
+                        accepted: false,
+                        evicted,
+                    };
+                }
+                evicted = evicted.saturating_add(1);
             }
+            self.final_entries = self.final_entries.saturating_add(1);
+            self.final_bytes = self.final_bytes.saturating_add(len);
+        } else {
+            while self.non_final_entries >= self.limit_entries
+                || self.non_final_bytes.saturating_add(len) > self.limit_bytes
+            {
+                if !self.evict_queued_non_final() {
+                    return EnqueueOutcome {
+                        accepted: false,
+                        evicted,
+                    };
+                }
+                evicted = evicted.saturating_add(1);
+            }
+            self.non_final_entries = self.non_final_entries.saturating_add(1);
+            self.non_final_bytes = self.non_final_bytes.saturating_add(len);
         }
         let target = Target::for_phase(stdout.phase);
-        self.bytes = self.bytes.saturating_add(len);
         self.entries.insert(
             seq,
             OutboxEntry {
@@ -1681,10 +2047,18 @@ impl Outbox {
             },
         );
         self.queued.insert(seq);
-        true
+        EnqueueOutcome {
+            accepted: true,
+            evicted,
+        }
     }
 
-    fn evict_one(&mut self) -> bool {
+    /// 淘汰一条排队中的中间事件。
+    ///
+    /// 优先级：非最终、非 Hello/Offline 的最老事件优先；其次淘汰旧
+    /// Hello/Offline（下一次 Hello 或重连会重建它们）。**不会**淘汰最终事件
+    /// 或 in-flight 事件。
+    fn evict_queued_non_final(&mut self) -> bool {
         let victim = self
             .entries
             .iter()
@@ -1697,26 +2071,53 @@ impl Outbox {
             .or_else(|| {
                 self.entries
                     .iter()
-                    .find(|(_, entry)| matches!(entry.state, EntryState::Queued))
+                    .find(|(_, entry)| {
+                        matches!(entry.state, EntryState::Queued) && !entry.stdout.is_final()
+                    })
                     .map(|(seq, _)| *seq)
-            })
-            .or_else(|| self.entries.keys().next().copied());
+            });
         match victim {
             Some(seq) => self.remove(seq),
             None => false,
         }
     }
 
+    /// 淘汰最老的排队最终事件（仅当最终事件自己的预算已满，K7）。
+    fn evict_queued_final(&mut self) -> bool {
+        let victim = self
+            .entries
+            .iter()
+            .find(|(_, entry)| matches!(entry.state, EntryState::Queued) && entry.stdout.is_final())
+            .map(|(seq, _)| *seq);
+        match victim {
+            Some(seq) => self.remove(seq),
+            None => false,
+        }
+    }
+
+    /// 从发件箱移除一个条目并更新预算计数。
     fn remove(&mut self, seq: u32) -> bool {
         let Some(entry) = self.entries.remove(&seq) else {
             return false;
         };
-        self.bytes = self.bytes.saturating_sub(entry.stdout.payload.len());
+        self.account_removed(&entry);
         if let EntryState::InFlight(packet_id) = entry.state {
             self.pending_acks.remove(&packet_id);
         }
         self.queued.remove(&seq);
         true
+    }
+
+    /// 扣减已从 `entries` 取出的条目的预算计数（`remove` 与 `flush` 共用）。
+    fn account_removed(&mut self, entry: &OutboxEntry) {
+        let len = entry.stdout.payload.len();
+        if entry.stdout.is_final() {
+            self.final_entries = self.final_entries.saturating_sub(1);
+            self.final_bytes = self.final_bytes.saturating_sub(len);
+        } else {
+            self.non_final_entries = self.non_final_entries.saturating_sub(1);
+            self.non_final_bytes = self.non_final_bytes.saturating_sub(len);
+        }
     }
 
     fn on_puback(&mut self, packet_id: u16) {
@@ -1754,13 +2155,12 @@ impl Outbox {
                 self.queued.insert(seq);
                 break;
             }
-            let payload_len = entry.stdout.payload.len();
             let topic = entry.target.topic(topics).clone();
             let retain = entry.target == Target::State;
             let frame = match entry.stdout.encode() {
                 Ok(frame) => frame,
                 Err(_) => {
-                    self.bytes = self.bytes.saturating_sub(payload_len);
+                    self.account_removed(&entry);
                     dropped = dropped.saturating_add(1);
                     continue;
                 }
@@ -1777,7 +2177,7 @@ impl Outbox {
                     self.entries.insert(seq, entry);
                 }
                 Ok(None) => {
-                    self.bytes = self.bytes.saturating_sub(payload_len);
+                    self.account_removed(&entry);
                 }
                 Err(ClientError::NotConnected) => {
                     self.entries.insert(seq, entry);
@@ -1793,7 +2193,7 @@ impl Outbox {
                     let frame = match entry.stdout.encode() {
                         Ok(frame) => frame,
                         Err(_) => {
-                            self.bytes = self.bytes.saturating_sub(payload_len);
+                            self.account_removed(&entry);
                             dropped = dropped.saturating_add(1);
                             continue;
                         }
@@ -1805,7 +2205,7 @@ impl Outbox {
                     };
                     match client.publish(topic, frame, options, now) {
                         Ok(_) => {
-                            self.bytes = self.bytes.saturating_sub(payload_len);
+                            self.account_removed(&entry);
                         }
                         Err(ClientError::NotConnected) => {
                             self.entries.insert(seq, entry);
@@ -1813,17 +2213,121 @@ impl Outbox {
                             break;
                         }
                         Err(_) => {
-                            self.bytes = self.bytes.saturating_sub(payload_len);
+                            self.account_removed(&entry);
                             dropped = dropped.saturating_add(1);
                         }
                     }
                 }
                 Err(_) => {
-                    self.bytes = self.bytes.saturating_sub(payload_len);
+                    self.account_removed(&entry);
                     dropped = dropped.saturating_add(1);
                 }
             }
         }
         dropped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnqueueOutcome, EntryState, Outbox, Phase, Stdout};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// 构造一个非最终事件（Accepted/Started/Hello/Offline 之一）。
+    fn non_final(seq: u32, phase: Phase) -> Stdout {
+        let cmd_id = if matches!(phase, Phase::Hello | Phase::Offline) {
+            0
+        } else {
+            1
+        };
+        Stdout::new(7, cmd_id, seq, phase, 0, Vec::new()).unwrap()
+    }
+
+    /// 构造一个最终事件（Completed），载荷长度可调。
+    fn final_event(seq: u32, payload_len: usize) -> Stdout {
+        Stdout::new(
+            7,
+            seq as u64,
+            seq,
+            Phase::Completed,
+            0,
+            vec![0x5A; payload_len],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn outbox_keeps_final_events_under_non_final_pressure() {
+        let mut outbox = Outbox::new(1, 64, 2, 256);
+        // 中间事件预算 1 条：第二条淘汰第一条。
+        assert_eq!(
+            outbox.enqueue(non_final(1, Phase::Accepted)),
+            EnqueueOutcome {
+                accepted: true,
+                evicted: 0
+            }
+        );
+        let outcome = outbox.enqueue(non_final(2, Phase::Started));
+        assert!(outcome.accepted);
+        assert_eq!(outcome.evicted, 1);
+
+        // 最终事件走独立预算：不会被中间事件的旧事件挤掉。
+        let outcome = outbox.enqueue(final_event(3, 8));
+        assert!(outcome.accepted);
+        assert_eq!(outcome.evicted, 0);
+        assert!(outbox.entries.contains_key(&3));
+
+        // 再来中间事件只淘汰中间事件，最终事件仍在。
+        let outcome = outbox.enqueue(non_final(4, Phase::Accepted));
+        assert!(outcome.accepted);
+        assert_eq!(outcome.evicted, 1);
+        assert!(
+            outbox.entries.contains_key(&3),
+            "最终事件被中间事件的预算压力挤掉"
+        );
+        assert!(!outbox.entries.contains_key(&2));
+        assert_eq!(outbox.final_entries, 1);
+        assert_eq!(outbox.non_final_entries, 1);
+    }
+
+    #[test]
+    fn outbox_evicts_oldest_queued_final_only_when_final_budget_full() {
+        let mut outbox = Outbox::new(4, 1024, 1, 4096);
+        assert!(outbox.enqueue(final_event(10, 4)).accepted);
+        let outcome = outbox.enqueue(final_event(11, 4));
+        assert!(outcome.accepted);
+        assert_eq!(
+            outcome.evicted, 1,
+            "最终事件预算满时应淘汰最老的排队最终事件"
+        );
+        assert!(!outbox.entries.contains_key(&10));
+        assert!(outbox.entries.contains_key(&11));
+        assert_eq!(outbox.final_entries, 1);
+
+        // 超出字节预算同样淘汰最老的排队最终事件。
+        let mut outbox = Outbox::new(4, 1024, 4, 6);
+        assert!(outbox.enqueue(final_event(20, 4)).accepted);
+        let outcome = outbox.enqueue(final_event(21, 4));
+        assert!(outcome.accepted);
+        assert_eq!(outcome.evicted, 1);
+        assert_eq!(outbox.final_bytes, 4);
+    }
+
+    #[test]
+    fn outbox_does_not_evict_in_flight_final_for_new_final() {
+        let mut outbox = Outbox::new(2, 64, 1, 4096);
+        assert!(outbox.enqueue(final_event(30, 4)).accepted);
+        // 模拟该最终事件已发出、等 PUBACK：in-flight 不可淘汰。
+        let entry = outbox.entries.get_mut(&30).expect("最终事件应存在");
+        entry.state = EntryState::InFlight(99);
+        outbox.pending_acks.insert(99, 30);
+        outbox.queued.remove(&30);
+
+        let outcome = outbox.enqueue(final_event(31, 4));
+        assert!(!outcome.accepted, "in-flight 最终事件不应被淘汰");
+        assert_eq!(outcome.evicted, 0);
+        assert!(outbox.entries.contains_key(&30));
+        assert!(outbox.pending_acks.contains_key(&99));
     }
 }

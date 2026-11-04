@@ -64,6 +64,20 @@ impl VirtualGpio {
         }
     }
 
+    /// 用指定家族创建虚拟后端，并注入初始外部电平（P12：`--gpio-inputs`）。
+    ///
+    /// 每个引脚都经 [`VirtualGpio::set_external_level`] 的同一套校验
+    /// （存在/非保留），非法注入直接返回错误而不是留下半初始化状态。
+    /// 外部电平独立于配置：先注入、后 `gpio.config PIN in`，`gpio.read`
+    /// 就能读到注入值。
+    pub fn with_inputs(family: ChipFamily, inputs: &[(PinId, Level)]) -> Result<Self, GpioError> {
+        let mut port = Self::new(family);
+        for &(pin, level) in inputs {
+            port.set_external_level(pin, level)?;
+        }
+        Ok(port)
+    }
+
     /// 当前家族。
     pub fn family(&self) -> ChipFamily {
         self.family
@@ -102,6 +116,38 @@ impl VirtualGpio {
             .get_mut(usize::from(spec.slot))
             .ok_or_else(|| slot_out_of_range(spec))
     }
+}
+
+/// 解析宿主注入口的外部电平文本（P12：`IO4=1,PA5=0`）。
+///
+/// 语法：逗号分隔的 `引脚=电平`；电平接受 `0/1/low/high`（大小写不敏感），
+/// 引脚名同工具语法（`IO4` / `PA5`，大小写不敏感）。引脚必须属于
+/// `spec` 家族且非保留（与 [`VirtualGpio::set_external_level`] 一致）；
+/// 重复引脚以最后一次出现为准。空文本/空项返回空表。
+pub fn parse_external_levels(
+    spec: &FamilySpec,
+    text: &str,
+) -> Result<Vec<(PinId, Level)>, GpioError> {
+    let mut levels: Vec<(PinId, Level)> = Vec::new();
+    for entry in text.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let Some((pin_text, level_text)) = entry.split_once('=') else {
+            return Err(GpioError::invalid(format!(
+                "初始电平 `{entry}` 非法：应为 引脚=0|1（如 IO4=1）"
+            )));
+        };
+        let pin = spec.resolve(pin_text.trim())?;
+        ensure_operable(pin)?;
+        let level = crate::text::parse_level(level_text.trim())?;
+        match levels.iter_mut().find(|(id, _)| *id == pin.id) {
+            Some(existing) => existing.1 = level,
+            None => levels.push((pin.id, level)),
+        }
+    }
+    Ok(levels)
 }
 
 /// 槽位越界属于后端内部错误（协议错误码 Internal）。
@@ -177,6 +223,7 @@ mod tests {
     use crate::family::ChipFamily;
     use crate::pin::{PinId, Port};
     use crate::port::{BackendKind, GpioError, GpioPort};
+    use alloc::vec;
 
     fn configure(port: &mut VirtualGpio, pin: PinId, request: ConfigRequest) {
         let spec = port.spec().by_id(pin).unwrap();
@@ -387,6 +434,70 @@ mod tests {
                 assert!(usize::from(pin.slot) < port.pins.len());
             }
         }
+    }
+
+    #[test]
+    fn with_inputs_injects_both_levels() {
+        // P12：运行前注入外部电平，配置为输入后 read 返回注入值（1 与 0 两种）。
+        let mut port = VirtualGpio::with_inputs(
+            ChipFamily::Esp32,
+            &[(PinId::io(4), Level::High), (PinId::io(5), Level::Low)],
+        )
+        .unwrap();
+        assert_eq!(port.external_level(PinId::io(4)).unwrap(), Level::High);
+        assert_eq!(port.external_level(PinId::io(5)).unwrap(), Level::Low);
+        for (pin, expected) in [(PinId::io(4), Level::High), (PinId::io(5), Level::Low)] {
+            configure(
+                &mut port,
+                pin,
+                ConfigRequest {
+                    direction: Some(Direction::Input),
+                    ..ConfigRequest::new()
+                },
+            );
+            assert_eq!(port.read(pin).unwrap(), expected);
+            assert_eq!(port.describe(pin).unwrap().level, Some(expected));
+        }
+    }
+
+    #[test]
+    fn with_inputs_rejects_unknown_or_reserved_pins() {
+        // 不存在的引脚：ESP32 表没有 IO20。
+        assert!(matches!(
+            VirtualGpio::with_inputs(ChipFamily::Esp32, &[(PinId::io(20), Level::High)]),
+            Err(GpioError::UnknownPin(_))
+        ));
+        // 保留引脚（ESP32 IO6 是 SPI flash 保留脚）。
+        assert!(matches!(
+            VirtualGpio::with_inputs(ChipFamily::Esp32, &[(PinId::io(6), Level::High)]),
+            Err(GpioError::ReservedPin(_))
+        ));
+    }
+
+    #[test]
+    fn parse_external_levels_parses_text_form() {
+        let spec = ChipFamily::Stm32F4.spec();
+        let levels = crate::virtual_gpio::parse_external_levels(spec, "PA5=1, PC4=LOW").unwrap();
+        assert_eq!(
+            levels,
+            vec![
+                (PinId::port(Port::A, 5), Level::High),
+                (PinId::port(Port::C, 4), Level::Low),
+            ]
+        );
+        // 空文本合法（等价于不注入）。
+        assert!(
+            crate::virtual_gpio::parse_external_levels(spec, "  ")
+                .unwrap()
+                .is_empty()
+        );
+        // 语法错误/电平错误/保留引脚都拒绝。
+        assert!(crate::virtual_gpio::parse_external_levels(spec, "PA5").is_err());
+        assert!(crate::virtual_gpio::parse_external_levels(spec, "PA5=2").is_err());
+        assert!(
+            crate::virtual_gpio::parse_external_levels(spec, "PA13=1").is_err(),
+            "SWD 保留引脚应拒绝"
+        );
     }
 
     #[test]

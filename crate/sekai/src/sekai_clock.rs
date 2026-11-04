@@ -23,7 +23,9 @@ pub trait Clock {
 
     /// 用一次可信的 Unix 毫秒校准墙上时间。
     ///
-    /// 实现可以忽略重复校准；运行时负责限制校准频率。
+    /// 实现可以忽略重复校准；运行时负责限制校准频率。参考实现的
+    /// `Runtime::handle_builtin("sekai.set_time")` 以 1 秒为最小间隔：
+    /// 过频的校准请求返回 `InvalidArgument` 而不是直接改时钟。
     fn calibrate_unix_ms(&self, unix_ms: u64);
 }
 

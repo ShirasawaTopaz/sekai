@@ -85,7 +85,7 @@ fn payload_examples_match_docs() {
 
 #[test]
 fn lwt_offline_matches_docs() {
-    let offline = Stdout::new(1, 0, 0, Phase::Offline, 0, Vec::new()).unwrap();
+    let offline = Stdout::lwt_offline(1, 0).unwrap();
     assert_eq!(
         hex(&offline.encode().unwrap()),
         "01 07 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 \

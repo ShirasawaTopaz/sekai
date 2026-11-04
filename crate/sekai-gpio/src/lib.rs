@@ -4,7 +4,8 @@
 //! - 家族无关的引脚标识/解析（[`pin`]）与配置状态机（[`config`]）；
 //! - ESP32 classic / STM32F1 / STM32F4 引脚表与能力/保留标志（[`family`]）；
 //! - [`GpioPort`] 后端抽象（[`port`]）；
-//! - 宿主虚拟后端（[`virtual_gpio`]，默认构建即可用）；
+//! - 宿主虚拟后端（[`virtual_gpio`]，默认构建即可用；可用
+//!   [`VirtualGpio::with_inputs`] / [`parse_external_levels`] 注入初始外部电平）；
 //! - AI 可直接调用的 `gpio.info/config/read/write` 用户工具（[`tools`]）；
 //! - 可选的真实硬件后端：ESP32（`esp32` 特性）、STM32F1/F4（`stm32f1`/`stm32f4` 特性）。
 //!
@@ -42,4 +43,4 @@ pub use family::{ChipFamily, FamilyKind, FamilySpec, FamilySummary, PinCaps, Pin
 pub use pin::{Label, PinId, PinParseError, Port};
 pub use port::{BackendKind, GpioError, GpioPort, PinDescription};
 pub use tools::{GPIO_TOOL_NAMES, register_tools};
-pub use virtual_gpio::VirtualGpio;
+pub use virtual_gpio::{VirtualGpio, parse_external_levels};

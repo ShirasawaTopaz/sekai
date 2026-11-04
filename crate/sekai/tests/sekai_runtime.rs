@@ -8,7 +8,7 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use sekai::mqtt::packet::{Ack, Connack, Disconnect, Packet, Publish, Suback};
+use sekai::mqtt::packet::{Ack, Auth, Connack, Connect, Disconnect, Packet, Publish, Suback};
 use sekai::mqtt::property::Properties;
 use sekai::mqtt::qos::QoS;
 use sekai::mqtt::reason::ReasonCode;
@@ -151,6 +151,10 @@ impl Harness {
     }
 
     fn build(dedup_window: usize) -> Self {
+        Self::build_with(dedup_window, |_| {})
+    }
+
+    fn build_with(dedup_window: usize, configure: impl FnOnce(&mut RuntimeConfig)) -> Self {
         let clock = TestClock::new();
         let endpoint = Endpoint {
             host: String::from("127.0.0.1"),
@@ -199,6 +203,7 @@ impl Harness {
         let mut config = RuntimeConfig::new("demo", 1);
         config.mqtt.maximum_packet_size = Some(16 * 1024);
         config.dedup_window = dedup_window;
+        configure(&mut config);
         let runtime = Runtime::new(config, clock.clone(), workers, tasks, tools).unwrap();
 
         Self {
@@ -335,7 +340,8 @@ impl Harness {
         self.drain_stdouts()
     }
 
-    fn send(&mut self, stdin: Stdin) {
+    /// 只把命令 PUBLISH 喂给运行时（不 poll，因此不会 flush 发件箱）。
+    fn feed_stdin(&mut self, stdin: Stdin) {
         let payload = stdin.encode().unwrap();
         let packet_id = self.next_packet_id;
         self.next_packet_id = if packet_id == u16::MAX {
@@ -354,6 +360,10 @@ impl Harness {
                 payload,
             }))
             .unwrap();
+    }
+
+    fn send(&mut self, stdin: Stdin) {
+        self.feed_stdin(stdin);
         self.runtime.poll().unwrap();
     }
 
@@ -400,6 +410,56 @@ impl Harness {
         .unwrap();
         self.next_cmd_id += 1;
         stdin
+    }
+
+    /// 建立链路并发布 Hello，但不回 SUBACK：把订阅结果交给调用方（K5 用）。
+    fn handshake_raw(&mut self) -> (u16, Stdout) {
+        self.runtime.link_up(self.endpoint.clone()).unwrap();
+        self.drain_packets();
+        self.runtime.feed(connack(false)).unwrap();
+        self.runtime.poll().unwrap();
+        let packets = self.drain_packets();
+        let subscribe_id = packets
+            .iter()
+            .find_map(|packet| match packet {
+                Packet::Subscribe(subscribe) => Some(subscribe.packet_id),
+                _ => None,
+            })
+            .expect("missing SUBSCRIBE");
+        let hello_publish = packets
+            .iter()
+            .find_map(|packet| match packet {
+                Packet::Publish(publish)
+                    if publish.topic.as_ref().map(TopicName::as_str)
+                        == Some(self.state_topic.as_str()) =>
+                {
+                    Some(publish.clone())
+                }
+                _ => None,
+            })
+            .expect("missing Hello");
+        let hello_stdout = Stdout::decode(&hello_publish.payload).unwrap();
+        if let Some(packet_id) = hello_publish.packet_id {
+            self.ack(packet_id);
+        }
+        (subscribe_id, hello_stdout)
+    }
+
+    /// 取出（并消费）发件箱里的 CONNECT 报文；找不到时 panic。
+    fn take_connect(&mut self) -> Connect {
+        self.drain_packets()
+            .into_iter()
+            .find_map(|packet| match packet {
+                Packet::Connect(connect) => Some(connect),
+                _ => None,
+            })
+            .expect("missing CONNECT")
+    }
+
+    /// 把当前链路重置到「已断开」状态（模拟对端关闭）。
+    fn drop_link(&mut self) {
+        self.runtime.link_lost();
+        self.drain_packets();
     }
 }
 
@@ -1020,4 +1080,409 @@ fn jump_connect_timeout_falls_back() {
         }
     }
     assert_eq!(harness.runtime.status().jump, Some(JumpPhase::FallingBack));
+}
+
+// ---------------------------------------------------------------------------
+// K2–K8：增强认证 / Jump 回退 / 会话重放 / 订阅退避 / LWT / 丢弃计数 / 限频
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auth_challenge_is_answered_with_configured_data() {
+    // 未配置增强认证时，AUTH 事件被忽略（不产生任何出站 AUTH）。
+    let mut plain = Harness::connected();
+    plain
+        .runtime
+        .feed(Packet::Auth(Auth {
+            reason_code: ReasonCode::ContinueAuthentication,
+            properties: Properties::new(),
+        }))
+        .unwrap();
+    assert!(
+        !plain
+            .drain_packets()
+            .iter()
+            .any(|packet| matches!(packet, Packet::Auth(_))),
+        "未配置 authentication_method 时不应发送 AUTH"
+    );
+
+    // 配置了认证方式：对 challenge 用配置的 method/data 应答，避免挂死。
+    let mut harness = Harness::build_with(32, |config| {
+        config.mqtt.authentication_method = Some(String::from("token"));
+        config.mqtt.authentication_data = Some(vec![7, 8]);
+    });
+    harness.handshake();
+    harness
+        .runtime
+        .feed(Packet::Auth(Auth {
+            reason_code: ReasonCode::ContinueAuthentication,
+            properties: Properties::new(),
+        }))
+        .unwrap();
+    let response = harness
+        .drain_packets()
+        .into_iter()
+        .find_map(|packet| match packet {
+            Packet::Auth(auth) => Some(auth),
+            _ => None,
+        })
+        .expect("AUTH challenge 必须有应答");
+    assert_eq!(response.reason_code, ReasonCode::ContinueAuthentication);
+    assert_eq!(
+        response.properties.authentication_method.as_deref(),
+        Some("token")
+    );
+    assert_eq!(response.properties.authentication_data, Some(vec![7, 8]));
+}
+
+#[test]
+fn commands_during_jump_fail_busy_instead_of_silent_drop() {
+    let mut harness = Harness::connected();
+    let jump = harness.jump_stdin("peer");
+    harness.send(jump);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Offline]
+    );
+    assert_eq!(harness.runtime.status().jump, Some(JumpPhase::Draining));
+
+    // Jump 活跃期的新命令必须立即回 Failed(Busy)，而不是被静默丢弃（K3）。
+    let task = harness.task_stdin("echo", b"x", 0, 500);
+    let task_id = task.id;
+    harness.send(task);
+    let failed = harness
+        .pump()
+        .into_iter()
+        .find(|stdout| stdout.phase == Phase::Failed)
+        .expect("Jump 期间的新命令应回 Failed");
+    assert_eq!(failed.cmd_id, task_id);
+    assert_eq!(
+        ErrorPayload::decode(&failed.payload).unwrap().code,
+        ErrorCode::Busy
+    );
+    assert!(harness.runtime.status().rejected_commands >= 1);
+}
+
+#[test]
+fn jump_fallback_timeout_emits_failed_and_recovers() {
+    let mut harness = Harness::connected();
+    let jump = harness.jump_stdin("peer");
+    let jump_id = jump.id;
+    harness.send(jump);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Offline]
+    );
+    harness.runtime.poll().unwrap();
+    harness.drain_packets();
+    match harness.runtime.take_link_action().expect("missing switch") {
+        LinkAction::Switch { endpoint, .. } => assert_eq!(endpoint.port, 1884),
+    }
+
+    // 目标端点 TCP 连接失败 → 回退原端点。
+    harness.runtime.link_closed();
+    harness.runtime.link_failed(harness.peer.clone());
+    match harness
+        .runtime
+        .take_link_action()
+        .expect("missing fallback")
+    {
+        LinkAction::Switch { endpoint, reason } => {
+            assert_eq!(endpoint.port, 1883);
+            assert_eq!(reason, SwitchReason::Fallback);
+        }
+    }
+    assert_eq!(harness.runtime.status().jump, Some(JumpPhase::FallingBack));
+
+    // 回退链路也一直连不上：超过 jump_fallback_ms 必须结束 Jump 并补发失败终态。
+    harness.clock.advance(5_000);
+    harness.runtime.poll().unwrap();
+    assert!(
+        harness.runtime.status().jump.is_none(),
+        "回退超时后 Jump 状态不能卡死"
+    );
+
+    // 失败帧在发件箱里排队；重连原链路后与 Hello 一起送达。
+    harness.runtime.link_up(harness.endpoint.clone()).unwrap();
+    harness.drain_packets();
+    harness.runtime.feed(connack(false)).unwrap();
+    harness.runtime.poll().unwrap();
+    let mut failed = None;
+    let mut hello_seen = false;
+    for packet in harness.drain_packets() {
+        if let Packet::Publish(publish) = packet {
+            let stdout = Stdout::decode(&publish.payload).unwrap();
+            if let Some(packet_id) = publish.packet_id {
+                harness.ack(packet_id);
+            }
+            match stdout.phase {
+                Phase::Hello => hello_seen = true,
+                Phase::Failed => failed = Some(stdout),
+                _ => {}
+            }
+        }
+    }
+    assert!(hello_seen, "missing Hello after fallback");
+    let failed = failed.expect("回退超时后必须补发 Failed(JumpUnreachable)");
+    assert_eq!(failed.cmd_id, jump_id);
+    assert_eq!(
+        ErrorPayload::decode(&failed.payload).unwrap().code,
+        ErrorCode::JumpUnreachable
+    );
+
+    // Jump 已结束：后续命令恢复受理（证明不再卡在 Jump 活跃态）。
+    let stdin = harness.task_stdin("echo", b"ok", 0, 500);
+    harness.send(stdin);
+    assert!(
+        harness
+            .pump()
+            .iter()
+            .any(|stdout| stdout.phase == Phase::Completed)
+    );
+}
+
+#[test]
+fn jump_fallback_link_failure_terminates_immediately() {
+    let mut harness = Harness::connected();
+    let jump = harness.jump_stdin("peer");
+    let jump_id = jump.id;
+    harness.send(jump);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Offline]
+    );
+    harness.runtime.poll().unwrap();
+    harness.drain_packets();
+    match harness.runtime.take_link_action().expect("missing switch") {
+        LinkAction::Switch { endpoint, .. } => assert_eq!(endpoint.port, 1884),
+    }
+
+    harness.runtime.link_closed();
+    harness.runtime.link_failed(harness.peer.clone());
+    match harness
+        .runtime
+        .take_link_action()
+        .expect("missing fallback")
+    {
+        LinkAction::Switch { endpoint, .. } => assert_eq!(endpoint.port, 1883),
+    }
+    // 回退端点 TCP 连接也失败：立即终态，不必等到 deadline。
+    harness.runtime.link_failed(harness.endpoint.clone());
+    assert!(
+        harness.runtime.status().jump.is_none(),
+        "link_failed 必须给终态"
+    );
+
+    harness.runtime.link_up(harness.endpoint.clone()).unwrap();
+    harness.drain_packets();
+    harness.runtime.feed(connack(false)).unwrap();
+    harness.runtime.poll().unwrap();
+    let failed = harness
+        .drain_stdouts()
+        .into_iter()
+        .find(|stdout| stdout.phase == Phase::Failed)
+        .expect("回退链路失败也要补发 Failed");
+    assert_eq!(failed.cmd_id, jump_id);
+    assert_eq!(
+        ErrorPayload::decode(&failed.payload).unwrap().code,
+        ErrorCode::JumpUnreachable
+    );
+}
+
+#[test]
+fn clean_start_and_session_expiry_defaults_are_safe() {
+    // K4：默认 Clean Start + session expiry 0，broker 不会跨连接重放 in。
+    let config = RuntimeConfig::new("demo", 1);
+    assert!(config.mqtt.clean_start, "默认必须 Clean Start");
+    assert_eq!(config.mqtt.session_expiry_interval, Some(0));
+
+    // 可重放组合（clean_start=false + expiry>0）在配置校验时被拒绝。
+    let mut replay_prone = RuntimeConfig::new("demo", 1);
+    replay_prone.mqtt.clean_start = false;
+    replay_prone.mqtt.session_expiry_interval = Some(300);
+    let error = Runtime::new(
+        replay_prone,
+        TestClock::new(),
+        DeviceList::new(),
+        TaskRegistry::new(),
+        ToolRegistry::new(),
+    )
+    .err()
+    .expect("可重放组合必须被拒绝");
+    assert!(format!("{error}").contains("重放"), "{error}");
+}
+
+#[test]
+fn every_connect_uses_clean_start() {
+    let mut harness = Harness::new();
+    harness.runtime.link_up(harness.endpoint.clone()).unwrap();
+    let first = harness.take_connect();
+    assert!(first.clean_start);
+    assert_eq!(first.properties.session_expiry_interval, Some(0));
+
+    harness.runtime.link_closed();
+    harness.runtime.link_up(harness.endpoint.clone()).unwrap();
+    let second = harness.take_connect();
+    assert!(second.clean_start, "重连也必须 Clean Start");
+    assert_eq!(second.properties.session_expiry_interval, Some(0));
+}
+
+#[test]
+fn suback_error_is_visible_and_retried_with_backoff() {
+    let mut harness = Harness::new();
+    let (subscribe_id, _hello) = harness.handshake_raw();
+    harness
+        .runtime
+        .feed(Packet::Suback(Suback {
+            packet_id: subscribe_id,
+            properties: Properties::new(),
+            reason_codes: vec![ReasonCode::NotAuthorized],
+        }))
+        .unwrap();
+    let status = harness.runtime.status();
+    assert!(!status.subscribed);
+    assert_eq!(status.subscribe_error, Some(ReasonCode::NotAuthorized));
+    assert_eq!(status.subscribe_attempts, 1);
+
+    // 退避期内不重试；到期后重发 SUBSCRIBE。
+    harness.runtime.poll().unwrap();
+    assert!(
+        !harness
+            .drain_packets()
+            .iter()
+            .any(|packet| matches!(packet, Packet::Subscribe(_)))
+    );
+    harness.clock.advance(1_000);
+    harness.runtime.poll().unwrap();
+    let retry_id = harness
+        .drain_packets()
+        .into_iter()
+        .find_map(|packet| match packet {
+            Packet::Subscribe(subscribe) => Some(subscribe.packet_id),
+            _ => None,
+        })
+        .expect("订阅失败后应按退避重发 SUBSCRIBE");
+
+    // 重试成功：错误码清空、subscribed 恢复。
+    harness
+        .runtime
+        .feed(Packet::Suback(Suback {
+            packet_id: retry_id,
+            properties: Properties::new(),
+            reason_codes: vec![ReasonCode::GrantedQos1],
+        }))
+        .unwrap();
+    let status = harness.runtime.status();
+    assert!(status.subscribed);
+    assert_eq!(status.subscribe_error, None);
+}
+
+#[test]
+fn will_payload_timestamp_is_rebuilt_per_connect() {
+    let mut harness = Harness::connected();
+    let target = 1_700_000_123_000u64;
+    let set = harness.tool_stdin("sekai.set_time", &target.to_be_bytes(), 0, 500);
+    harness.send(set);
+    assert!(
+        harness
+            .pump()
+            .iter()
+            .any(|stdout| stdout.phase == Phase::Completed)
+    );
+    assert_eq!(harness.clock.unix_ms(), Some(target));
+
+    harness.drop_link();
+    harness.runtime.link_up(harness.endpoint.clone()).unwrap();
+    let connect = harness.take_connect();
+    let will = connect.will.expect("missing LWT");
+    let offline = Stdout::decode(&will.payload).unwrap();
+    assert_eq!(offline.phase, Phase::Offline);
+    assert_eq!(offline.seq, 0, "LWT Offline 的 seq 必须为 0");
+    assert_eq!(
+        offline.timestamp, target,
+        "LWT 时间戳必须取本次 CONNECT 时刻"
+    );
+}
+
+#[test]
+fn set_time_is_rate_limited() {
+    let mut harness = Harness::connected();
+    let first = harness.tool_stdin(
+        "sekai.set_time",
+        &1_700_000_111_000u64.to_be_bytes(),
+        0,
+        500,
+    );
+    harness.send(first);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Completed]
+    );
+
+    // 1 秒内的第二次校准被拒绝，且不改时钟。
+    let second = harness.tool_stdin(
+        "sekai.set_time",
+        &1_700_000_222_000u64.to_be_bytes(),
+        0,
+        500,
+    );
+    harness.send(second);
+    let events = harness.pump();
+    assert_eq!(phases(&events), vec![Phase::Accepted, Phase::Failed]);
+    let error = ErrorPayload::decode(&events[1].payload).unwrap();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(harness.clock.unix_ms(), Some(1_700_000_111_000));
+
+    // 间隔满 1 秒后允许再次校准。
+    harness.clock.advance(1_000);
+    let third = harness.tool_stdin(
+        "sekai.set_time",
+        &1_700_000_222_000u64.to_be_bytes(),
+        0,
+        500,
+    );
+    harness.send(third);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Completed]
+    );
+    assert_eq!(harness.clock.unix_ms(), Some(1_700_000_222_000));
+}
+
+#[test]
+fn outbox_final_budget_pressure_counts_dropped_events() {
+    let mut harness = Harness::build_with(32, |config| {
+        config.max_outbox_final = 1;
+        config.final_outbox_bytes = 4 * 1024;
+    });
+    harness.handshake();
+    let jump = harness.jump_stdin("peer");
+    harness.send(jump);
+    assert_eq!(
+        phases(&harness.pump()),
+        vec![Phase::Accepted, Phase::Offline]
+    );
+
+    // Jump（Draining）期间连续 3 条命令各产生一个最终事件；最终事件预算
+    // 只有 1 条，因此后两条会把更早的排队最终事件淘汰并计数（K7）。
+    let mut last_id = 0;
+    for _ in 0..3 {
+        let stdin = harness.task_stdin("echo", b"x", 0, 500);
+        last_id = stdin.id;
+        harness.feed_stdin(stdin);
+    }
+    let status = harness.runtime.status();
+    assert_eq!(status.outbox, 1, "最终事件预算应只保留最新一条");
+    assert_eq!(status.dropped_events, 2, "被淘汰的最终事件必须计数");
+
+    // 最新一条最终事件仍会送达（预算淘汰的是更早的排队最终事件）。
+    let failed = harness
+        .pump()
+        .into_iter()
+        .find(|stdout| stdout.phase == Phase::Failed)
+        .expect("最新最终事件必须送达");
+    assert_eq!(failed.cmd_id, last_id);
+    assert_eq!(
+        ErrorPayload::decode(&failed.payload).unwrap().code,
+        ErrorCode::Busy
+    );
 }

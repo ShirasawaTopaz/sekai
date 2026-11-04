@@ -7,7 +7,9 @@
  *   worker_online 通知与 link/workers/tool_call/task/policy.get/policy.set/
  *   status/shutdown 响应），验证 router 侧桥接（JsonlProcess 分帧、请求-
  *   响应、通知、丢弃告警、超时、本地中止、dispose、崩溃重启、autoLink
- *   重放、四个 sekai_* 工具、错误信封、schema 卫生）；
+ *   重放、四个 sekai_* 工具、错误信封、schema 卫生）；另覆盖 link 响应的
+ *   `addr` 兼容读取与「serve 不补发 link_state 时 status 轮询兜底」的
+ *   幂等行为（B11）；
  * - 用一个假 worker 脚本（打印阶段化 stderr 后退出/长驻）验证 worker 侧
  *   的生命周期与状态工具（重启退避、环形 stderr、spawn 失败告警）；
  * - 用一个假 prompt worker（stdout 发 prompt JSONL 请求行、stdin 收到的行
@@ -57,8 +59,12 @@ rl.on('line', (line) => {
   const params = msg.params ?? {}
   if (msg.method === 'link') {
     linked = true
-    linkDesc = (params.mode ?? 'tcp') + ' ' + (params.listen_addr ?? 'dynamic')
-    write({ id, ok: true, result: { mode: params.mode ?? 'tcp', listen_addr: params.listen_addr ?? null, linked: true } })
+    const requested = params.listen_addr ?? 'dynamic'
+    // serve 返回的实际地址字段是 addr。用 :0 请求模拟系统分配的动态端口，
+    // 验证插件优先读 addr 而不是请求参数 listen_addr。
+    const actual = requested === '127.0.0.1:0' ? '127.0.0.1:41234' : requested
+    linkDesc = (params.mode ?? 'tcp') + ' ' + actual
+    write({ id, ok: true, result: { mode: params.mode ?? 'tcp', addr: actual, listen_addr: requested, linked: true } })
     setTimeout(() => write({ event: 'link_state', desc: linkDesc, ready: true }), 10)
     setTimeout(() => write({ event: 'worker_online', worker_id: 'pc-worker', worker: { worker_id: 'pc-worker', online: true } }), 20)
     return
@@ -67,6 +73,13 @@ rl.on('line', (line) => {
     linked = false
     write({ id, ok: true, result: { linked: false } })
     write({ event: 'link_state', desc: '', ready: false })
+    return
+  }
+  if (msg.method === 'test_drop') {
+    // 模拟 TCP 对端断开但 serve 不发 link_state：插件用 status 探测兜底（B11）。
+    linked = false
+    linkDesc = ''
+    write({ id, ok: true, result: { dropped: true } })
     return
   }
   if (msg.method === 'workers') {
@@ -489,6 +502,11 @@ function defineRouterPluginTests(servePath) {
         ['sekai_list_workers', 'sekai_status', 'sekai_worker_task', 'sekai_worker_tool'],
       )
       for (const def of host.tools.values()) assertToolDefinition(def)
+      // B11：任务工具必须提示 pc.ask/pc.job 的 ddl_ms 下限（Router 默认 1s 会超时）。
+      const taskTool = host.tools.get('sekai_worker_task')
+      assert.match(taskTool.description, /60000/, 'task description must hint ddl_ms >= 60000')
+      assert.match(taskTool.parameters.properties.ddl_ms.description, /60000/, 'ddl_ms field must hint 60000')
+      assert.match(host.tools.get('sekai_worker_tool').parameters.properties.ddl_ms.description, /60000/)
 
       // autoLink：ready → link → link_state → worker_online
       await waitFor(() => plugin.state.ready === true, { label: 'autoLink ready' })
@@ -579,6 +597,46 @@ function defineRouterPluginTests(servePath) {
     assert.equal(plugin.stopped, true)
     assert.equal(plugin.restartTimer, null)
     assert.equal(host.tools.size, 0, 'tools unregistered on teardown')
+  })
+
+  test('router 插件：link 读 addr；链路断开时 status 探测补发 link_state 且幂等', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiRouterPlugin(host.ctx, {
+      routerBin: 'unused-sekai-router',
+      link: 'tcp',
+      // 请求 :0（动态端口），假 serve 返回实际地址 127.0.0.1:41234。
+      listenAddr: '127.0.0.1:0',
+      requestTimeoutMs: 4000,
+    })
+    plugin.serveSpawnTarget = (bin, args) => ({ command: process.execPath, args: [servePath, ...args] })
+    host.start()
+    try {
+      await waitFor(() => plugin.state.ready === true, { label: 'autoLink ready (addr)' })
+      // B11：serve 的 link 响应字段是 addr；只读 listen_addr 会得到请求值 :0。
+      assert.equal(plugin.state.linkDesc, 'tcp 127.0.0.1:41234')
+      await waitFor(() => plugin.state.workerCount === 1, { label: 'worker counted' })
+
+      // 模拟 TCP 对端断开但 serve 不发 link_state：watcher 用 status 兜底修正。
+      await plugin.proc.request('test_drop', {})
+      await waitFor(() => plugin.state.ready === false, {
+        timeoutMs: 15000,
+        label: 'link down detected by status watch',
+      })
+      assert.equal(plugin.state.linkDesc, '')
+      assert.equal(plugin.state.workerCount, 0)
+      const downLogs = () => host.entries.filter(
+        ([level, message]) => level === 'warn' && message.includes('status 探测补发'),
+      ).length
+      assert.equal(downLogs(), 1, 'link 断开应用 status 探测补发告警')
+
+      // 幂等：后续轮询仍看到断开，不能重复告警/重复事件。
+      await new Promise((resolve) => setTimeout(resolve, 7000))
+      assert.equal(downLogs(), 1, '重复的断开状态不应重复告警')
+      assert.equal(plugin.state.ready, false)
+    } finally {
+      host.teardown()
+    }
+    assert.equal(plugin.watchTimer, null, 'teardown 必须清掉兜底轮询定时器')
   })
 
   test('router 插件：二进制缺失 → spawn_error 信封（含可操作提示）', async () => {
