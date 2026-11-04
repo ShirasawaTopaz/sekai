@@ -16,16 +16,47 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 编译检查（含测试目标）
+        run: cargo check --workspace --all-targets
 
       - name: Test（宿主全量测试，无需硬件/网络/broker）
         run: cargo test --workspace
 
       # 风格告警不阻断（当前 sekai-router 有 5 条既有 clippy 告警）；
-      # 编译错误仍会失败。
+      # 编译错误仍会失败。本地用 scripts/gate.sh 跑同一套。
       - name: Clippy（告警不阻断）
         run: cargo clippy --workspace --all-targets
+
+      # 真实 API 测试默认 ignored；只有配置了仓库 secret 时才跑。
+      - name: 真实 API（有 DEEPSEEK_API_KEY 时）
+        if: ${{ env.DEEPSEEK_API_KEY != '' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          SEKAI_REAL_API: "1"
+        run: cargo test -p sekai-router --test real_api -- --ignored
+
+  rust-windows:
+    name: Rust (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 覆盖 Windows 专属路径：Job 对象/taskkill 杀进程树、cmd /C 编码、
+      # crossterm TUI 编译。
+      - name: Test（Windows 全量测试）
+        run: cargo test --workspace
 
   plugin:
     name: DSH plugin smoke（无 Rust 依赖）
@@ -43,5 +74,5 @@ jobs:
       - name: 语法检查
         run: node --check lib/index.js && node --check lib/shared.js && node --check lib/router.js && node --check lib/worker.js && node --check scripts/smoke.mjs
 
-      - name: 冒烟（假 serve/假 worker 驱动，14 个断言组）
+      - name: 冒烟（假 serve/假 worker 驱动）
         run: node scripts/smoke.mjs
