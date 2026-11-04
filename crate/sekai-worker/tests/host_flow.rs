@@ -11,6 +11,9 @@
 
 mod support;
 
+use std::thread;
+use std::time::{Duration, Instant};
+
 use sekai::sekai_stdin::{Kind, Stdin, TaskBody, ToolBody};
 use sekai::sekai_stdout::{ErrorPayload, Hello, Phase, Stdout};
 use sekai::sekai_wire::ErrorCode;
@@ -29,12 +32,16 @@ fn stdin_bytes(id: u64, kind: Kind, payload: Vec<u8>, ddl_ms: u32) -> Vec<u8> {
 }
 
 fn task_stdin(id: u64, name: &str, args: &[u8]) -> Vec<u8> {
+    task_stdin_with_ddl(id, name, args, 500)
+}
+
+fn task_stdin_with_ddl(id: u64, name: &str, args: &[u8], ddl_ms: u32) -> Vec<u8> {
     let body = TaskBody::new(name, args.to_vec()).expect("任务载荷构造失败");
     stdin_bytes(
         id,
         Kind::Task,
         body.encode().expect("任务载荷编码失败"),
-        500,
+        ddl_ms,
     )
 }
 
@@ -54,6 +61,34 @@ fn decode_stdout(frame: &[u8]) -> Stdout {
 
 fn phases(frames: &[Vec<u8>]) -> Vec<Phase> {
     frames.iter().map(|f| decode_stdout(f).phase).collect()
+}
+
+/// 等待指定 `cmd_id` 的下一帧：期间 pump Worker、推进手动时钟并真实等待
+/// （`pc.exec` 等 Task 的完成依赖真实子进程退出，而 `ManualClock` 只能手动
+/// 推进「下次 poll 时刻」）。
+fn wait_for_cmd_frame(lp: &mut Loop, cmd_id: u64, max_ms: u64) -> Stdout {
+    let deadline = Instant::now() + Duration::from_millis(max_ms);
+    loop {
+        lp.pump_until_idle(2);
+        loop {
+            match lp.router.read_frame() {
+                Ok(Some(frame)) => {
+                    let out = decode_stdout(&frame);
+                    if out.cmd_id == cmd_id {
+                        return out;
+                    }
+                }
+                Ok(None) => panic!("Router 端链路被关闭"),
+                Err(_) => break, // 当前没有可读帧
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "等待命令 {cmd_id} 的帧超时（{max_ms}ms）"
+        );
+        thread::sleep(Duration::from_millis(10));
+        lp.clock.advance(10);
+    }
 }
 
 // ---- Hello → Task → Accepted/Started/Completed ----
@@ -80,8 +115,19 @@ fn hello_then_task_full_flow() {
     assert!(hello.tasks.iter().any(|name| name == "sleep"));
     assert!(hello.tasks.iter().any(|name| name == "pc.job"));
     assert!(hello.tasks.iter().any(|name| name == "pc.ask"));
+    // pc.exec 是 Task（B4.2/P3）：Hello 必须把它放在 tasks 列表里，
+    // Router 会按"名字→线类型"自动路由同名调用。
+    assert!(
+        hello.tasks.iter().any(|name| name == "pc.exec"),
+        "{:?}",
+        hello.tasks
+    );
+    assert!(
+        !hello.tools.iter().any(|tool| tool == "pc.exec"),
+        "pc.exec 不应再出现在 tools 列表"
+    );
     // 能力声明：PC agent 工具 + 内置工具；默认（无 --gpio）不含 gpio.*。
-    for name in ["pc.exec", "pc.read", "pc.write", "pc.ls", "pc.info"] {
+    for name in ["pc.read", "pc.write", "pc.ls", "pc.info"] {
         assert!(
             hello.tools.iter().any(|tool| tool == name),
             "Hello 缺少工具 {name}"
@@ -135,8 +181,8 @@ fn tool_call_flow_with_virtual_gpio() {
         );
     }
     assert!(
-        hello.tools.iter().any(|tool| tool == "pc.exec"),
-        "agent 工具仍在"
+        hello.tasks.iter().any(|name| name == "pc.exec"),
+        "pc.exec 应在任务列表（Task 化后）"
     );
 
     // gpio.config：把 IO4 配置为输入。
@@ -195,20 +241,23 @@ fn tool_call_flow_with_virtual_gpio() {
     lp.assert_router_idle();
 }
 
-// ---- PC agent 工具经直连链路（pc.exec / pc.write → pc.read） ----
+// ---- PC agent 能力经直连链路（pc.exec 任务 / pc.write → pc.read 工具） ----
 
 #[test]
 fn pc_agent_tools_flow_over_link() {
     let mut lp = Loop::new("pc-agent", 21);
     let _hello = lp.router_read();
 
-    // pc.exec：跨平台 echo，exit=0 + 输出。
+    // pc.exec 是 Task：Accepted → Started → Completed 三段。
     lp.router
-        .write_frame(&tool_stdin(31, "pc.exec", b"echo hello-pc"))
+        .write_frame(&task_stdin(31, "pc.exec", b"echo hello-pc"))
         .expect("写链路失败");
-    let frames = lp.router_read_n(2);
-    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Completed]);
-    let completed = decode_stdout(&frames[1]);
+    let frames = lp.router_read_n(3);
+    assert_eq!(
+        phases(&frames),
+        [Phase::Accepted, Phase::Started, Phase::Completed]
+    );
+    let completed = decode_stdout(&frames[2]);
     assert_eq!(completed.cmd_id, 31);
     let text = String::from_utf8(completed.payload.clone()).expect("exec 结果应为 UTF-8");
     assert!(text.starts_with("exit=0\n"), "{text}");
@@ -241,8 +290,8 @@ fn pc_agent_tools_flow_over_link() {
     assert_eq!(completed.payload, b"hello-file\n");
     let _ = std::fs::remove_dir_all(&dir);
 
-    // seq 严格递增：Hello(1) + exec(2,3) + write(4,5) + read(6,7)。
-    assert_eq!(completed.seq, 7);
+    // seq 严格递增：Hello(1) + exec(2,3,4) + write(5,6) + read(7,8)。
+    assert_eq!(completed.seq, 8);
     lp.assert_router_idle();
 }
 
@@ -411,6 +460,83 @@ fn task_exceeding_ddl_fails_with_timeout() {
     assert_eq!(failed.phase, Phase::Failed);
     assert_eq!(failed.cmd_id, 9);
     let error = ErrorPayload::decode(&failed.payload).unwrap();
+    assert_eq!(error.code, ErrorCode::Timeout);
+    lp.assert_router_idle();
+}
+
+// ---- pc.exec 任务化：执行期间帧循环仍响应其它命令（B4.2/P3） ----
+
+#[test]
+fn pc_exec_task_keeps_runtime_responsive() {
+    let mut lp = Loop::new("pc-exec-par", 31);
+    let _hello = lp.router_read();
+
+    // powershell Start-Sleep 不依赖网络（受限/离线环境下 ping 会立刻失败）。
+    let command = if cfg!(windows) {
+        "powershell -NoProfile -Command Start-Sleep 2"
+    } else {
+        "sleep 1"
+    };
+    // DDL 放宽：本用例等命令自然结束（不是靠 DDL 超时）。
+    lp.router
+        .write_frame(&task_stdin_with_ddl(
+            41,
+            "pc.exec",
+            command.as_bytes(),
+            60_000,
+        ))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Started]);
+
+    // pc.exec 仍在执行：Worker 必须继续处理其它命令。旧实现（同步 Tool）
+    // 会在这里阻塞整个帧循环，sekai.time 不可能被回应。
+    lp.router
+        .write_frame(&tool_stdin(42, "sekai.time", b""))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Completed]);
+    let time_completed = decode_stdout(&frames[1]);
+    assert_eq!(time_completed.cmd_id, 42);
+    assert_eq!(time_completed.payload.len(), 16);
+
+    // 此刻 pc.exec 还没有终态帧（命令仍在跑）。
+    lp.assert_router_idle();
+
+    // 真实等待子进程退出 + 推进手动时钟，收到 pc.exec 的 Completed。
+    let completed = wait_for_cmd_frame(&mut lp, 41, 30_000);
+    assert_eq!(completed.phase, Phase::Completed);
+    let text = String::from_utf8(completed.payload).expect("exec 结果应为 UTF-8");
+    assert!(text.starts_with("exit=0\n"), "{text}");
+    lp.assert_router_idle();
+}
+
+// ---- pc.exec 任务化：DDL 到期杀进程树并 Failed(Timeout)（B4.3/P1） ----
+
+#[test]
+fn pc_exec_task_ddl_fails_with_timeout() {
+    let mut lp = Loop::new("pc-exec-ddl", 33);
+    let _hello = lp.router_read();
+
+    // powershell Start-Sleep 不依赖网络（受限/离线环境下 ping 会立刻失败）。
+    let command = if cfg!(windows) {
+        "powershell -NoProfile -Command Start-Sleep 30"
+    } else {
+        "sleep 30"
+    };
+    lp.router
+        .write_frame(&task_stdin_with_ddl(51, "pc.exec", command.as_bytes(), 100))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Started]);
+
+    // 越过 DDL：运行时丢弃任务（ExecTask::Drop 杀进程树）并回 Failed(Timeout)。
+    lp.clock.advance(101);
+    let frames = lp.router_read_n(1);
+    let failed = decode_stdout(&frames[0]);
+    assert_eq!(failed.phase, Phase::Failed);
+    assert_eq!(failed.cmd_id, 51);
+    let error = ErrorPayload::decode(&failed.payload).expect("错误载荷解码失败");
     assert_eq!(error.code, ErrorCode::Timeout);
     lp.assert_router_idle();
 }

@@ -23,15 +23,42 @@
 //!
 //! `id` 每通道内单调递增；响应按 `id` 关联请求。行内非 JSON 或无匹配 id
 //! 的响应一律忽略。序列化/解析用本 crate 的 [`crate::mini_json`] 子集。
+//!
+//! ## 健壮性（P8）
+//!
+//! - **按 id 过滤**：两条通道都只接受 `id` 匹配当前请求的响应行；迟到/错位
+//!   响应被忽略（不会把同 socket 上别人的 `ok` 行当成本次回答）；
+//! - **有界缓冲**：DSH 通道的迟到响应缓冲有上限（`MAX_PENDING_RESPONSES`），
+//!   无主响应不会无限增长；
+//! - **连接超时**：Router 通道用 `TcpStream::connect_timeout`（≤
+//!   `CONNECT_TIMEOUT_MS`，且不超过本次 ask 预算），不会无限等待；
+//! - **可取消**：[`PromptTransport::ask_cancellable`] 让 pc.ask 任务在 DDL
+//!   到期/丢弃时通知工作线程退出——只丢弃接收端不足以结束阻塞中的 socket
+//!   读或 condvar 等待。
 
 use std::fmt;
 use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::mini_json::Json;
+
+/// Router prompt 通道建立 TCP 连接的上限（毫秒）；同时不超过本次 ask 预算。
+const CONNECT_TIMEOUT_MS: u64 = 5_000;
+
+/// 可取消 ask 的单次阻塞读/等待粒度（毫秒）：每轮检查一次取消标志。
+const CANCEL_CHECK_MS: u64 = 100;
+
+/// 单次 ask 最多忽略的「迟到/不匹配 id」响应行数（防止对端持续灌入）。
+const MAX_IGNORED_LINES: usize = 64;
+
+/// DSH 通道待取响应缓冲上限：迟到/无主响应超出即按入队顺序丢弃最旧的。
+const MAX_PENDING_RESPONSES: usize = 64;
+
+/// 永不取消的取消标志（供 [`PromptTransport::ask`] 的默认实现复用）。
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// 从环境变量读取一个钳制到 `[min, max]` 的毫秒值；缺失/非法取 `default`。
 pub(crate) fn env_clamped_ms(name: &str, default: u64, min: u64, max: u64) -> u64 {
@@ -83,6 +110,18 @@ impl std::error::Error for PromptError {}
 pub trait PromptTransport: Send + Sync {
     /// 发送 prompt 并等待回答。
     fn ask(&self, prompt: &str) -> Result<String, PromptError>;
+
+    /// 可取消版本：`cancelled` 置位后应尽快返回（`code = "cancelled"`）。
+    ///
+    /// pc.ask 任务在 DDL 到期/被丢弃时置位该标志；**只丢弃接收端不足以**
+    /// 结束阻塞中的 socket 读 / condvar 等待，因此内置通道都实现本方法。
+    /// 默认实现退化为不可取消的 [`ask`]（供简单测试替身使用）。
+    ///
+    /// [`ask`]: PromptTransport::ask
+    fn ask_cancellable(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
+        let _ = cancelled;
+        self.ask(prompt)
+    }
 }
 
 /// 构造一条 prompt 请求行（JSONL 契约见模块头）。
@@ -166,25 +205,45 @@ impl RouterPromptChannel {
     pub fn addr(&self) -> &str {
         &self.addr
     }
-}
 
-impl PromptTransport for RouterPromptChannel {
-    fn ask(&self, prompt: &str) -> Result<String, PromptError> {
+    /// 带超时的 TCP 连接：用本次 ask 预算内的 [`CONNECT_TIMEOUT_MS`] 上限，
+    /// 逐地址尝试 `connect_timeout`（P8：不再无超时地等 connect）。
+    fn connect(&self, deadline: Instant) -> Result<TcpStream, PromptError> {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let budget = remaining.min(Duration::from_millis(CONNECT_TIMEOUT_MS));
+        let addrs: Vec<std::net::SocketAddr> = self
+            .addr
+            .as_str()
+            .to_socket_addrs()
+            .map_err(|error| unreachable_hint(&self.addr, error))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(unreachable_hint(&self.addr, "地址解析结果为空"));
+        }
+        let mut last_error = None;
+        for addr in addrs {
+            match TcpStream::connect_timeout(&addr, budget) {
+                Ok(stream) => return Ok(stream),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(unreachable_hint(
+            &self.addr,
+            last_error.unwrap_or_else(|| std::io::Error::other("连接失败")),
+        ))
+    }
+
+    /// ask 主体：按 `id` 过滤响应行，可被 `cancelled` 打断（P8）。
+    fn ask_with(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut stream = TcpStream::connect(self.addr.as_str()).map_err(|error| {
-            PromptError::new(
-                "unreachable",
-                format!(
-                    "无法连接 Router prompt 通道 {}：{error}。Router 可能未开启 prompt 通道：\
-                     sekai-router 交互/serve 模式默认监听 127.0.0.1:7422，\
-                     可用 --prompt-addr 指定实际地址",
-                    self.addr
-                ),
-            )
-        })?;
-        let budget = Duration::from_millis(self.timeout_ms.max(1));
-        let _ = stream.set_read_timeout(Some(budget));
-        let _ = stream.set_write_timeout(Some(budget));
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms.max(1));
+        let mut stream = self.connect(deadline)?;
+        let write_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        let _ = stream.set_write_timeout(Some(write_timeout));
 
         // 一行请求（无中间缓冲，直接写穿并 flush）。
         let mut request = prompt_request(id, prompt).into_bytes();
@@ -196,32 +255,90 @@ impl PromptTransport for RouterPromptChannel {
             PromptError::new("agent_error", format!("冲刷 prompt 请求失败：{error}"))
         })?;
 
-        // 一行响应。
+        // 一行响应：只接受 id 匹配的行；非 JSONL / 迟到响应忽略（有上限）。
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => Err(PromptError::new(
-                "agent_error",
-                "Router 提前关闭了 prompt 连接（未返回响应）",
-            )),
-            Ok(_) => match parse_response_line(&line) {
-                Some((_, result)) => result,
-                None => Err(PromptError::new(
-                    "agent_error",
-                    format!("Router prompt 应答不是合法 JSONL：{}", line.trim()),
-                )),
-            },
-            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                Err(PromptError::new(
+        let mut ignored = 0usize;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(PromptError::new(
+                    "cancelled",
+                    "pc.ask 已取消：不再等待 Router prompt 应答",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(PromptError::new(
                     "timeout",
                     format!("等待 Router prompt 应答超时（{}ms）", self.timeout_ms),
-                ))
+                ));
             }
-            Err(error) => Err(PromptError::new(
-                "agent_error",
-                format!("读取 Router prompt 应答失败：{error}"),
-            )),
+            // 分片读：每片不超过 CANCEL_CHECK_MS，以便及时观察取消标志。
+            let slice = remaining.min(Duration::from_millis(CANCEL_CHECK_MS));
+            let _ = reader.get_ref().set_read_timeout(Some(slice));
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    return Err(PromptError::new(
+                        "agent_error",
+                        "Router 提前关闭了 prompt 连接（未返回响应）",
+                    ));
+                }
+                Ok(_) => {
+                    let response = parse_response_line(&line);
+                    line.clear();
+                    match response {
+                        Some((Some(rid), result)) if rid == id => return result,
+                        Some(_) => {
+                            // 迟到/无主响应：忽略，但不能无限忽略。
+                            ignored += 1;
+                            if ignored > MAX_IGNORED_LINES {
+                                return Err(PromptError::new(
+                                    "agent_error",
+                                    format!(
+                                        "Router prompt 通道连续返回 {ignored} 行不匹配 id 的响应（期望 id={id}）"
+                                    ),
+                                ));
+                            }
+                        }
+                        None => {} // 非 JSONL 行：按契约忽略。
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    // 分片读超时：回到循环检查取消标志/总预算。
+                }
+                Err(error) => {
+                    return Err(PromptError::new(
+                        "agent_error",
+                        format!("读取 Router prompt 应答失败：{error}"),
+                    ));
+                }
+            }
         }
+    }
+}
+
+/// Router 通道不可达错误：保留可操作提示（Router 默认 ingress 地址等）。
+fn unreachable_hint(addr: &str, error: impl fmt::Display) -> PromptError {
+    PromptError::new(
+        "unreachable",
+        format!(
+            "无法连接 Router prompt 通道 {addr}：{error}。Router 可能未开启 prompt 通道：\
+             sekai-router 交互/serve 模式默认监听 127.0.0.1:7422，\
+             可用 --prompt-addr 指定实际地址"
+        ),
+    )
+}
+
+impl PromptTransport for RouterPromptChannel {
+    fn ask(&self, prompt: &str) -> Result<String, PromptError> {
+        self.ask_with(prompt, &NEVER_CANCELLED)
+    }
+
+    fn ask_cancellable(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
+        self.ask_with(prompt, cancelled)
     }
 }
 
@@ -337,12 +454,19 @@ impl DshPromptChannel {
 
     /// 投递一行响应（读线程调用）。行内非 JSON、缺 `id` 或缺 `ok` 时忽略并
     /// 返回 `false`；合法则登记结果、唤醒等待者并返回 `true`。
+    ///
+    /// 迟到/无主响应（没有 ask 在等它）仍会入队——但缓冲有上限
+    ///（[`MAX_PENDING_RESPONSES`]），超出时丢弃最旧的，避免无限增长（P8）。
     pub fn feed_line(&self, line: &str) -> bool {
         let Some((Some(id), result)) = parse_response_line(line) else {
             return false;
         };
         let mut state = self.shared.state.lock().unwrap();
         state.responses.push((id, result));
+        if state.responses.len() > MAX_PENDING_RESPONSES {
+            let excess = state.responses.len() - MAX_PENDING_RESPONSES;
+            state.responses.drain(..excess);
+        }
         drop(state);
         self.shared.signal.notify_all();
         true
@@ -381,6 +505,17 @@ impl DshPromptChannel {
 
 impl PromptTransport for DshPromptChannel {
     fn ask(&self, prompt: &str) -> Result<String, PromptError> {
+        self.ask_with(prompt, &NEVER_CANCELLED)
+    }
+
+    fn ask_cancellable(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
+        self.ask_with(prompt, cancelled)
+    }
+}
+
+impl DshPromptChannel {
+    /// ask 主体：写一行请求，等对应 `id` 的响应；`cancelled` 置位后尽快返回。
+    fn ask_with(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let request = prompt_request(id, prompt);
         {
@@ -397,6 +532,12 @@ impl PromptTransport for DshPromptChannel {
         let deadline = Instant::now() + Duration::from_millis(self.timeout_ms.max(1));
         let mut state = self.shared.state.lock().unwrap();
         loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(PromptError::new(
+                    "cancelled",
+                    "pc.ask 已取消：不再等待 DSH 插件应答",
+                ));
+            }
             if let Some(index) = state.responses.iter().position(|(rid, _)| *rid == id) {
                 let (_, result) = state.responses.remove(index);
                 return result;
@@ -414,11 +555,9 @@ impl PromptTransport for DshPromptChannel {
                     format!("等待 DSH prompt 应答超时（{}ms）", self.timeout_ms),
                 ));
             }
-            let (next, _) = self
-                .shared
-                .signal
-                .wait_timeout(state, deadline - now)
-                .unwrap();
+            // 分片等待：每片不超过 CANCEL_CHECK_MS，以便及时观察取消标志。
+            let slice = (deadline - now).min(Duration::from_millis(CANCEL_CHECK_MS));
+            let (next, _) = self.shared.signal.wait_timeout(state, slice).unwrap();
             state = next;
         }
     }
@@ -666,6 +805,105 @@ mod tests {
         let error = channel.ask("问").unwrap_err();
         assert_eq!(error.code, "timeout");
         assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    // ---- P8：响应 id 过滤 / 迟到响应清理 / 可取消 ----
+
+    #[test]
+    fn router_channel_ignores_mismatched_ids() {
+        // 同 socket 上先回一个不匹配 id 的 ok 行：不能当作本次回答。
+        let addr = spawn_router_server(|id, _text| {
+            format!(
+                "{{\"id\":{},\"ok\":true,\"result\":{{\"answer\":\"错位\"}}}}\n\
+                 {{\"id\":{id},\"ok\":true,\"result\":{{\"answer\":\"命中\"}}}}",
+                id + 1
+            )
+        });
+        let channel = RouterPromptChannel::with_timeout_ms(addr, 5_000);
+        assert_eq!(channel.ask("问").unwrap(), "命中");
+    }
+
+    #[test]
+    fn router_channel_ask_cancellable_exits_quickly() {
+        // 服务端保持连接但完全不响应：ask_cancellable 必须在取消后尽快退出，
+        // 而不是等满整个 ask 预算（P8）。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定失败");
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            if let Ok(stream) = listener.accept() {
+                let _held = stream; // 保持连接打开、不发响应
+                thread::sleep(Duration::from_secs(30));
+            }
+        });
+        let channel = Arc::new(RouterPromptChannel::with_timeout_ms(addr, 60_000));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancelled.clone();
+        let ask_channel = channel.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = ask_channel.ask_cancellable("问", &cancel_flag);
+            let _ = sender.send(result);
+        });
+        thread::sleep(Duration::from_millis(50));
+        cancelled.store(true, Ordering::Relaxed);
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消后 ask_cancellable 未在 5s 内返回");
+        let error = result.expect_err("取消后不应返回成功");
+        assert_eq!(error.code, "cancelled", "{}", error.message);
+    }
+
+    #[test]
+    fn dsh_channel_bounds_late_responses() {
+        // 迟到/无主响应不能无限增长：feed_line 只保留最近 MAX_PENDING_RESPONSES 条。
+        let (worker_io, _peer_alive) = mem_pair();
+        let channel =
+            DshPromptChannel::with_timeout_ms(boxed(worker_io.clone()), boxed(worker_io), 100);
+        for id in 0..(MAX_PENDING_RESPONSES as u64 * 4) {
+            let line = format!(
+                "{{\"id\":{},\"ok\":true,\"result\":{{\"answer\":\"迟到\"}}}}",
+                id + 100
+            );
+            assert!(channel.feed_line(&line));
+        }
+        let state = channel.shared.state.lock().unwrap();
+        assert!(
+            state.responses.len() <= MAX_PENDING_RESPONSES,
+            "迟到响应缓冲无限增长：{}",
+            state.responses.len()
+        );
+        // 保留的是最近的响应（最旧的被丢弃）。
+        let first_kept = 100 + MAX_PENDING_RESPONSES as u64 * 3;
+        assert!(
+            state.responses.iter().all(|(id, _)| *id >= first_kept),
+            "{:?}",
+            state.responses.first()
+        );
+    }
+
+    #[test]
+    fn dsh_channel_ask_cancellable_exits_quickly() {
+        let (worker_io, _peer_alive) = mem_pair();
+        let channel = Arc::new(DshPromptChannel::with_timeout_ms(
+            boxed(worker_io.clone()),
+            boxed(worker_io),
+            60_000,
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_flag = cancelled.clone();
+        let ask_channel = channel.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = ask_channel.ask_cancellable("问", &cancel_flag);
+            let _ = sender.send(result);
+        });
+        thread::sleep(Duration::from_millis(50));
+        cancelled.store(true, Ordering::Relaxed);
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消后 ask_cancellable 未在 5s 内返回");
+        let error = result.expect_err("取消后不应返回成功");
+        assert_eq!(error.code, "cancelled", "{}", error.message);
     }
 
     #[test]

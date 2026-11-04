@@ -1,6 +1,8 @@
 //! 集成测试共享设施：手动时钟 + 内存链路上的 Worker 驱动辅助。
 
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use sekai::sekai_clock::Clock;
 use sekai::sekai_device_list::DeviceList;
@@ -184,6 +186,10 @@ impl Loop {
     }
 
     /// Router 端读取一帧；超过 `max_ticks` 次超时即失败。
+    ///
+    /// 等待期间会小幅推进 [`Loop::clock`]：Task（如 `pc.exec`/`pc.job`）的后续
+    /// poll 由运行时的单调时钟驱动，紧循环 pump 若不推进时钟，`Pending` 任务
+    /// 永远等不到下一次 poll，终态帧也就不会出现。
     pub fn router_read(&mut self) -> Vec<u8> {
         for _ in 0..100 {
             match self.router.read_frame() {
@@ -191,6 +197,8 @@ impl Loop {
                 Ok(None) => panic!("Router 端链路被关闭"),
                 Err(sekai_worker::link::LinkError::Timeout) => {
                     self.pump_once();
+                    thread::sleep(Duration::from_millis(2));
+                    self.clock.advance(2);
                 }
                 Err(error) => panic!("Router 端读取失败：{error}"),
             }
