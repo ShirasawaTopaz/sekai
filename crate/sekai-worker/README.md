@@ -8,8 +8,8 @@ Sekai **PC Worker**：宿主进程形态的 Worker，当前阶段的主力——
 ```text
 sekai-worker connect 127.0.0.1:7421 --llm dsh
  ├─ 链路（connect/tcp 或 stdio 子进程）：V1 帧，与 Router 的命令面
- ├─ 工具（Tool）：pc.exec / pc.read / pc.write / pc.ls / pc.info（+ 内置 sekai.*）
- ├─ 任务（Task）：pc.job / pc.ask / echo / sleep
+ ├─ 工具（Tool）：pc.read / pc.write / pc.ls / pc.info（+ 内置 sekai.*）
+ ├─ 任务（Task）：pc.exec / pc.job / pc.ask / echo / sleep
  ├─ prompt 通道（--llm，带外 JSONL，不影响 V1 帧）：
  │   ├─ router：Worker 直连 Router prompt ingress（TCP，--prompt-addr）
  │   └─ dsh  ：Worker stdin/stdout JSONL → DSH worker 插件中转 → ingress
@@ -52,7 +52,7 @@ args 与输出都是原始 UTF-8 文本；输出统一截断（`[[truncated]]` /
 
 | 名称 | 类别 | args | 结果 |
 | --- | --- | --- | --- |
-| `pc.exec` | 工具 | 命令文本（Windows `cmd /C`，其余 `sh -c`） | `exit=<code>` + 合并输出；≤4096B；默认 10s 内部超时 |
+| `pc.exec` | 任务 | 命令文本（Windows `cmd /C`，其余 `sh -c`） | `exit=<code>` + 合并输出；≤4096B；默认 10s 内部超时。v0.2 起为 Task（不阻塞帧循环），策略仍按写操作需要 `--allow-write` |
 | `pc.read` | 工具 | 首行路径 | 文件内容（≤4000B） |
 | `pc.write` | 工具 | 首行路径 + 其余全部为内容 | `written=<字节数>`（覆盖写） |
 | `pc.ls` | 工具 | 路径 | `d <name>` / `f <name>` 行，≤200 行 |

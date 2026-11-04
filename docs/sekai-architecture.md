@@ -108,9 +108,9 @@ P2 的退出条件与未闭环清单以 [sekai-gap-audit.md](sekai-gap-audit.md)
 
 ## 5. PC agent 能力与 prompt 通道
 
-PC Worker 以 **PC agent** 形态提供本机能力：工具 `pc.exec`/`pc.read`/`pc.write`/
-`pc.ls`/`pc.info`，任务 `pc.job`/`pc.ask`/`echo`/`sleep`（全表与输出格式见
-[sekai-pc-agent.md](sekai-pc-agent.md)）；虚拟 GPIO 降为 `--gpio` opt-in。
+PC Worker 以 **PC agent** 形态提供本机能力：工具 `pc.read`/`pc.write`/`pc.ls`/`pc.info`，
+任务 `pc.exec`/`pc.job`/`pc.ask`/`echo`/`sleep`（`pc.exec` 自 v0.2 起为 Task，不阻塞帧循环；
+全表与输出格式见 [sekai-pc-agent.md](sekai-pc-agent.md)）；虚拟 GPIO 降为 `--gpio` opt-in。
 `pc.ask` 把 prompt 交给 LLM 取回回答，路径有两条（`--llm` 旗标选择）：
 
 ```text

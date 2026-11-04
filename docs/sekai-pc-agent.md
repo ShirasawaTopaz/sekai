@@ -19,8 +19,8 @@
                  sekai-router（LLM 评估/派工/汇总）
                         │  V1 帧（直连 stdio/TCP；嵌入式 MQTT）
                  sekai-worker（PC agent）
-                  ├─ 工具：pc.exec / pc.read / pc.write / pc.ls / pc.info
-                  ├─ 任务：pc.job / pc.ask / echo / sleep
+                  ├─ 工具：pc.read / pc.write / pc.ls / pc.info
+                  ├─ 任务：pc.exec / pc.job / pc.ask / echo / sleep
                   └─ （可选）--gpio esp32|stm32f1|stm32f4 → 追加 gpio.*（虚拟 GPIO）
                         │
                         │ prompt 通道（带外 JSONL，帧协议不变）
@@ -39,13 +39,13 @@ GPIO 降级为 `--gpio` opt-in（嵌入式演示用）。
 
 | 类别 | 名称 |
 | --- | --- |
-| 工具（Tool） | `pc.exec`、`pc.read`、`pc.write`、`pc.ls`、`pc.info` + 内置 `sekai.*` |
-| 任务（Task） | `pc.job`、`pc.ask`、`echo`、`sleep` |
+| 工具（Tool） | `pc.read`、`pc.write`、`pc.ls`、`pc.info` + 内置 `sekai.*` |
+| 任务（Task） | `pc.exec`、`pc.job`、`pc.ask`、`echo`、`sleep` |
 
 加 `--gpio esp32|stm32f1|stm32f4`（`--family` 为兼容别名）后**追加**
 `gpio.info` / `gpio.config` / `gpio.read` / `gpio.write`（虚拟 GPIO，见 `docs/sekai-gpio.md`）。
 
-## 2. 工具（Tool）参考
+## 2. 本机能力参考（Tool / Task）
 
 args 与输出均为**原始 UTF-8 文本**（无 key=value 前缀；与 `gpio.*` 的文本参数风格一致）。
 输出统一截断：超出上限时按 UTF-8 字符边界截断并追加 `[[truncated]]` 标记行；
