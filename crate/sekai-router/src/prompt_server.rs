@@ -29,17 +29,31 @@
 //! 置 true：worker 的 pc.ask → router → 再派 pc.ask 会死循环，一律在
 //! 策略层拒绝（见 tools.rs）。
 //!
+//! ## 访问控制（B9）
+//!
+//! ingress 默认只允许回环地址；绑定非回环地址必须显式开启
+//! `SEKAI_INGRESS_ALLOW_REMOTE=1`，且必须配置 token（否则拒绝启动）。
+//! token 来源：`SEKAI_INGRESS_TOKEN` 或 `SEKAI_INGRESS_TOKEN_FILE`
+//! （文件首行）。配置 token 后，连接的第一行必须是
+//! `{"id":<int>,"method":"hello","params":{"token":".."}}`；认证失败立即
+//! 回 `unauthorized` 并断开。回环 + 未配置 token 的旧用法保持兼容。
+//! 另有限制：每连接一个处理线程，并发连接上限默认 4；每连接每 60 秒最多
+//! 60 个请求（`SEKAI_INGRESS_MAX_CONNECTIONS` / `SEKAI_INGRESS_RATE` 可调）。
+//! 每个请求都会在 stderr 留一行审计（peer/method/outcome）。
+//!
 //! ## 线程模型
 //!
 //! `PromptCore` 是 `Arc` 共享的快照容器：网关/策略由 Session（REPL）或
 //! ServeState 在 set_gateway / 策略变更时同步进来；chat 客户端可惰性构造
 //! （serve 无 API key 时回 `llm_unavailable`）。ingress 每连接一个处理
-//! 线程；跨连接的 Agent 运行经 `run_lock` 串行化，避免多路 prompt 交错
-//! 操作同一网关。
+//! 线程；跨连接的 Agent 运行经 `RunGate` 限制在 4 路并发（超出时短等
+//! 后回 `busy`），避免无界占用 API 配额。
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::net::{IpAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::agent::{Agent, AgentConfig, AgentStatus};
 use crate::gateway::{GatewayHandle, WorkerGateway};
@@ -60,8 +74,34 @@ pub const CODE_NOT_LINKED: &str = "not_linked";
 pub const CODE_NO_WORKERS: &str = "no_workers";
 /// 错误码：Agent 循环失败。
 pub const CODE_AGENT_ERROR: &str = "agent_error";
+/// 错误码：prompt 运行槽位已满（并发上限）。
+pub const CODE_BUSY: &str = "busy";
+/// 错误码：ingress 认证失败（未握手或 token 不匹配）。
+pub const CODE_UNAUTHORIZED: &str = "unauthorized";
+/// 错误码：请求速率超限。
+pub const CODE_RATE_LIMITED: &str = "rate_limited";
+/// 错误码：并发连接数超限。
+pub const CODE_TOO_MANY_CONNECTIONS: &str = "too_many_connections";
 /// 错误码：未知方法（ingress）。
 const CODE_UNKNOWN_METHOD: &str = "unknown_method";
+/// 同时运行的 prompt 上限（跨 ingress 连接与 serve prompt 共用）。
+const MAX_CONCURRENT_PROMPT_RUNS: usize = 4;
+/// 等待运行槽位的最长时间（毫秒）；超时回 `busy`。
+const RUN_SLOT_WAIT_MS: u64 = 5_000;
+/// 默认并发连接上限。
+const DEFAULT_MAX_CONNECTIONS: usize = 4;
+/// 默认每连接每分钟请求上限。
+const DEFAULT_REQUESTS_PER_MINUTE: usize = 60;
+/// 环境变量：ingress token。
+const ENV_TOKEN: &str = "SEKAI_INGRESS_TOKEN";
+/// 环境变量：ingress token 文件（取首行）。
+const ENV_TOKEN_FILE: &str = "SEKAI_INGRESS_TOKEN_FILE";
+/// 环境变量：允许绑定非回环地址（`1`/`true`）。
+const ENV_ALLOW_REMOTE: &str = "SEKAI_INGRESS_ALLOW_REMOTE";
+/// 环境变量：并发连接上限。
+const ENV_MAX_CONNECTIONS: &str = "SEKAI_INGRESS_MAX_CONNECTIONS";
+/// 环境变量：每连接每分钟请求上限。
+const ENV_RATE_PER_MINUTE: &str = "SEKAI_INGRESS_RATE";
 /// ingress 单行最大字节数（text 上限 8192 字节，JSON 编码与字段开销留足
 /// 余量）；超限视为损坏行，通知 invalid_json 后断开，防止无界内存。
 const MAX_INGRESS_LINE_BYTES: usize = 64 * 1024;
@@ -87,8 +127,10 @@ pub struct PromptCore<C: ChatClient + Clone> {
     gateway: Mutex<Option<GatewayHandle>>,
     /// 策略快照（执行时克隆并置 deny_llm_relay=true）。
     policy: Mutex<Policy>,
-    /// 跨连接串行化 Agent 运行（ingress 多连接并发时避免交错）。
-    run_lock: Mutex<()>,
+    /// 跨连接的 Agent 运行许可（上限 `MAX_CONCURRENT_PROMPT_RUNS`）。
+    run_gate: RunGate,
+    /// ingress 计数（连接/拒绝/限流/prompt 次数）。
+    ingress_stats: Arc<IngressStats>,
     /// Agent 配置快照（max_steps 可被请求覆盖）。
     agent_config: AgentConfig,
     /// 脱敏 trace。
@@ -104,7 +146,8 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             builder: Box::new(|| None::<C>),
             gateway: Mutex::new(None),
             policy: Mutex::new(policy),
-            run_lock: Mutex::new(()),
+            run_gate: RunGate::new(),
+            ingress_stats: Arc::new(IngressStats::default()),
             agent_config,
             trace,
         }
@@ -123,7 +166,8 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             builder,
             gateway: Mutex::new(None),
             policy: Mutex::new(policy),
-            run_lock: Mutex::new(()),
+            run_gate: RunGate::new(),
+            ingress_stats: Arc::new(IngressStats::default()),
             agent_config,
             trace,
         }
@@ -200,7 +244,12 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         if let Some(steps) = max_steps {
             config.max_steps = steps;
         }
-        let _guard = self.run_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _permit = self.run_gate.acquire().ok_or_else(|| {
+            PromptRunError::new(
+                CODE_BUSY,
+                format!("已有 {MAX_CONCURRENT_PROMPT_RUNS} 个 prompt 在运行，请稍后重试"),
+            )
+        })?;
         let mut agent = Agent::new(chat, gateway, policy, config, self.trace.clone());
         match agent.run(text) {
             Ok(outcome) => Ok(PromptRunResult {
@@ -214,6 +263,210 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             }),
             Err(error) => Err(PromptRunError::new(CODE_AGENT_ERROR, error.to_string())),
         }
+    }
+}
+
+impl<C: ChatClient + Clone> PromptCore<C> {
+    /// ingress 计数快照（status / 测试用；只读）。
+    pub fn ingress_stats(&self) -> IngressStatsSnapshot {
+        self.ingress_stats.snapshot()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 并发许可与 ingress 访问控制
+// ---------------------------------------------------------------------------
+
+/// prompt 运行槽位（最多 `MAX_CONCURRENT_PROMPT_RUNS` 路并发）。
+///
+/// 旧实现用 `Mutex<()>` 完全串行化；B5/B3 之后允许多路 prompt 并行（含
+/// `pc.ask` 内层 agent 复用同一 Worker 工具），但必须限制在配额内。
+struct RunGate {
+    active: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl RunGate {
+    const fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// 取一个运行槽位；`RUN_SLOT_WAIT_MS` 内仍无空位返回 None（上层回 busy）。
+    fn acquire(&self) -> Option<RunPermit<'_>> {
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        let deadline = Instant::now() + Duration::from_millis(RUN_SLOT_WAIT_MS);
+        while *active >= MAX_CONCURRENT_PROMPT_RUNS {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let wait = deadline.saturating_duration_since(now);
+            let (guard, _timeout) = self
+                .ready
+                .wait_timeout(active, wait)
+                .unwrap_or_else(|p| p.into_inner());
+            active = guard;
+        }
+        *active += 1;
+        Some(RunPermit { gate: self })
+    }
+}
+
+/// 运行槽位守卫；Drop 时归还并唤醒等待者。
+struct RunPermit<'a> {
+    gate: &'a RunGate,
+}
+
+impl Drop for RunPermit<'_> {
+    fn drop(&mut self) {
+        {
+            let mut active = self.gate.active.lock().unwrap_or_else(|p| p.into_inner());
+            *active = active.saturating_sub(1);
+        }
+        self.gate.ready.notify_one();
+    }
+}
+
+/// ingress 计数（原子累加，供 status/测试读取）。
+#[derive(Debug, Default)]
+struct IngressStats {
+    connections: AtomicU64,
+    rejected_connections: AtomicU64,
+    rejected_auth: AtomicU64,
+    rate_limited: AtomicU64,
+    prompts: AtomicU64,
+}
+
+impl IngressStats {
+    fn snapshot(&self) -> IngressStatsSnapshot {
+        IngressStatsSnapshot {
+            connections: self.connections.load(Ordering::Relaxed),
+            rejected_connections: self.rejected_connections.load(Ordering::Relaxed),
+            rejected_auth: self.rejected_auth.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
+            prompts: self.prompts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// ingress 计数快照（对外只读）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngressStatsSnapshot {
+    /// 已接受的连接数（累计）。
+    pub connections: u64,
+    /// 因并发上限被拒绝的连接数。
+    pub rejected_connections: u64,
+    /// 认证失败次数。
+    pub rejected_auth: u64,
+    /// 触发速率限制的连接数。
+    pub rate_limited: u64,
+    /// 已处理的 prompt 请求数（含失败）。
+    pub prompts: u64,
+}
+
+/// ingress 访问控制配置（默认回环 + 无 token + 4 连接 / 60 req/min）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressSecurity {
+    /// 要求的 token；None 表示不要求（仅限回环兼容用法）。
+    pub token: Option<String>,
+    /// 是否允许绑定非回环地址。
+    pub allow_remote: bool,
+    /// 并发连接上限。
+    pub max_connections: usize,
+    /// 每连接每分钟请求上限。
+    pub max_requests_per_minute: usize,
+}
+
+impl Default for IngressSecurity {
+    fn default() -> Self {
+        Self {
+            token: None,
+            allow_remote: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
+        }
+    }
+}
+
+impl IngressSecurity {
+    /// 完全开放的配置（回环 + 无 token + 默认限额；测试与本地演示用）。
+    pub fn loopback_open() -> Self {
+        Self::default()
+    }
+
+    /// 从环境变量构造（见模块文档「访问控制」）。
+    pub fn from_env() -> Self {
+        let mut security = Self {
+            token: std::env::var(ENV_TOKEN)
+                .ok()
+                .filter(|token| !token.is_empty()),
+            allow_remote: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_requests_per_minute: DEFAULT_REQUESTS_PER_MINUTE,
+        };
+        if security.token.is_none()
+            && let Ok(path) = std::env::var(ENV_TOKEN_FILE)
+            && let Ok(text) = std::fs::read_to_string(path)
+        {
+            let first = text.lines().next().unwrap_or_default().trim();
+            if !first.is_empty() {
+                security.token = Some(String::from(first));
+            }
+        }
+        if let Ok(value) = std::env::var(ENV_ALLOW_REMOTE) {
+            security.allow_remote = matches!(value.trim(), "1" | "true" | "TRUE" | "yes");
+        }
+        if let Ok(value) = std::env::var(ENV_MAX_CONNECTIONS)
+            && let Ok(number) = value.trim().parse::<usize>()
+        {
+            security.max_connections = number.max(1);
+        }
+        if let Ok(value) = std::env::var(ENV_RATE_PER_MINUTE)
+            && let Ok(number) = value.trim().parse::<usize>()
+        {
+            security.max_requests_per_minute = number.max(1);
+        }
+        security
+    }
+}
+
+/// 并发连接闸门（超出上限直接拒绝并关闭，不排队）。
+struct ConnectionGate {
+    active: AtomicUsize,
+    max: usize,
+}
+
+impl ConnectionGate {
+    fn new(max: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max: max.max(1),
+        }
+    }
+
+    fn try_enter(self: &Arc<Self>) -> Option<ConnGuard> {
+        let current = self.active.fetch_add(1, Ordering::SeqCst);
+        if current >= self.max {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(ConnGuard {
+            gate: Arc::clone(self),
+        })
+    }
+}
+
+/// 连接名额守卫；Drop 时归还。
+struct ConnGuard {
+    gate: Arc<ConnectionGate>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.gate.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -346,28 +599,64 @@ fn invalid_arguments(message: impl Into<String>) -> PromptRunError {
 
 /// 启动 prompt ingress TCP 服务器（后台线程；返回实际监听地址，端口 0 展开）。
 ///
+/// 安全限制见模块文档「访问控制」：默认只允许回环地址；非回环绑定需要
+/// `IngressSecurity { allow_remote: true, token: Some(..) }`（或用环境变量）。
 /// - 每连接一个处理线程；连接内逐行读 JSONL、串行处理（与 serve
-///   dispatcher 同风格）；跨连接的 Agent 运行经核心内 `run_lock` 串行化。
+///   dispatcher 同风格）；跨连接的 Agent 运行经 `RunGate` 限制并发（默认 4）。
 /// - 监听线程随进程退出（不 join）；监听器 Drop 即停。
-/// - 绑定失败（端口占用等）返回 io 错误，由调用方决定报错策略
+/// - 绑定失败（端口占用、非回环未授权等）返回 io 错误，由调用方决定报错策略
 ///   （REPL/serve 选择 stderr 报错后继续运行，见 bin 与 serve.rs）。
 pub fn start_ingress<C: ChatClient + Clone + Send + 'static>(
     core: Arc<PromptCore<C>>,
     addr: &str,
 ) -> std::io::Result<std::net::SocketAddr> {
+    start_ingress_with(core, addr, IngressSecurity::from_env())
+}
+
+/// 以显式安全配置启动 ingress（测试与嵌入式调用用；绕过环境变量）。
+pub fn start_ingress_with<C: ChatClient + Clone + Send + 'static>(
+    core: Arc<PromptCore<C>>,
+    addr: &str,
+    security: IngressSecurity,
+) -> std::io::Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr)?;
     let local_addr = listener.local_addr()?;
+    check_bind_allowed(local_addr.ip(), &security)?;
+    let gate = Arc::new(ConnectionGate::new(security.max_connections));
+    let security = Arc::new(security);
     std::thread::Builder::new()
         .name(String::from(INGRESS_THREAD_NAME))
-        .spawn(move || accept_loop(listener, core))
+        .spawn(move || accept_loop(listener, core, security, gate))
         .map_err(|error| std::io::Error::other(format!("线程启动失败：{error}")))?;
     Ok(local_addr)
+}
+
+/// 绑定地址校验：非回环地址必须显式允许且必须配置 token。
+fn check_bind_allowed(ip: IpAddr, security: &IngressSecurity) -> std::io::Result<()> {
+    if ip.is_loopback() {
+        return Ok(());
+    }
+    if !security.allow_remote {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("拒绝绑定非回环地址 {ip}：设置 {ENV_ALLOW_REMOTE}=1 显式允许"),
+        ));
+    }
+    if security.token.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("拒绝在非回环地址 {ip} 上无 token 运行：设置 {ENV_TOKEN} 或 {ENV_TOKEN_FILE}"),
+        ));
+    }
+    Ok(())
 }
 
 /// accept 循环：单次 accept 失败只记录并继续，不退出。
 fn accept_loop<C: ChatClient + Clone + Send + 'static>(
     listener: TcpListener,
     core: Arc<PromptCore<C>>,
+    security: Arc<IngressSecurity>,
+    gate: Arc<ConnectionGate>,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -377,23 +666,62 @@ fn accept_loop<C: ChatClient + Clone + Send + 'static>(
                 continue;
             }
         };
+        let Some(guard) = gate.try_enter() else {
+            core.ingress_stats
+                .rejected_connections
+                .fetch_add(1, Ordering::Relaxed);
+            reject_connection(stream, CODE_TOO_MANY_CONNECTIONS, "并发连接数已达上限");
+            continue;
+        };
         let core = Arc::clone(&core);
+        let security = Arc::clone(&security);
         let spawn = std::thread::Builder::new()
             .name(String::from(CONN_THREAD_NAME))
-            .spawn(move || handle_connection(stream, core));
+            .spawn(move || {
+                let _guard = guard;
+                handle_connection(stream, core, security);
+            });
         if let Err(error) = spawn {
             eprintln!("sekai-router: prompt 通道连接线程启动失败：{error}");
         }
     }
 }
 
-/// 单连接处理：逐行读 → 处理 → 写响应行（写后即 flush）。
-fn handle_connection<C: ChatClient + Clone>(stream: TcpStream, core: Arc<PromptCore<C>>) {
+/// 拒绝一个连接：尽力回一行错误后关闭。
+fn reject_connection(mut stream: TcpStream, code: &str, message: &str) {
+    {
+        let mut writer = BufWriter::new(&mut stream);
+        let _ = write_line(&mut writer, &error_response(0, code, message));
+        let _ = writer.flush();
+    }
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// 单连接处理：认证（如需）→ 逐行读 → 处理 → 写响应行（写后即 flush）。
+///
+/// 限额：每连接每 60 秒最多 `max_requests_per_minute` 个请求；超过回
+/// `rate_limited` 并断开。审计：每个请求在 stderr 留一行
+/// `peer/method/outcome`（不记录 prompt 正文）。
+fn handle_connection<C: ChatClient + Clone>(
+    stream: TcpStream,
+    core: Arc<PromptCore<C>>,
+    security: Arc<IngressSecurity>,
+) {
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| String::from("unknown"));
+    core.ingress_stats
+        .connections
+        .fetch_add(1, Ordering::Relaxed);
     let Ok(reader) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(reader);
     let mut writer = BufWriter::new(stream);
+    let mut authenticated = security.token.is_none();
+    let mut requests = 0usize;
+    let mut window = Instant::now();
     loop {
         let line = match read_line_capped(&mut reader, MAX_INGRESS_LINE_BYTES) {
             Ok(LineRead::Line(line)) => line,
@@ -413,7 +741,58 @@ fn handle_connection<C: ChatClient + Clone>(stream: TcpStream, core: Arc<PromptC
                 break;
             }
         };
-        for message in handle_ingress_line(&core, &line) {
+        if window.elapsed() >= Duration::from_secs(60) {
+            window = Instant::now();
+            requests = 0;
+        }
+        requests += 1;
+        if requests > security.max_requests_per_minute {
+            core.ingress_stats
+                .rate_limited
+                .fetch_add(1, Ordering::Relaxed);
+            write_line(
+                &mut writer,
+                &error_response(0, CODE_RATE_LIMITED, "每分钟请求数超限，连接已关闭"),
+            );
+            break;
+        }
+        if !authenticated {
+            match authenticate(&security, &line) {
+                Ok(id) => {
+                    authenticated = true;
+                    write_line(
+                        &mut writer,
+                        &ok_response(id, Json::object(vec![("authenticated", Json::Bool(true))])),
+                    );
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                Err((id, message)) => {
+                    core.ingress_stats
+                        .rejected_auth
+                        .fetch_add(1, Ordering::Relaxed);
+                    write_line(
+                        &mut writer,
+                        &error_response(id, CODE_UNAUTHORIZED, &message),
+                    );
+                    break;
+                }
+            }
+        }
+        let method = request_method(&line);
+        let messages = handle_ingress_line(&core, &line);
+        let outcome = if messages
+            .iter()
+            .any(|message| matches!(message.get("ok"), Some(Json::Bool(false))))
+        {
+            "denied"
+        } else {
+            "ok"
+        };
+        eprintln!("sekai-router: prompt 通道 peer={peer} method={method} outcome={outcome}");
+        for message in messages {
             write_line(&mut writer, &message);
         }
         if writer.flush().is_err() {
@@ -421,6 +800,61 @@ fn handle_connection<C: ChatClient + Clone>(stream: TcpStream, core: Arc<PromptC
             break;
         }
     }
+}
+
+/// 取请求的 method（解析失败回 `"-"`；只用于审计日志）。
+fn request_method(line: &str) -> String {
+    Json::parse(line.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .get("method")
+                .and_then(Json::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from("-"))
+}
+
+/// 校验 hello 握手行。
+///
+/// 成功返回请求 id；失败返回（可用于回显的 id, 错误消息）。
+fn authenticate(security: &IngressSecurity, line: &str) -> Result<i64, (i64, String)> {
+    let value = Json::parse(line.trim())
+        .map_err(|error| (0, format!("认证失败：首个请求必须是 hello 握手（{error}）")))?;
+    let id = value.get("id").and_then(Json::as_i64).unwrap_or(0);
+    let method = value
+        .get("method")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if method != "hello" {
+        return Err((
+            id,
+            format!("认证失败：首个请求必须是 hello 握手（收到 {method}）"),
+        ));
+    }
+    let token = value
+        .get_path(&["params", "token"])
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    match security.token.as_deref() {
+        Some(expected) if constant_time_eq(expected, token) => Ok(id),
+        _ => Err((id, String::from("认证失败：token 不匹配"))),
+    }
+}
+
+/// 常量时间比较，避免按 token 前缀/长度泄漏时间差。
+fn constant_time_eq(expected: &str, actual: &str) -> bool {
+    let expected = expected.as_bytes();
+    let actual = actual.as_bytes();
+    let mut diff = expected.len() ^ actual.len();
+    let mut index = 0;
+    while index < expected.len().max(actual.len()) {
+        let left = expected.get(index).copied().unwrap_or(0);
+        let right = actual.get(index).copied().unwrap_or(0);
+        diff |= usize::from(left ^ right);
+        index += 1;
+    }
+    diff == 0
 }
 
 /// 处理一行 ingress 请求（serve `handle_line` 同风格：畸形行跳行回错，
@@ -480,10 +914,13 @@ fn handle_ingress_line<C: ChatClient + Clone>(core: &PromptCore<C>, line: &str) 
             id,
             Json::object(vec![("pong", Json::Bool(true))]),
         )],
-        "prompt" => match dispatch_prompt(core, &params) {
-            Ok(result) => vec![ok_response(id, result)],
-            Err(error) => vec![error_response(id, &error.code, &error.message)],
-        },
+        "prompt" => {
+            core.ingress_stats.prompts.fetch_add(1, Ordering::Relaxed);
+            match dispatch_prompt(core, &params) {
+                Ok(result) => vec![ok_response(id, result)],
+                Err(error) => vec![error_response(id, &error.code, &error.message)],
+            }
+        }
         other => vec![error_response(
             id,
             CODE_UNKNOWN_METHOD,

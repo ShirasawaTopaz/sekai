@@ -1,16 +1,17 @@
-//! 零依赖 HTTP 客户端。
+//! HTTP 客户端。
 //!
-//! # 为什么不是 ureq
+//! # 为什么不是 ureq / reqwest
 //!
-//! 本 crate 的目标是能在任意 host 环境（包括受 Windows 沙箱限制、无法由 cargo
-//! 启动 rustc 的调试机器）里做真实构建与真实 API 测试，因此不引入第三方依赖。
+//! 本 crate 只有传输层需要 TLS，其余协议/Worker 侧代码保持零依赖；因此
 //! HTTP 客户端分两条路径：
 //!
 //! - http://：进程内实现 HTTP/1.1（StdHttpClient），用于本地 mock server 测试，
 //!   不依赖外部程序；
-//! - https://：把请求交给外部 helper（优先 Node.js，其次 OpenSSL 版 curl），
-//!   通过临时文件而不是管道交换请求/响应体。helper 进程使用环境变量接收
-//!   Authorization，密钥不落盘、不出现在命令行参数中。
+//! - https://：默认用进程内 TLS（`tls` feature，`native-tls`：Windows 走
+//!   schannel、Linux 走系统 OpenSSL），部署时不需要 node/curl。
+//!   需要兼容旧部署时可用 `SEKAI_HTTPS_MODE=helper` 回退到外部 helper
+//!   （优先 Node.js，其次 OpenSSL 版 curl；通过临时文件交换请求/响应体，
+//!   Authorization 走环境变量，不落盘、不出现在命令行参数中）。
 //!
 //! 该设计只用于 host 侧工具；协议/Worker侧代码不依赖本模块。
 
@@ -28,6 +29,8 @@ use crate::json::Json;
 pub const ENV_NODE: &str = "SEKAI_NODE";
 /// 环境变量：覆盖 curl 可执行文件路径。
 pub const ENV_CURL: &str = "SEKAI_CURL";
+/// 环境变量：HTTPS 后端选择（`native` 默认 / `helper` 回退旧行为）。
+pub const ENV_HTTPS_MODE: &str = "SEKAI_HTTPS_MODE";
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -138,7 +141,7 @@ impl std::fmt::Display for HttpError {
             Self::Helper(message) => write!(f, "HTTPS helper 失败：{message}"),
             Self::NoHttpsHelper => write!(
                 f,
-                "当前环境没有可用的 HTTPS helper（需要 node 或 OpenSSL 版 curl；可用 {ENV_NODE}/{ENV_CURL} 指定路径）"
+                "当前构建没有 HTTPS 能力：启用 tls feature（默认开）或用 {ENV_HTTPS_MODE}=helper 配置 node/curl（{ENV_NODE}/{ENV_CURL} 可指定路径）"
             ),
         }
     }
@@ -168,32 +171,65 @@ pub enum HttpsHelper {
     Disabled,
 }
 
-/// 默认 HTTP 客户端：明文直连 + HTTPS 外部 helper。
+/// HTTPS 后端选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpsBackend {
+    /// 进程内 TLS（`tls` feature）。
+    Native,
+    /// 外部 helper（node/curl）。
+    Helper,
+}
+
+impl HttpsBackend {
+    /// 按构建特性与 `SEKAI_HTTPS_MODE` 选择后端。
+    fn resolve() -> Self {
+        match std::env::var(ENV_HTTPS_MODE) {
+            Ok(value) if value.trim().eq_ignore_ascii_case("helper") => Self::Helper,
+            Ok(value) if value.trim().eq_ignore_ascii_case("native") => Self::Native,
+            // 默认：有 tls feature 就用进程内 TLS。
+            _ if cfg!(feature = "tls") => Self::Native,
+            _ => Self::Helper,
+        }
+    }
+}
+
+/// 默认 HTTP 客户端：明文直连 + 进程内 TLS（默认）或外部 helper。
 pub struct StdHttpClient {
     helper: HttpsHelper,
+    backend: HttpsBackend,
     node_path: Option<PathBuf>,
     curl_path: Option<PathBuf>,
     helper_dir: Option<PathBuf>,
 }
 
 impl StdHttpClient {
-    /// 创建自动探测 helper 的客户端。
+    /// 创建默认客户端：HTTPS 优先进程内 TLS（`tls` feature）。
     pub fn new() -> Self {
-        Self::with_helper(HttpsHelper::Auto)
-    }
-
-    /// 用指定 helper 策略创建客户端。
-    pub fn with_helper(helper: HttpsHelper) -> Self {
         Self {
-            helper,
+            helper: HttpsHelper::Auto,
+            backend: HttpsBackend::resolve(),
             node_path: resolve_node(),
             curl_path: resolve_curl(),
             helper_dir: None,
         }
     }
 
-    /// 当前可用的 HTTPS helper 名称；没有则 None。
+    /// 用指定 helper 策略创建客户端（强制走外部 helper；测试 mock 常用）。
+    pub fn with_helper(helper: HttpsHelper) -> Self {
+        Self {
+            helper,
+            backend: HttpsBackend::Helper,
+            node_path: resolve_node(),
+            curl_path: resolve_curl(),
+            helper_dir: None,
+        }
+    }
+
+    /// 当前 HTTPS 能力名称：`native-tls` 或 helper 名；都没有则 None。
     pub fn https_helper_name(&self) -> Option<&'static str> {
+        if self.backend == HttpsBackend::Native && cfg!(feature = "tls") {
+            return Some("native-tls");
+        }
         match &self.helper {
             HttpsHelper::Disabled => None,
             HttpsHelper::Node => self.node_path.as_ref().map(|_| "node"),
@@ -211,6 +247,49 @@ impl StdHttpClient {
     }
 
     fn execute_https(&mut self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        if self.backend == HttpsBackend::Native {
+            return self.execute_native_tls(request);
+        }
+        self.execute_https_helper(request)
+    }
+
+    /// 进程内 TLS 请求（`tls` feature 关闭时回 NoHttpsHelper）。
+    fn execute_native_tls(&mut self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        #[cfg(feature = "tls")]
+        {
+            let parsed = ParsedHttpUrl::parse_https(&request.url)?;
+            let address = format!("{}:{}", parsed.host, parsed.port);
+            let mut addresses = address
+                .to_socket_addrs()
+                .map_err(|error| HttpError::Connect(error.to_string()))?;
+            let socket = addresses
+                .next()
+                .ok_or_else(|| HttpError::Connect(String::from("没有可用地址")))?;
+            let started = Instant::now();
+            let stream = TcpStream::connect_timeout(&socket, request.timeout)
+                .map_err(|error| HttpError::Connect(error.to_string()))?;
+            let _ = stream.set_nodelay(true);
+            let remaining = request
+                .timeout
+                .saturating_sub(Instant::now().saturating_duration_since(started));
+            let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
+            let _ = stream.set_write_timeout(Some(remaining.max(Duration::from_millis(1))));
+            let connector = native_tls::TlsConnector::new()
+                .map_err(|error| HttpError::Connect(format!("TLS 初始化失败：{error}")))?;
+            let mut stream = connector
+                .connect(&parsed.host, stream)
+                .map_err(|error| HttpError::Connect(format!("TLS 握手失败：{error}")))?;
+            send_and_read(&mut stream, request, &parsed)
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            let _ = request;
+            Err(HttpError::NoHttpsHelper)
+        }
+    }
+
+    /// 外部 helper 请求（旧行为）。
+    fn execute_https_helper(&mut self, request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         match &self.helper {
             HttpsHelper::Disabled => Err(HttpError::NoHttpsHelper),
             HttpsHelper::Curl(path) => self.execute_with_curl(path.clone(), request),
@@ -399,7 +478,7 @@ fn execute_plain(request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         .next()
         .ok_or_else(|| HttpError::Connect(String::from("没有可用地址")))?;
     let started = Instant::now();
-    let stream = TcpStream::connect_timeout(&socket, request.timeout)
+    let mut stream = TcpStream::connect_timeout(&socket, request.timeout)
         .map_err(|error| HttpError::Connect(error.to_string()))?;
     let _ = stream.set_nodelay(true);
     let remaining = request
@@ -407,7 +486,15 @@ fn execute_plain(request: &HttpRequest) -> Result<HttpResponse, HttpError> {
         .saturating_sub(Instant::now().saturating_duration_since(started));
     let _ = stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))));
     let _ = stream.set_write_timeout(Some(remaining.max(Duration::from_millis(1))));
-    let mut stream = stream;
+    send_and_read(&mut stream, request, &parsed)
+}
+
+/// 在已建立的连接上完成一次 HTTP/1.1 交换（明文与 TLS 共用）。
+fn send_and_read<S: Read + Write>(
+    stream: &mut S,
+    request: &HttpRequest,
+    parsed: &ParsedHttpUrl,
+) -> Result<HttpResponse, HttpError> {
     let mut head = format!(
         "{} {} HTTP/1.1\r\nHost: {}:{}\r\n",
         request.method, parsed.path, parsed.host, parsed.port
@@ -458,9 +545,18 @@ struct ParsedHttpUrl {
 
 impl ParsedHttpUrl {
     fn parse(url: &str) -> Result<Self, HttpError> {
+        Self::parse_with_scheme(url, "http://", 80)
+    }
+
+    /// 解析 `https://` URL（默认端口 443）。
+    fn parse_https(url: &str) -> Result<Self, HttpError> {
+        Self::parse_with_scheme(url, "https://", 443)
+    }
+
+    fn parse_with_scheme(url: &str, scheme: &str, default_port: u16) -> Result<Self, HttpError> {
         let rest = url
-            .strip_prefix("http://")
-            .ok_or_else(|| HttpError::InvalidUrl(String::from("不是 http:// URL")))?;
+            .strip_prefix(scheme)
+            .ok_or_else(|| HttpError::InvalidUrl(format!("不是 {scheme} URL")))?;
         let (authority, path) = match rest.find('/') {
             Some(index) => (&rest[..index], &rest[index..]),
             None => (rest, "/"),
@@ -474,7 +570,7 @@ impl ParsedHttpUrl {
                 port.parse::<u16>()
                     .map_err(|_| HttpError::InvalidUrl(String::from("端口非法")))?,
             ),
-            None => (authority.to_string(), 80),
+            None => (authority.to_string(), default_port),
         };
         if host.is_empty() || port == 0 {
             return Err(HttpError::InvalidUrl(String::from("host/port 非法")));

@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sekai_router::http::{HttpsHelper, StdHttpClient};
+use sekai_router::http::{HttpClient, HttpError, HttpRequest, HttpsHelper, StdHttpClient};
 use sekai_router::json::Json;
 use sekai_router::llm::{
     ChatClient, ChatRequest, LlmClient, LlmConfig, LlmError, Message, ToolChoice, ToolDef,
@@ -465,4 +465,44 @@ fn list_models_rejects_missing_data() {
     let error = client.list_models().unwrap_err();
     server.stop();
     assert!(matches!(error, LlmError::Protocol(_)), "got {error:?}");
+}
+
+// ---------------------------------------------------------------------------
+// B10：进程内 HTTPS（tls feature）
+// ---------------------------------------------------------------------------
+
+/// 默认客户端：启用 tls feature 时使用进程内 TLS，不再依赖 node/curl。
+#[test]
+fn https_backend_defaults_to_native_tls() {
+    let http = StdHttpClient::new();
+    if cfg!(feature = "tls") {
+        assert_eq!(http.https_helper_name(), Some("native-tls"));
+    }
+}
+
+/// https:// 走进程内 TLS：连接被拒时报连接错误，而不是"缺 helper"。
+#[test]
+fn https_uses_native_tls_and_reports_connect_error() {
+    if !cfg!(feature = "tls") {
+        return;
+    }
+    let mut http = StdHttpClient::new();
+    let request =
+        HttpRequest::new("POST", "https://127.0.0.1:1/v1").timeout(Duration::from_millis(500));
+    let error = http.execute(&request).expect_err("端口 1 应连接失败");
+    assert!(
+        matches!(error, HttpError::Connect(_)),
+        "应走进程内 TLS 并报连接错误：{error:?}"
+    );
+}
+
+/// 显式 with_helper 保留旧 helper 语义（旧部署/测试兼容）。
+#[test]
+fn https_helper_mode_is_still_available() {
+    let mut http = StdHttpClient::with_helper(HttpsHelper::Disabled);
+    let request = HttpRequest::new("GET", "https://example.com/");
+    assert_eq!(
+        http.execute(&request).expect_err("Disabled 必须拒绝"),
+        HttpError::NoHttpsHelper
+    );
 }

@@ -13,6 +13,12 @@ path = "src/lib.rs"
 name = "sekai-router"
 path = "src/bin/sekai-router.rs"
 
+[features]
+default = ["tls"]
+# 进程内 HTTPS（B10）：Windows 走 schannel、Linux/macOS 走系统 OpenSSL /
+# Security.framework，不依赖 node 或 curl。关闭后 https 回退到外部 helper。
+tls = ["dep:native-tls"]
+
 [dependencies]
 # 全屏 TUI 前端（src/tui.rs）：ratatui 渲染 + crossterm 终端控制/事件。
 crossterm = "0.28"
@@ -21,6 +27,8 @@ sekai = { path = "../sekai" }
 # 直连链路传输层（Link trait / 内存链路 / 帧编解码）：Router 直连端点与
 # PC Worker 共用同一抽象（见 crate/sekai-worker/src/link.rs）。
 sekai-worker = { path = "../sekai-worker" }
+# 进程内 TLS（`tls` feature，默认开）：https:// 请求不再依赖外部 helper。
+native-tls = { version = "0.2", optional = true }
 
 [dev-dependencies]
 sekai-gpio = { path = "../sekai-gpio" }
