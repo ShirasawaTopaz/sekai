@@ -10,15 +10,18 @@
 
 ## 0. 术语
 
-### 0.1 术语重命名与适用范围
-
-2025 年重构后，原「服务器（server）」统一改称 **Router**，原「设备（device）」统一改称 **Worker**（第一阶段以 PC Worker 为主，嵌入式 Worker 优先级置后）。本文措辞已按新术语书写；线级标识符保持原样：字段名（`device_id`、`boot_id`、`cmd_id`）、结构名（`DeviceList`）、主题模式（`{root}/dev/{device_id}/in|out|state`）、content-type 字符串、错误码与常量值均不变。
+### 0.1 术语与适用范围
 
 本协议 V1 帧格式与主题布局不变。承载方式的适用范围：
 
 - **MQTT 主题承载**仅适用于嵌入式 Worker 链路（后期阶段）。
 - **PC Worker 直连链路**（stdio/TCP + 长度前缀帧，见 `crate/sekai-worker`）复用同一套 Stdin/Stdout 帧，不经 MQTT broker。
 - Jump/DeviceList 等 MQTT 特有命令仅在有主题路由的链路上有意义。
+
+**prompt 通道（带外，不改变本协议）**：Router 的 prompt ingress（TCP JSONL）与
+Worker `pc.ask` 使用的 JSONL 信封是**带外传输层能力**——它只出现在 ingress 连接与
+Worker↔DSH 插件的 stdin/stdout 上，不新增帧类型、错误码或 `content_type`，V1
+Stdin/Stdout 帧一字不变。全量定义见 [sekai-pc-agent.md](sekai-pc-agent.md) §4。
 
 ### 0.2 术语表
 

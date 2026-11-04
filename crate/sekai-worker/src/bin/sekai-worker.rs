@@ -12,6 +12,19 @@
 //!   便于 Router 以 `sekai-worker --mode stdio` 或裸进程名拉起。
 //! - `sekai-worker help`：帮助。
 //!
+//! 能力：默认注册 **PC agent 能力**（`pc.exec/read/write/ls/info` 工具 +
+//! `echo/sleep/pc.job/pc.ask` 任务，见 `sekai_worker::capability`）；
+//! virtual GPIO 改为 `--gpio`（兼容别名 `--family`，旧 DSH 插件仍会传）
+//! 显式 opt-in。
+//!
+//! LLM prompt 通道（`--llm`）：`pc.ask` 的**带外**传输，不占用 V1 链路：
+//!
+//! - `router`（connect 默认）：TCP JSONL 到 Router ingress（地址用
+//!   `--prompt-addr`，缺省取 connect 地址主机 + 端口 7422）；
+//! - `dsh`：本进程 stdin/stdout JSONL，经安装它的 DSH 插件中转到 LLM
+//!   （仅 connect 模式；主循环启动前 spawn stdin 行读线程喂通道）；
+//! - `off`（stdio 默认）：不启用，`pc.ask` 调用即失败并给 `--llm` 提示。
+//!
 //! 兼容旧旗标：`--mode stdio|tcp`、`--router-addr HOST:PORT` 等仍可用；
 //! 子命令与 `--mode` 同时给出且不一致时报冲突。
 //!
@@ -20,17 +33,21 @@
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sekai::sekai_device_list::{DeviceList, Endpoint};
 use sekai::sekai_runtime::{LinkAction, RuntimeConfig};
 use sekai_gpio::ChipFamily;
-use sekai_worker::capability::{SystemClock, host_registries};
+use sekai_worker::capability::{LlmMode, SystemClock, agent_registries_for};
 use sekai_worker::host::WorkerHost;
 use sekai_worker::link::{
     Backoff, Link, LinkError, StdioLink, TcpLink, connect_hint, read_frame_stream,
     write_frame_stream,
+};
+use sekai_worker::llm_channel::{
+    DshPromptChannel, LineIo, PromptTransport, RouterPromptChannel, StdioLineIo,
 };
 
 /// 空闲轮询间隔：读超时当作一次 tick，借此推进任务/定时器。
@@ -46,17 +63,25 @@ sekai-worker：Sekai PC Worker（直连链路，非 MQTT broker）
 
 选项：
   --worker-id ID          Worker id（默认 pc-worker）
-  --family esp32|stm32f1|stm32f4
-                          virtual GPIO 家族（默认 esp32）
+  --llm router|dsh|off    pc.ask 的 LLM prompt 通道（默认：connect→router，stdio→off）
+  --prompt-addr HOST:PORT --llm router 的 ingress 地址（默认取 connect 地址主机 +
+                          端口 7422，如 connect 10.0.0.5:7421 → 10.0.0.5:7422）
+  --gpio esp32|stm32f1|stm32f4
+                          opt-in 追加 virtual GPIO 工具（默认不注册 gpio.*）
   --boot-id N             启动周期 id（默认按时间+pid 生成，跨重启必变）
   -h, --help              显示本帮助
+
+能力：pc.exec / pc.read / pc.write / pc.ls / pc.info 工具 +
+echo / sleep / pc.job / pc.ask 任务（--gpio 追加 gpio.* 工具）。
 
 兼容旗标（等价子命令）：
   --mode stdio|tcp        运行模式（默认 stdio）
   --router-addr HOST:PORT tcp 模式的 Router 直连接入地址（tcp 模式必填）
+  --family FAMILY         --gpio 的兼容别名（旧 DSH 插件仍会传，等价不报错）
 
 示例：
   sekai-worker connect 127.0.0.1:7421 --worker-id desk-1
+  sekai-worker connect 127.0.0.1:7421 --llm dsh    # pc.ask 经 DSH 插件中转
   sekai-router            # 另一终端：/link tcp 后 /wait 等本 Worker 上线
 ";
 
@@ -65,8 +90,26 @@ struct Args {
     mode: Mode,
     router_addr: Option<String>,
     worker_id: String,
-    family: ChipFamily,
+    gpio: Option<ChipFamily>,
+    llm: LlmMode,
+    prompt_addr: Option<String>,
     boot_id: u64,
+}
+
+impl Args {
+    /// `--llm router` 的 ingress 地址：显式 `--prompt-addr` 优先，否则取
+    /// connect 地址的主机部分 + 默认端口 7422（如 10.0.0.5:7421 →
+    /// 10.0.0.5:7422）。
+    fn effective_prompt_addr(&self) -> String {
+        if let Some(addr) = &self.prompt_addr {
+            return addr.clone();
+        }
+        let router = self.router_addr.as_deref().unwrap_or("127.0.0.1:7421");
+        let host = router
+            .rsplit_once(':')
+            .map_or("127.0.0.1", |(host, _)| host);
+        format!("{host}:7422")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +131,9 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
     let mut mode: Option<Mode> = None;
     let mut router_addr: Option<String> = None;
     let mut worker_id = String::from("pc-worker");
-    let mut family = ChipFamily::Esp32;
+    let mut gpio: Option<ChipFamily> = None;
+    let mut llm: Option<LlmMode> = None;
+    let mut prompt_addr: Option<String> = None;
     let mut boot_id = generate_boot_id();
     let mut flag_mode: Option<Mode> = None;
 
@@ -148,18 +193,39 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
             "--worker-id" => {
                 worker_id = take_value("--worker-id")?;
             }
-            "--family" => {
-                let value = take_value("--family")?;
-                family = match value.as_str() {
+            "--llm" => {
+                let value = take_value("--llm")?;
+                llm = Some(LlmMode::parse(&value).ok_or_else(|| {
+                    UsageError(format!("--llm 不支持 {value:?}（可选 router/dsh/off）"))
+                })?);
+            }
+            "--prompt-addr" => {
+                let value = take_value("--prompt-addr")?;
+                Endpoint::parse(&value)
+                    .map_err(|error| UsageError(format!("--prompt-addr 非法：{error}")))?;
+                if prompt_addr.is_some() {
+                    return Err(UsageError(String::from("--prompt-addr 重复")));
+                }
+                prompt_addr = Some(value);
+            }
+            // --gpio 为正式名；--family 保留为兼容别名（旧 DSH 插件仍会传）。
+            "--gpio" | "--family" => {
+                let name = if arg == "--gpio" {
+                    "--gpio"
+                } else {
+                    "--family"
+                };
+                let value = take_value(name)?;
+                gpio = Some(match value.as_str() {
                     "esp32" => ChipFamily::Esp32,
                     "stm32f1" => ChipFamily::Stm32F1,
                     "stm32f4" => ChipFamily::Stm32F4,
                     other => {
                         return Err(UsageError(format!(
-                            "--family 不支持 {other:?}（可选 esp32/stm32f1/stm32f4）"
+                            "{name} 不支持 {other:?}（可选 esp32/stm32f1/stm32f4）"
                         )));
                     }
-                };
+                });
             }
             "--boot-id" => {
                 let value = take_value("--boot-id")?;
@@ -190,11 +256,29 @@ fn parse_args(argv: &[String]) -> Result<Parsed, UsageError> {
             "tcp 模式必须提供地址：sekai-worker connect HOST:PORT（或 --router-addr）",
         )));
     }
+    // LLM prompt 通道默认：connect→router，stdio→off；组合合法性校验。
+    let llm = llm.unwrap_or(match mode {
+        Mode::Tcp => LlmMode::Router,
+        Mode::Stdio => LlmMode::Off,
+    });
+    if mode == Mode::Stdio && llm != LlmMode::Off {
+        return Err(UsageError(format!(
+            "--llm {} 需要 connect（TCP）模式：stdio 模式的 stdin/stdout 是链路本身",
+            llm.as_str()
+        )));
+    }
+    if prompt_addr.is_some() && llm != LlmMode::Router {
+        return Err(UsageError(String::from(
+            "--prompt-addr 仅在 --llm router 时有效",
+        )));
+    }
     Ok(Parsed::Run(Box::new(Args {
         mode,
         router_addr,
         worker_id,
-        family,
+        gpio,
+        llm,
+        prompt_addr,
         boot_id,
     })))
 }
@@ -237,9 +321,13 @@ fn main() -> ExitCode {
     }
 }
 
-/// 组装 WorkerHost（能力：virtual GPIO + echo/sleep 任务）。
-fn build_host(args: &Args) -> Result<WorkerHost<SystemClock>, String> {
-    let (tasks, tools) = host_registries(args.family)?;
+/// 组装 WorkerHost（能力：PC agent pc.* + 可选 gpio；prompt 通道由 `llm`
+/// 提供，`pc.info` 的 `llm=` 行取 `args.llm` 标签）。
+fn build_host(
+    args: &Args,
+    llm: Option<Arc<dyn PromptTransport>>,
+) -> Result<WorkerHost<SystemClock>, String> {
+    let (tasks, tools) = agent_registries_for(llm, args.llm, args.gpio)?;
     let clock = SystemClock::new();
     let mut config = RuntimeConfig::new(args.worker_id.clone(), args.boot_id);
     config.firmware = format!("sekai-worker/{}", env!("CARGO_PKG_VERSION"));
@@ -250,7 +338,8 @@ fn build_host(args: &Args) -> Result<WorkerHost<SystemClock>, String> {
 // ---- stdio 模式 ----
 
 fn run_stdio(args: &Args) -> Result<(), String> {
-    let mut host = build_host(args)?;
+    // stdio 模式 llm 必为 off（parse_args 已校验），stdin/stdout 是链路本身。
+    let mut host = build_host(args, None)?;
     let endpoint = Endpoint::new("local", 1).map_err(|error| error.to_string())?;
     let (reader, writer) = StdioLink::std().into_parts();
     let mut writer = writer.ok_or("stdio 写半侧不可用")?;
@@ -385,8 +474,33 @@ fn mark_link_ready(written: usize, hello_pending: &mut bool) {
     }
 }
 
+/// connect（tcp）模式的 LLM prompt 通道：按 `--llm` 构造传输；`dsh` 时在
+/// 主循环启动前 spawn stdin 行读线程喂通道（connect 模式的链路是 TCP，
+/// stdin/stdout 空闲，可作带外通道）。
+fn build_llm_transport(args: &Args) -> Option<Arc<dyn PromptTransport>> {
+    match args.llm {
+        LlmMode::Off => None,
+        LlmMode::Router => {
+            let addr = args.effective_prompt_addr();
+            eprintln!("sekai-worker: LLM prompt 通道 router（ingress {addr}）");
+            Some(Arc::new(RouterPromptChannel::new(addr)))
+        }
+        LlmMode::Dsh => {
+            let channel = Arc::new(DshPromptChannel::new(
+                Arc::new(Mutex::new(Box::new(StdioLineIo) as Box<dyn LineIo + Send>)),
+                Arc::new(Mutex::new(Box::new(StdioLineIo) as Box<dyn LineIo + Send>)),
+            ));
+            eprintln!("sekai-worker: LLM prompt 通道 dsh（stdin/stdout JSONL，经 DSH 插件中转）");
+            let pump = channel.clone();
+            thread::spawn(move || pump.pump());
+            Some(channel)
+        }
+    }
+}
+
 fn run_tcp(args: &Args) -> Result<(), String> {
-    let mut host = build_host(args)?;
+    let llm = build_llm_transport(args);
+    let mut host = build_host(args, llm)?;
     let mut link = TcpLink::new();
     let mut backoff = Backoff::new();
     let mut address = args
@@ -586,6 +700,72 @@ mod tests {
         assert!(parse_args(&argv(&["--nope"])).is_err());
         // 子命令重复。
         assert!(parse_args(&argv(&["stdio", "connect", "127.0.0.1:1"])).is_err());
+    }
+
+    // ---- LLM prompt 通道旗标 ----
+
+    #[test]
+    fn llm_defaults_by_mode() {
+        // stdio 默认 off；默认无 gpio。
+        let args = parse_ok(&[]);
+        assert_eq!(args.llm, LlmMode::Off);
+        assert!(args.gpio.is_none());
+
+        // connect 默认 router；prompt 地址按 connect 主机 + 7422 推导。
+        let args = parse_ok(&["connect", "10.0.0.5:7421"]);
+        assert_eq!(args.llm, LlmMode::Router);
+        assert_eq!(args.effective_prompt_addr(), "10.0.0.5:7422");
+        let args = parse_ok(&["--router-addr", "127.0.0.1:7421"]);
+        assert_eq!(args.effective_prompt_addr(), "127.0.0.1:7422");
+    }
+
+    #[test]
+    fn llm_flag_combinations() {
+        let args = parse_ok(&["connect", "127.0.0.1:7421", "--llm", "dsh"]);
+        assert_eq!(args.llm, LlmMode::Dsh);
+        let args = parse_ok(&["connect", "127.0.0.1:7421", "--llm", "off"]);
+        assert_eq!(args.llm, LlmMode::Off);
+        let args = parse_ok(&[
+            "connect",
+            "127.0.0.1:7421",
+            "--llm",
+            "router",
+            "--prompt-addr",
+            "127.0.0.1:8400",
+        ]);
+        assert_eq!(args.effective_prompt_addr(), "127.0.0.1:8400");
+
+        // stdio 模式拒绝 router / dsh；非法取值与非法组合报错。
+        assert!(parse_err(&["--llm", "router"]).contains("router"));
+        assert!(parse_err(&["--llm", "dsh"]).contains("dsh"));
+        assert!(parse_err(&["connect", "127.0.0.1:7421", "--llm", "nope"]).contains("--llm"));
+        assert!(parse_err(&["--llm", "nope"]).contains("--llm"));
+        assert!(
+            parse_err(&[
+                "connect",
+                "127.0.0.1:7421",
+                "--llm",
+                "off",
+                "--prompt-addr",
+                "127.0.0.1:7422"
+            ])
+            .contains("--prompt-addr")
+        );
+        assert!(parse_err(&["--prompt-addr", "127.0.0.1:7422"]).contains("--prompt-addr"));
+        assert!(parse_err(&["connect", "127.0.0.1:7421", "--prompt-addr", "bad"]).contains("非法"));
+    }
+
+    #[test]
+    fn gpio_flag_and_family_alias() {
+        let args = parse_ok(&["connect", "127.0.0.1:7421", "--gpio", "stm32f4"]);
+        assert_eq!(args.gpio, Some(ChipFamily::Stm32F4));
+        // --family 是 --gpio 的兼容别名（stdio 下同样可用）。
+        let args = parse_ok(&["--family", "esp32"]);
+        assert_eq!(args.gpio, Some(ChipFamily::Esp32));
+        let args = parse_ok(&["--gpio", "stm32f1"]);
+        assert_eq!(args.gpio, Some(ChipFamily::Stm32F1));
+        assert!(parse_err(&["--gpio", "avr"]).contains("--gpio"));
+        assert!(parse_err(&["--family", "avr"]).contains("--family"));
     }
 
     // ---- connect 模式阶段文案 ----

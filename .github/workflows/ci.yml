@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test（宿主全量测试，无需硬件/网络/broker）
+        run: cargo test --workspace
+
+      # 风格告警不阻断（当前 sekai-router 有 5 条既有 clippy 告警）；
+      # 编译错误仍会失败。
+      - name: Clippy（告警不阻断）
+        run: cargo clippy --workspace --all-targets
+
+  plugin:
+    name: DSH plugin smoke（无 Rust 依赖）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/sekai-dsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 语法检查
+        run: node --check lib/index.js && node --check lib/shared.js && node --check lib/router.js && node --check lib/worker.js && node --check scripts/smoke.mjs
+
+      - name: 冒烟（假 serve/假 worker 驱动，14 个断言组）
+        run: node scripts/smoke.mjs

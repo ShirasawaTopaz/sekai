@@ -8,8 +8,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use sekai_router::agent::AgentConfig;
-use sekai_router::control::{CommandRequest, CommandResult};
-use sekai_router::gateway::{GatewayError, GatewayHandle, WorkerGateway};
+use sekai_router::control::CommandRequest;
+use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
 use sekai_router::llm::{ChatClient, ChatRequest, ChatResponse, LlmError, Usage};
 use sekai_router::session::{Session, SessionConfig, SessionMessage};
 use sekai_router::tools::Policy;
@@ -53,8 +53,13 @@ impl WorkerGateway for FakeGateway {
         self.workers.clone()
     }
 
-    fn call(&mut self, _request: CommandRequest) -> Result<CommandResult, GatewayError> {
-        Err(GatewayError::new("worker_not_found", "会话测试不执行命令"))
+    fn submit(&mut self, _request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(Err(GatewayError::new(
+            "worker_not_found",
+            "会话测试不执行命令",
+        )));
+        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
@@ -277,4 +282,53 @@ fn blank_input_is_ignored() {
     let mut session = session(ScriptedChat::one(text_response("unused")));
     assert!(session.execute("").is_empty());
     assert!(session.execute("   ").is_empty());
+}
+
+// ---- prompt 通道 hub 同步 ----
+
+/// 会话把网关与策略同步进 prompt hub：/policy 变更即时可见；
+/// /link tcp 后 hub 网关就位（run_prompt 从 not_linked 变为 no_workers）。
+#[test]
+fn session_syncs_policy_and_gateway_into_prompt_hub() {
+    use sekai_router::prompt_server::{self, PromptCore};
+
+    let mut session = session(ScriptedChat::one(text_response("unused")));
+    let hub = Arc::new(PromptCore::new(
+        ScriptedChat::one(text_response("unused")),
+        Policy::default(),
+        AgentConfig {
+            model: String::from("deepseek-flash"),
+            max_steps: 1,
+            ddl_ms: 1_000,
+            timeout_ms: None,
+            temperature: 0.0,
+            max_tokens: 4_096,
+        },
+        TraceWriter::disabled(),
+    ));
+    session.set_prompt_hub(Arc::clone(&hub));
+
+    // 策略同步：/policy 切换后 hub 策略快照随之更新。
+    assert!(!hub.policy().allow_write);
+    session.execute("/policy allow-write on");
+    assert!(hub.policy().allow_write);
+
+    // 网关同步：未建链 → not_linked；/link tcp 后 → no_workers
+    // （tcp 监听建立但无 Worker 连入，hub 已能看到网关）。
+    let error = hub.run_prompt("hi", None).expect_err("未建链应报错");
+    assert_eq!(error.code, prompt_server::CODE_NOT_LINKED);
+    session.execute("/link tcp 127.0.0.1:0");
+    let error = hub.run_prompt("hi", None).expect_err("无 Worker 应报错");
+    assert_eq!(error.code, prompt_server::CODE_NO_WORKERS);
+
+    // /link off 后回到 not_linked。
+    session.execute("/link off");
+    let error = hub.run_prompt("hi", None).expect_err("关链后应报错");
+    assert_eq!(error.code, prompt_server::CODE_NOT_LINKED);
+
+    // set_gateway 注入同样同步：注入带 Worker 的网关后可走到 LLM 并返回回答。
+    session.set_gateway(fake_handle(vec![worker("pc-1", true)]), "测试链路");
+    let result = hub.run_prompt("hi", None).expect("注入网关后应成功");
+    assert_eq!(result.answer, "unused");
+    assert_eq!(result.status, "completed");
 }

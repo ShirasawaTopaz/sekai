@@ -34,7 +34,7 @@ use sekai_gpio::pin::PinId;
 use sekai_gpio::{ChipFamily, Level, Port};
 use sekai_router::agent::{Agent, AgentConfig, AgentOutcome, AgentStatus};
 use sekai_router::control::{CommandKind, CommandRequest, CommandResult};
-use sekai_router::gateway::{GatewayError, WorkerGateway};
+use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
 use sekai_router::http::StdHttpClient;
 use sekai_router::llm::{
     ChatClient, ChatRequest, ChatResponse, LlmClient, LlmConfig, LlmError, Message, ToolChoice,
@@ -149,24 +149,29 @@ impl WorkerGateway for LoopbackGateway {
         self.harness.borrow().server().workers()
     }
 
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         self.calls.borrow_mut().push(request.clone());
-        let mut harness = self.harness.borrow_mut();
-        let cmd_id = harness
-            .try_submit(request.clone())
-            .map_err(|error| GatewayError::from_control(&error))?;
-        // 内存 harness 用 ManualClock 推进命令超时：给足预算，正常路径会提前返回。
-        let timeout_ms = request.timeout_ms.unwrap_or(60_000);
-        let result = harness
-            .run_until_command(cmd_id, timeout_ms)
-            .ok_or_else(|| {
-                GatewayError::new(
-                    "timeout",
-                    format!("命令 {cmd_id} 在 {timeout_ms}ms 内没有最终事件"),
-                )
-            })?;
-        self.results.borrow_mut().push(result.clone());
-        Ok(result)
+        let result = (|| {
+            let mut harness = self.harness.borrow_mut();
+            let cmd_id = harness
+                .try_submit(request.clone())
+                .map_err(|error| GatewayError::from_control(&error))?;
+            // 内存 harness 用 ManualClock 推进命令超时：给足预算，正常路径会提前返回。
+            let timeout_ms = request.timeout_ms.unwrap_or(60_000);
+            let result = harness
+                .run_until_command(cmd_id, timeout_ms)
+                .ok_or_else(|| {
+                    GatewayError::new(
+                        "timeout",
+                        format!("命令 {cmd_id} 在 {timeout_ms}ms 内没有最终事件"),
+                    )
+                })?;
+            self.results.borrow_mut().push(result.clone());
+            Ok(result)
+        })();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(result);
+        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
@@ -232,6 +237,7 @@ fn test_policy() -> Policy {
         allow_tasks: true,
         allow_admin: false,
         worker_filter: None,
+        deny_llm_relay: false,
     }
 }
 

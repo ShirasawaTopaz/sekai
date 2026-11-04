@@ -81,12 +81,71 @@ impl std::error::Error for GatewayError {}
 pub trait WorkerGateway: Send {
     /// 当前Worker快照。
     fn list_workers(&mut self) -> Vec<WorkerInfo>;
-    /// 执行一条命令并等待最终事件。
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError>;
+    /// 提交一条命令并立即返回等待回执（不等待最终事件）。
+    ///
+    /// 实现必须快速返回：等待最终事件由调用方持 [`CommandReceipt`] 进行，
+    /// 以便在 [`GatewayHandle`] 形态下**锁外等待**（见 [`CommandReceipt`]）。
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError>;
+    /// 执行一条命令并等待最终事件（默认实现：提交后等待回执）。
+    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
+        self.submit(request)?.wait()
+    }
     /// 等待链路就绪（连接 + 订阅成功）。
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError>;
     /// 链路是否就绪。
     fn is_ready(&self) -> bool;
+}
+
+/// 已提交命令的等待回执（[`WorkerGateway::submit`] 返回）。
+///
+/// `wait` 在**不持有**网关互斥锁的情况下等待最终事件——这是有意设计：
+/// 长命令（Task 可能持续数十秒）等待期间不得占用 [`GatewayHandle`] 的锁。
+/// 否则「命令期间反向上行 prompt」的形态（Worker 的 `pc.ask` 任务等待
+/// Router prompt 通道应答，而 prompt 通道又要经同一网关查 Worker 列表）
+/// 会形成分布式死锁：命令等 prompt、prompt 等锁、锁等命令。
+pub struct CommandReceipt {
+    reply: Receiver<Result<CommandResult, GatewayError>>,
+    budget_ms: u64,
+    /// 链路断开错误文案里的 IO 线程名（如 "MQTT"/"直连"）。
+    io_name: &'static str,
+}
+
+impl CommandReceipt {
+    /// 构造：`budget_ms` 为等待预算，`io_name` 用于 Disconnected 错误文案。
+    pub fn new(
+        reply: Receiver<Result<CommandResult, GatewayError>>,
+        budget_ms: u64,
+        io_name: &'static str,
+    ) -> Self {
+        Self {
+            reply,
+            budget_ms,
+            io_name,
+        }
+    }
+
+    /// 等待预算（毫秒）。
+    pub fn budget_ms(&self) -> u64 {
+        self.budget_ms
+    }
+
+    /// 阻塞等待最终事件（预算内）；超时/断链映射为网关错误。
+    pub fn wait(self) -> Result<CommandResult, GatewayError> {
+        match self
+            .reply
+            .recv_timeout(Duration::from_millis(self.budget_ms))
+        {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(GatewayError::new(
+                "timeout",
+                "等待Worker最终事件超时（IO 线程未在预算内回复）",
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err(GatewayError::new(
+                "link_lost",
+                format!("{} IO 线程已退出", self.io_name),
+            )),
+        }
+    }
 }
 
 /// MQTT 网关配置。
@@ -149,8 +208,10 @@ pub(crate) enum GatewayOp {
 
 /// 会话持有的网关句柄：`Arc<Mutex<Box<dyn WorkerGateway>>>`。
 ///
-/// REPL 会话在链路切换时替换盒内网关；多轮 Agent 各持一份克隆，
-/// 经同一把锁串行访问（Agent 本身是同步调用，锁只在调用边界短暂持有）。
+/// REPL 会话在链路切换时替换盒内网关；多轮 Agent 各持一份克隆。锁只在
+/// **提交**（[`WorkerGateway::submit`]）与快照读取时短暂持有；对最终事件
+/// 的等待发生在锁外（[`CommandReceipt::wait`]），因此长命令不会阻塞其他
+/// 调用方（REPL/serve/prompt 通道可并发进出同一网关）。
 pub type GatewayHandle = Arc<Mutex<Box<dyn WorkerGateway>>>;
 
 /// 装箱网关委托（CLI/会话层用 `Box<dyn WorkerGateway>` 统一三种链路形态）。
@@ -159,8 +220,8 @@ impl WorkerGateway for Box<dyn WorkerGateway> {
         (**self).list_workers()
     }
 
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
-        (**self).call(request)
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        (**self).submit(request)
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
@@ -179,9 +240,11 @@ impl WorkerGateway for GatewayHandle {
         gateway.list_workers()
     }
 
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        // 锁只覆盖提交；默认 `call = submit + wait` 因此天然变成
+        // 「锁内提交、锁外等待」，长命令不再占用网关互斥锁。
         let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        gateway.call(request)
+        gateway.submit(request)
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {
@@ -339,7 +402,7 @@ impl WorkerGateway for MqttGateway {
         self.snapshot().workers
     }
 
-    fn call(&mut self, mut request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, mut request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         if request.ddl_ms == 0 {
             request.ddl_ms = self.config.default_ddl_ms.max(1);
         }
@@ -357,16 +420,7 @@ impl WorkerGateway for MqttGateway {
                 reply: reply_tx,
             })
             .map_err(|_| GatewayError::new("link_lost", "MQTT IO 线程已退出"))?;
-        match reply_rx.recv_timeout(Duration::from_millis(budget)) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(GatewayError::new(
-                "timeout",
-                "等待Worker最终事件超时（IO 线程未在预算内回复）",
-            )),
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(GatewayError::new("link_lost", "MQTT IO 线程已退出"))
-            }
-        }
+        Ok(CommandReceipt::new(reply_rx, budget, "MQTT"))
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {

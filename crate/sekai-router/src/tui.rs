@@ -144,12 +144,11 @@ fn run_fullscreen<C: crate::llm::ChatClient + Clone>(session: Session<C>) -> io:
         let mut pane_height = 1;
         terminal.draw(|frame| pane_height = render(frame, &app))?;
         app.scroll.page = pane_height.max(1);
-        if event::poll(Duration::from_millis(TICK_MS))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Release {
-                    app.on_key(key);
-                }
-            }
+        if event::poll(Duration::from_millis(TICK_MS))?
+            && let Event::Key(key) = event::read()?
+            && key.kind != KeyEventKind::Release
+        {
+            app.on_key(key);
         }
         if app.exit_code.is_some() {
             break;
@@ -232,8 +231,8 @@ impl<C: crate::llm::ChatClient + Clone> App<C> {
             KeyCode::PageDown => self.scroll.down(self.scroll.page),
             KeyCode::Up => self.scroll.up(1),
             KeyCode::Down => self.scroll.down(1),
-            KeyCode::Home => self.scroll.to_top(self.log.len()),
-            KeyCode::End => self.scroll.to_bottom(),
+            KeyCode::Home => self.scroll.jump_top(self.log.len()),
+            KeyCode::End => self.scroll.jump_bottom(),
             KeyCode::F(10) => self.exit_code = Some(0),
             KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match c.to_ascii_lowercase() {
@@ -387,12 +386,12 @@ impl ScrollState {
     }
 
     /// 跳到日志顶部（`total` 为当前日志行数）。
-    fn to_top(&mut self, total: usize) {
+    fn jump_top(&mut self, total: usize) {
         self.offset = total.saturating_sub(1);
     }
 
     /// 回到底部并恢复跟随。
-    fn to_bottom(&mut self) {
+    fn jump_bottom(&mut self) {
         self.offset = 0;
     }
 }
@@ -646,15 +645,15 @@ mod tests {
     #[test]
     fn scroll_to_top_uses_total_and_bottom_resumes() {
         let mut scroll = ScrollState::new();
-        scroll.to_top(10);
+        scroll.jump_top(10);
         assert_eq!(scroll.offset, 9);
         assert!(!scroll.following());
         // 日志极短时回到底部等价于跟随。
-        scroll.to_top(1);
+        scroll.jump_top(1);
         assert_eq!(scroll.offset, 0);
         assert!(scroll.following());
-        scroll.to_top(10);
-        scroll.to_bottom();
+        scroll.jump_top(10);
+        scroll.jump_bottom();
         assert!(scroll.following());
     }
 
@@ -681,7 +680,7 @@ mod tests {
         log.push("行10");
         assert_eq!(pick(&log, &scroll), ["行5", "行6", "行7"]);
         // 跟随时则被新行推着走。
-        scroll.to_bottom();
+        scroll.jump_bottom();
         assert_eq!(pick(&log, &scroll), ["行8", "行9", "行10"]);
     }
 

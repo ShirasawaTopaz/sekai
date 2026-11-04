@@ -6,6 +6,7 @@ members = [
 
 package.version = "0.1.0"
 package.edition = "2024"
+package.license = "Apache-2.0"
 
 # esp-radio 文档要求：WiFi blob 在 debug 构建下至少 opt-level 2。固件构建
 # 使用 dev profile 时仍然要有可用性能，因此这里单独提高 esp-radio 的优化级别。

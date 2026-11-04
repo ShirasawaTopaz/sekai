@@ -4,7 +4,7 @@
 //! `Loop::pump_once` 驱动真实 `Runtime`。覆盖：
 //!
 //! - Hello → Task Stdin → Accepted/Started/Completed 全流程；
-//! - ToolCall 流程（含 sekai-gpio virtual 后端与内置工具）；
+//! - ToolCall 流程（PC agent pc.* 工具、gpio opt-in 与内置工具）；
 //! - 非法帧拒绝（解码层静默丢弃 + 可关联 id 的 Failed 回执 + 链路层拒绝）；
 //! - 断线重连后的 retained-Hello 语义与 boot_id/seq 连续性；
 //! - Stdin 去重（重放最终事件）与 sleep 任务的多周期推进。
@@ -78,14 +78,22 @@ fn hello_then_task_full_flow() {
         hello.tasks
     );
     assert!(hello.tasks.iter().any(|name| name == "sleep"));
-    // 能力声明：内置工具 + virtual GPIO 全套工具。
-    for name in GPIO_TOOL_NAMES {
+    assert!(hello.tasks.iter().any(|name| name == "pc.job"));
+    assert!(hello.tasks.iter().any(|name| name == "pc.ask"));
+    // 能力声明：PC agent 工具 + 内置工具；默认（无 --gpio）不含 gpio.*。
+    for name in ["pc.exec", "pc.read", "pc.write", "pc.ls", "pc.info"] {
         assert!(
             hello.tools.iter().any(|tool| tool == name),
             "Hello 缺少工具 {name}"
         );
     }
     assert!(hello.tools.iter().any(|tool| tool == "sekai.time"));
+    for name in GPIO_TOOL_NAMES {
+        assert!(
+            !hello.tools.iter().any(|tool| tool == name),
+            "默认不应注册 gpio 工具 {name}"
+        );
+    }
     lp.assert_router_idle();
 
     // Router 下发 Task Stdin（echo 任务）。
@@ -111,12 +119,25 @@ fn hello_then_task_full_flow() {
     lp.assert_router_idle();
 }
 
-// ---- ToolCall 流程（virtual GPIO + 内置工具） ----
+// ---- ToolCall 流程（gpio opt-in：--gpio 后含 gpio.*；PC agent 工具见下） ----
 
 #[test]
 fn tool_call_flow_with_virtual_gpio() {
-    let mut lp = Loop::new("pc-tools", 11);
-    let _hello = lp.router_read();
+    // gpio 需显式 opt-in（等价 CLI --gpio esp32）。
+    let mut lp = Loop::new_with_gpio("pc-tools", 11);
+    let hello_frame = lp.router_read();
+    let hello_out = decode_stdout(&hello_frame);
+    let hello = Hello::decode(&hello_out.payload).expect("Hello 载荷解码失败");
+    for name in GPIO_TOOL_NAMES {
+        assert!(
+            hello.tools.iter().any(|tool| tool == name),
+            "--gpio 后应含工具 {name}"
+        );
+    }
+    assert!(
+        hello.tools.iter().any(|tool| tool == "pc.exec"),
+        "agent 工具仍在"
+    );
 
     // gpio.config：把 IO4 配置为输入。
     lp.router
@@ -171,6 +192,57 @@ fn tool_call_flow_with_virtual_gpio() {
     // + nope 的 Failed(6) + time(7,8)。
     let last = decode_stdout(&frames[1]);
     assert_eq!(last.seq, 8);
+    lp.assert_router_idle();
+}
+
+// ---- PC agent 工具经直连链路（pc.exec / pc.write → pc.read） ----
+
+#[test]
+fn pc_agent_tools_flow_over_link() {
+    let mut lp = Loop::new("pc-agent", 21);
+    let _hello = lp.router_read();
+
+    // pc.exec：跨平台 echo，exit=0 + 输出。
+    lp.router
+        .write_frame(&tool_stdin(31, "pc.exec", b"echo hello-pc"))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Completed]);
+    let completed = decode_stdout(&frames[1]);
+    assert_eq!(completed.cmd_id, 31);
+    let text = String::from_utf8(completed.payload.clone()).expect("exec 结果应为 UTF-8");
+    assert!(text.starts_with("exit=0\n"), "{text}");
+    assert!(text.contains("hello-pc"), "{text}");
+
+    // pc.write → pc.read 往返（tempdir 测试自建自清）。
+    let dir = std::env::temp_dir().join(format!("sekai-worker-flow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("创建临时目录失败");
+    let file = dir.join("note.txt");
+    let path = file.to_string_lossy().into_owned();
+
+    lp.router
+        .write_frame(&tool_stdin(
+            32,
+            "pc.write",
+            format!("{path}\nhello-file\n").as_bytes(),
+        ))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Completed]);
+    let completed = decode_stdout(&frames[1]);
+    assert_eq!(completed.payload, b"written=11", "hello-file\\n 共 11 字节");
+
+    lp.router
+        .write_frame(&tool_stdin(33, "pc.read", format!("{path}\n").as_bytes()))
+        .expect("写链路失败");
+    let frames = lp.router_read_n(2);
+    assert_eq!(phases(&frames), [Phase::Accepted, Phase::Completed]);
+    let completed = decode_stdout(&frames[1]);
+    assert_eq!(completed.payload, b"hello-file\n");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // seq 严格递增：Hello(1) + exec(2,3) + write(4,5) + read(6,7)。
+    assert_eq!(completed.seq, 7);
     lp.assert_router_idle();
 }
 

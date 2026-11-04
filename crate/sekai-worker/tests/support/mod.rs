@@ -8,7 +8,7 @@ use sekai::sekai_runtime::RuntimeConfig;
 use sekai::sekai_task::TaskRegistry;
 use sekai::sekai_tool::ToolRegistry;
 use sekai_gpio::ChipFamily;
-use sekai_worker::capability::host_registries;
+use sekai_worker::capability::{LlmMode, agent_registries, agent_registries_for};
 use sekai_worker::host::WorkerHost;
 use sekai_worker::link::{Link, MemoryLink, memory_pair};
 
@@ -62,10 +62,33 @@ impl Clock for ManualClock {
 /// 测试用的固定基准墙上时间（2025-06-01 附近的整毫秒）。
 pub const BASE_UNIX_MS: u64 = 1_748_736_000_000;
 
-/// 构造一个带 virtual GPIO + echo/sleep 任务的 WorkerHost。
+/// 构造默认能力（PC agent：pc.* 工具 + echo/sleep/pc.job/pc.ask 任务，
+/// **无 gpio**，对齐 CLI 默认）的 WorkerHost。
 pub fn test_host(worker_id: &str, boot_id: u64, clock: ManualClock) -> WorkerHost<ManualClock> {
-    let (tasks, tools): (TaskRegistry, ToolRegistry) =
-        host_registries(ChipFamily::Esp32).expect("宿主能力注册失败");
+    build_host(worker_id, boot_id, clock, false)
+}
+
+/// 构造带 gpio opt-in（等价 CLI `--gpio esp32`）的 WorkerHost：
+/// agent 能力之上追加 gpio.* 工具。
+pub fn test_host_with_gpio(
+    worker_id: &str,
+    boot_id: u64,
+    clock: ManualClock,
+) -> WorkerHost<ManualClock> {
+    build_host(worker_id, boot_id, clock, true)
+}
+
+fn build_host(
+    worker_id: &str,
+    boot_id: u64,
+    clock: ManualClock,
+    gpio: bool,
+) -> WorkerHost<ManualClock> {
+    let (tasks, tools): (TaskRegistry, ToolRegistry) = if gpio {
+        agent_registries_for(None, LlmMode::Off, Some(ChipFamily::Esp32)).expect("宿主能力注册失败")
+    } else {
+        agent_registries(None).expect("宿主能力注册失败")
+    };
     let mut config = RuntimeConfig::new(worker_id, boot_id);
     config.firmware = String::from("0.1.0-test");
     WorkerHost::new(config, clock, DeviceList::new(), tasks, tools).expect("WorkerHost 构造失败")
@@ -82,12 +105,26 @@ pub struct Loop {
 }
 
 impl Loop {
+    /// 默认能力（agent，无 gpio）的链路与宿主。
+    pub fn new(worker_id: &str, boot_id: u64) -> Self {
+        Self::build(worker_id, boot_id, false)
+    }
+
+    /// gpio opt-in（`--gpio` 等价）的链路与宿主。
+    pub fn new_with_gpio(worker_id: &str, boot_id: u64) -> Self {
+        Self::build(worker_id, boot_id, true)
+    }
+
     /// 建立链路并完成 link_up；Hello 首帧由 [`WorkerHost::on_link_up`] 产出，
     /// 直接写入链路供测试从 Router 端读取。
-    pub fn new(worker_id: &str, boot_id: u64) -> Self {
+    fn build(worker_id: &str, boot_id: u64, gpio: bool) -> Self {
         let clock = ManualClock::new(1_000, BASE_UNIX_MS);
         let (router, mut worker_link) = memory_pair();
-        let mut host = test_host(worker_id, boot_id, clock.clone());
+        let mut host = if gpio {
+            test_host_with_gpio(worker_id, boot_id, clock.clone())
+        } else {
+            test_host(worker_id, boot_id, clock.clone())
+        };
         let frames = host
             .on_link_up(sekai::sekai_device_list::Endpoint::new("router", 7421).unwrap())
             .expect("link_up 失败");

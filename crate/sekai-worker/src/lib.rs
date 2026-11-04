@@ -9,8 +9,11 @@
 //! - 运行时：驱动 [`sekai::sekai_runtime::Runtime`] 执行 Task/ToolCall，
 //!   适配层 [`host::WorkerHost`] 在进程内合成最小虚拟 broker，使 Runtime 的
 //!   boot_id/seq/去重/Hello retained 语义在直连承载下原样生效。
-//! - 能力：PC Worker 通过 `sekai-gpio` 的 virtual 后端等宿主工具对外声明能力
-//!   （见 [`capability`]）。
+//! - 能力：PC Worker 默认注册 **PC agent 能力**（`pc.*` 工具/任务，见
+//!   [`capability`]）；virtual GPIO 改为 `--gpio` 显式 opt-in。
+//! - LLM prompt 通道：`pc.ask` 经 [`llm_channel`] 的带外传输（TCP JSONL 到
+//!   Router ingress，或 stdin/stdout JSONL 经 DSH 插件中转）取回回答；
+//!   JSONL 编解码用本 crate 的零依赖子集 [`mini_json`]。
 //!
 //! 典型用法：
 //!
@@ -21,11 +24,17 @@
 pub mod capability;
 pub mod host;
 pub mod link;
+pub mod llm_channel;
+pub mod mini_json;
 
 pub use host::{HostError, WorkerHost};
 pub use link::{
     Backoff, FrameDecoder, Link, LinkError, MemoryLink, StdioLink, TcpLink, connect_hint,
     memory_pair, memory_pair_with_timeout,
+};
+pub use llm_channel::{
+    DshPromptChannel, LineIo, PromptError, PromptTransport, RouterPromptChannel, StdioLineIo,
+    ask_timeout_ms,
 };
 
 /// crate 版本。

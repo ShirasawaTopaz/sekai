@@ -10,11 +10,11 @@
       name: '@sekai/dsh-plugin/router'
       config:
         enabled: true
-        # 开发机默认：指向本仓库构建产物；换机器请覆盖本行 config
-        # （或让 sekai-router 出现在 PATH / 设置 SEKAI_ROUTER_BIN）。
-        routerBin: D:/Source/seika/sekai/target/release/sekai-router.exe
+        # 二进制不写死路径：解析顺序 config routerBin > SEKAI_ROUTER_BIN > PATH。
+        # 构建后（cargo build --release -p sekai-router）把 target/release 加入
+        # PATH、设环境变量，或在 profile 里覆盖 routerBin 为绝对路径。
     - id: sekai-worker
       name: '@sekai/dsh-plugin/worker'
       config:
         enabled: true
-        workerBin: D:/Source/seika/sekai/target/release/sekai-worker.exe
+        # 同理：workerBin > SEKAI_WORKER_BIN > PATH 上的 sekai-worker。

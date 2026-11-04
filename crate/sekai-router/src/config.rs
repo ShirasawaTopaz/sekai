@@ -16,6 +16,7 @@
 //! | SEKAI_MQTT_USERNAME / PASSWORD | - | MQTT 凭据 |
 //! | SEKAI_TOPIC_ROOT | - | 主题根 |
 //! | SEKAI_ROUTER_TRACE | - | JSONL trace 路径 |
+//! | SEKAI_PROMPT_ADDR | - | prompt ingress 监听地址（HOST:PORT 或 off） |
 //! | SEKAI_MAX_STEPS / SEKAI_DDL_MS / SEKAI_TIMEOUT_MS / SEKAI_WAIT_WORKER_MS / SEKAI_HTTP_TIMEOUT_MS | - | 调参 |
 
 use std::collections::HashMap;
@@ -80,6 +81,10 @@ pub const ENV_TIMEOUT_MS: &str = "SEKAI_TIMEOUT_MS";
 pub const ENV_WAIT_WORKER_MS: &str = "SEKAI_WAIT_WORKER_MS";
 /// 环境变量名：HTTP 超时。
 pub const ENV_HTTP_TIMEOUT_MS: &str = "SEKAI_HTTP_TIMEOUT_MS";
+/// 环境变量名：prompt ingress 监听地址（HOST:PORT 或 off）。
+pub const ENV_PROMPT_ADDR: &str = "SEKAI_PROMPT_ADDR";
+/// 默认 prompt ingress 监听地址（交互与 --serve 模式；批处理默认 off）。
+pub const DEFAULT_PROMPT_ADDR: &str = "127.0.0.1:7422";
 
 /// Worker 链路类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,6 +239,12 @@ pub struct Config {
     /// 驱动）；不调用 LLM，不需要 API key，与 --goal/--goal-file/--tui/
     /// -i/--dry-run 互斥。
     pub serve: bool,
+    /// prompt ingress 监听地址（HOST:PORT）；None = 关闭。
+    ///
+    /// 默认：交互（REPL/TUI）与 --serve 模式取 [`DEFAULT_PROMPT_ADDR`]，
+    /// 批处理（--goal）模式默认 off（进程短命，不常驻通道）；
+    /// `--prompt-addr off` / `SEKAI_PROMPT_ADDR=off` 显式关闭。
+    pub prompt_addr: Option<String>,
     /// trace 路径。
     pub trace_path: Option<PathBuf>,
 }
@@ -270,6 +281,7 @@ impl fmt::Debug for Config {
             .field("interactive", &self.interactive)
             .field("tui", &self.tui)
             .field("serve", &self.serve)
+            .field("prompt_addr", &self.prompt_addr)
             .field("trace_path", &self.trace_path)
             .finish()
     }
@@ -374,6 +386,9 @@ impl Config {
             interactive: false,
             tui: false,
             serve: false,
+            // 环境变量原始值（可为 off）；apply_args 里统一校验并按运行形态
+            // 决定默认值。
+            prompt_addr: env_string(env, &[ENV_PROMPT_ADDR]),
             trace_path: env_string(env, &[ENV_TRACE]).map(PathBuf::from),
         })
     }
@@ -492,6 +507,15 @@ impl Config {
                 "--json" => self.json = true,
                 "--dry-run" => self.dry_run = true,
                 "--serve" => self.serve = true,
+                "--prompt-addr" => {
+                    let value = take_value("--prompt-addr")?;
+                    if value.trim().is_empty() {
+                        return Err(ConfigError::InvalidArg(String::from(
+                            "--prompt-addr 不能为空（HOST:PORT 或 off）",
+                        )));
+                    }
+                    self.prompt_addr = Some(value);
+                }
                 "-i" | "--interactive" => self.interactive = true,
                 "--tui" => {
                     // 全屏 TUI 蕴含交互会话；其余交互语义（goal 互斥等）复用
@@ -559,6 +583,25 @@ impl Config {
             // 无 goal 且非 dry-run/serve：进入交互 REPL，而非报错。
             self.interactive = true;
         }
+        // prompt ingress 地址：显式值（CLI 覆盖环境变量）校验后生效；
+        // 未显式给出时按运行形态取默认（交互/--serve 开、批处理 off）。
+        // 运行形态（serve/interactive）到此处已定。
+        match self.prompt_addr.take().as_deref() {
+            Some("off") | Some("OFF") => {
+                self.prompt_addr = None;
+            }
+            Some(text) => {
+                validate_prompt_addr(text)?;
+                self.prompt_addr = Some(String::from(text));
+            }
+            None => {
+                self.prompt_addr = if self.serve || self.interactive {
+                    Some(String::from(DEFAULT_PROMPT_ADDR))
+                } else {
+                    None
+                };
+            }
+        }
         if !self.dry_run
             && !self.interactive
             && !self.serve
@@ -621,6 +664,7 @@ pub fn usage() -> String {
   sekai-router --serve [选项]           无头 JSONL 服务模式：stdin 读请求、
                                         stdout 只写 JSONL（DSH 插件驱动；
                                         不调用 LLM，不需要 API key）
+                                        --prompt-addr 另开 prompt ingress
 
 必需环境变量：
   {ENV_API_KEY}        DeepSeek API key（--dry-run、交互会话与 --serve 除外；也接受 {ENV_API_KEY_ALT}）
@@ -636,6 +680,7 @@ pub fn usage() -> String {
   {ENV_MQTT_PASSWORD}   MQTT 密码
   {ENV_TOPIC_ROOT}      主题根，默认 {DEFAULT_TOPIC_ROOT}
   {ENV_TRACE}           trace JSONL 路径
+  {ENV_PROMPT_ADDR}     prompt ingress 监听地址（HOST:PORT 或 off），默认按运行形态
   {ENV_MAX_STEPS} / {ENV_DDL_MS} / {ENV_TIMEOUT_MS} / {ENV_WAIT_WORKER_MS} / {ENV_HTTP_TIMEOUT_MS}
 
 选项：
@@ -659,6 +704,11 @@ pub fn usage() -> String {
   --allow-write         允许 gpio.config / gpio.write 等写操作
   --allow-tasks         允许下发Worker Task
   --allow-admin         允许 sekai.set_time / sekai.workers.set / sekai.cancel 等管理工具
+  --prompt-addr <HOST:PORT|off>
+                        prompt ingress 监听地址（Worker 经此把 prompt 交给
+                        Router 调 LLM）；默认交互/--serve 模式
+                        {DEFAULT_PROMPT_ADDR}、批处理模式 off；环境变量
+                        {ENV_PROMPT_ADDR} 同义
   --json                stdout 输出单个 JSON 结果
   --dry-run             只连接链路并列出Worker，不调用 LLM
   --serve               无头 JSONL 服务模式（与 --goal/--goal-file/--tui/-i/--dry-run 互斥）
@@ -685,6 +735,30 @@ fn validate_base_url(value: &str) -> Result<(), ConfigError> {
             "base URL 必须以 http:// 或 https:// 开头：{value}"
         )))
     }
+}
+
+/// 校验 prompt ingress 地址：`SocketAddr`（含 `[IPv6]:port`）或
+/// `主机名:端口`（端口 0 放行，运行时展开为实际端口）。
+fn validate_prompt_addr(value: &str) -> Result<(), ConfigError> {
+    if value.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    match value.rsplit_once(':') {
+        Some((host, port)) => {
+            if !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok() {
+                Ok(())
+            } else {
+                Err(invalid_prompt_addr(value))
+            }
+        }
+        None => Err(invalid_prompt_addr(value)),
+    }
+}
+
+fn invalid_prompt_addr(value: &str) -> ConfigError {
+    ConfigError::InvalidArg(format!(
+        "--prompt-addr/SEKAI_PROMPT_ADDR 非法：{value}（应为 HOST:PORT 或 off）"
+    ))
 }
 
 fn parse_u64(name: &str, value: &str) -> Result<u64, ConfigError> {
@@ -923,6 +997,99 @@ mod tests {
                 .apply_args(&args(&["--serve", "--goal-file", "no-such-file.txt"]))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn prompt_addr_defaults_by_frontend_mode() {
+        // 批处理（--goal）：默认 off（进程短命）。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["--goal", "x"])).unwrap();
+        assert_eq!(config.prompt_addr, None);
+        // dry-run（批处理形态）：同样 off。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["--dry-run"])).unwrap();
+        assert_eq!(config.prompt_addr, None);
+        // 交互（默认 / -i / --tui）：默认 127.0.0.1:7422。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&[])).unwrap();
+        assert_eq!(
+            config.prompt_addr.as_deref(),
+            Some(DEFAULT_PROMPT_ADDR),
+            "交互模式应默认开启 prompt 通道"
+        );
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["-i"])).unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some(DEFAULT_PROMPT_ADDR));
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["--tui"])).unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some(DEFAULT_PROMPT_ADDR));
+        // serve：同样默认开启。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["--serve"])).unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some(DEFAULT_PROMPT_ADDR));
+    }
+
+    #[test]
+    fn prompt_addr_cli_and_env_override() {
+        // CLI 显式地址。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&["--prompt-addr", "127.0.0.1:7500"]))
+            .unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some("127.0.0.1:7500"));
+        // 批处理模式也可显式开启。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&["--goal", "x", "--prompt-addr", "0.0.0.0:7422"]))
+            .unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some("0.0.0.0:7422"));
+        // off 显式关闭（覆盖默认）。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&args(&["--prompt-addr", "off"])).unwrap();
+        assert_eq!(config.prompt_addr, None);
+        // 环境变量：地址与 off。
+        let mut map = env();
+        map.insert(
+            String::from(ENV_PROMPT_ADDR),
+            String::from("127.0.0.1:7501"),
+        );
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&[])).unwrap();
+        assert_eq!(config.prompt_addr.as_deref(), Some("127.0.0.1:7501"));
+        let mut map = env();
+        map.insert(String::from(ENV_PROMPT_ADDR), String::from("off"));
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&[])).unwrap();
+        assert_eq!(config.prompt_addr, None);
+        // CLI 覆盖环境变量。
+        let mut map = env();
+        map.insert(
+            String::from(ENV_PROMPT_ADDR),
+            String::from("127.0.0.1:7501"),
+        );
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&["--prompt-addr", "off"])).unwrap();
+        assert_eq!(config.prompt_addr, None);
+    }
+
+    #[test]
+    fn prompt_addr_invalid_values_are_rejected() {
+        for bad in ["127.0.0.1", "host:99999", "abc", ":7422"] {
+            let mut config = Config::from_env_map(&env()).unwrap();
+            let error = config
+                .apply_args(&args(&["--prompt-addr", bad]))
+                .unwrap_err();
+            assert!(
+                matches!(error, ConfigError::InvalidArg(ref text) if text.contains(bad)),
+                "{bad} 应报非法地址，得到 {error:?}"
+            );
+        }
+        // 主机名:端口 与 [IPv6]:端口 放行；端口 0 放行（运行时展开）。
+        for good in ["localhost:7422", "[::1]:7422", "127.0.0.1:0"] {
+            let mut config = Config::from_env_map(&env()).unwrap();
+            config.apply_args(&args(&["--prompt-addr", good])).unwrap();
+            assert_eq!(config.prompt_addr.as_deref(), Some(good));
+        }
     }
 
     #[test]

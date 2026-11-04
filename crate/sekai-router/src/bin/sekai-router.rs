@@ -4,12 +4,16 @@
 //!
 //! - **批处理**（`--goal` / `--goal-file` / `--dry-run`）：建链路 → 等 Worker
 //!   →（可选 dry-run 输出 Worker）→ 构造 LLM 客户端与 agent → 执行目标
-//!   → 输出结果/退出码。链路由 `--link mqtt|stdio|tcp` 选择。
+//!   → 输出结果/退出码。链路由 `--link mqtt|stdio|tcp` 选择。不起 prompt
+//!   ingress（进程短命）。
 //! - **交互会话**（无 `--goal` 或 `-i`）：行式 REPL（`/link` 建链路、
 //!   `/workers` 观察、`/wait` 等上线，非 `/` 输入即目标，多轮执行）。
+//!   默认另起 prompt ingress（`--prompt-addr`，默认 127.0.0.1:7422）。
 //! - **无头服务**（`--serve`）：stdin 读 JSONL 请求、stdout 只写 JSONL
-//!   （协议 v1），供 DSH 插件子进程驱动；不调用 LLM。
+//!   （协议 v1），供 DSH 插件子进程驱动；`prompt` 方法（v1.1 additive）
+//!   与 prompt ingress 由 serve 内部驱动。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentOutcome, AgentStatus};
@@ -20,6 +24,7 @@ use sekai_router::json::Json;
 use sekai_router::link_builder::{self, LinkOptions};
 use sekai_router::llm::{LlmClient, LlmConfig};
 use sekai_router::prompt::worker_summary;
+use sekai_router::prompt_server::{self, PromptCore};
 use sekai_router::serve::{self, ServeConfig};
 use sekai_router::session::{Session, SessionConfig};
 use sekai_router::tools::{Policy, workers_json};
@@ -88,12 +93,15 @@ fn run_config(config: Config) -> i32 {
 // ---- 网关构造（按链路类型） ----
 
 /// CLI 旗标 → 服务端策略（批处理 / 交互 / serve 共用）。
+///
+/// `deny_llm_relay` 是 prompt 通道运行时内部位，CLI 不暴露、恒为 false。
 fn policy_from(config: &Config) -> Policy {
     Policy {
         allow_write: config.allow_write,
         allow_tasks: config.allow_tasks,
         allow_admin: config.allow_admin,
         worker_filter: config.worker_filter.clone(),
+        deny_llm_relay: false,
     }
 }
 
@@ -214,7 +222,6 @@ fn run_batch(config: Config, trace: &mut TraceWriter) -> i32 {
         return 0;
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
     let http = StdHttpClient::new();
     if http.https_helper_name().is_none() && config.base_url.starts_with("https://") {
         eprintln!(
@@ -223,30 +230,14 @@ fn run_batch(config: Config, trace: &mut TraceWriter) -> i32 {
         );
         return 4;
     }
-    let llm_config = LlmConfig {
-        base_url: config.base_url.clone(),
-        model: config.model.clone(),
-        api_key,
-        max_tokens: 4096,
-        temperature: 0.0,
-        timeout: Duration::from_millis(config.http_timeout_ms),
-        retry_base_ms: 1_000,
-        max_retries: 3,
-    };
+    let llm_config = build_llm_config(&config);
     let llm = LlmClient::new(Box::new(http), llm_config);
     let policy = policy_from(&config);
     eprintln!(
         "sekai-router: 策略 allow_write={} allow_tasks={} allow_admin={} worker={:?}",
         policy.allow_write, policy.allow_tasks, policy.allow_admin, policy.worker_filter
     );
-    let agent_config = AgentConfig {
-        model: config.model.clone(),
-        max_steps: config.max_steps,
-        ddl_ms: config.ddl_ms,
-        timeout_ms: config.timeout_ms,
-        temperature: 0.0,
-        max_tokens: 4096,
-    };
+    let agent_config = build_agent_config(&config);
     let mut agent = Agent::new(llm, gateway, policy, agent_config, trace.clone());
     let goal = config.goal_text().to_string();
     eprintln!("sekai-router: 目标：{goal}");
@@ -343,30 +334,42 @@ fn report_agent_error(error: &AgentError) -> i32 {
 
 // ---- 交互会话 ----
 
-/// 构造交互会话（REPL 与 TUI 共用；TUI 非 TTY 回退时重建一次）。
-fn build_session(config: &Config, trace: TraceWriter) -> Session<LlmClient> {
-    let api_key = config.api_key.clone().unwrap_or_default();
-    let http = StdHttpClient::new();
-    let llm_config = LlmConfig {
+/// CLI 配置 → LlmConfig（批处理 / 交互 / prompt 通道共用形状）。
+fn build_llm_config(config: &Config) -> LlmConfig {
+    LlmConfig {
         base_url: config.base_url.clone(),
         model: config.model.clone(),
-        api_key,
-        max_tokens: 4096,
+        api_key: config.api_key.clone().unwrap_or_default(),
+        max_tokens: 4_096,
         temperature: 0.0,
         timeout: Duration::from_millis(config.http_timeout_ms),
         retry_base_ms: 1_000,
         max_retries: 3,
-    };
-    let llm = LlmClient::new(Box::new(http), llm_config);
-    let policy = policy_from(config);
-    let agent_config = AgentConfig {
+    }
+}
+
+/// CLI 配置 → Agent 配置。
+fn build_agent_config(config: &Config) -> AgentConfig {
+    AgentConfig {
         model: config.model.clone(),
         max_steps: config.max_steps,
         ddl_ms: config.ddl_ms,
         timeout_ms: config.timeout_ms,
         temperature: 0.0,
-        max_tokens: 4096,
-    };
+        max_tokens: 4_096,
+    }
+}
+
+/// 构造交互会话（REPL 与 TUI 共用；TUI 非 TTY 回退时重建一次）。
+///
+/// `chat` 由调用方传入（与 prompt 通道共享同一 `LlmClient` 克隆）。
+fn build_session(
+    config: &Config,
+    trace: TraceWriter,
+    chat: LlmClient,
+    policy: &Policy,
+    agent_config: &AgentConfig,
+) -> Session<LlmClient> {
     let session_config = SessionConfig {
         listen_addr: config.listen_addr.clone(),
         worker_bin: config.worker_bin.clone(),
@@ -380,7 +383,30 @@ fn build_session(config: &Config, trace: TraceWriter) -> Session<LlmClient> {
         tool_timeout_ms: config.timeout_ms,
         task_timeout_ms: config.timeout_ms,
     };
-    Session::new(llm, policy, agent_config, trace, session_config)
+    Session::new(
+        chat,
+        policy.clone(),
+        agent_config.clone(),
+        trace,
+        session_config,
+    )
+}
+
+/// 按配置启动 prompt ingress（交互模式）；打印「提示通道已监听 <addr>」。
+///
+/// 监听失败（端口占用等）**只打 stderr 中文错误并继续运行**：交互 REPL
+/// 主流程不受影响（这是「报错继续」与「非 0 退出」之间的明确取舍，
+/// 用户不应因一个旁路通道不可用而丢掉整个会话）。
+fn start_prompt_ingress(config: &Config, hub: Arc<PromptCore<LlmClient>>) {
+    let Some(addr) = config.prompt_addr.as_deref() else {
+        return;
+    };
+    match prompt_server::start_ingress(hub, addr) {
+        Ok(actual) => println!("提示通道已监听 {actual}"),
+        Err(error) => {
+            eprintln!("sekai-router: 提示通道监听失败（{addr}）：{error}；交互会话继续运行");
+        }
+    }
 }
 
 /// `--link` 旗标对应的初始 `/link` 命令（交互内仍可 `/link` 切换）。
@@ -415,17 +441,34 @@ fn run_interactive(config: Config, trace: TraceWriter) -> i32 {
             config.base_url
         );
     }
-    let mut session = build_session(&config, trace.clone());
+    // LLM 客户端只建一次：会话 Agent 与 prompt 通道共用同一克隆
+    // （LlmClient 内部共享 HTTP 执行器）。
+    let llm = LlmClient::new(Box::new(http), build_llm_config(&config));
+    let policy = policy_from(&config);
+    let agent_config = build_agent_config(&config);
+    // prompt 通道共享核心：ingress 与会话在 set_gateway / /policy 变更时同步。
+    let hub = Arc::new(PromptCore::new(
+        llm.clone(),
+        policy.clone(),
+        agent_config.clone(),
+        trace.clone(),
+    ));
+    start_prompt_ingress(&config, Arc::clone(&hub));
+
     let initial = initial_link_command(&config);
+    let mut session = build_session(&config, trace.clone(), llm.clone(), &policy, &agent_config);
+    session.set_prompt_hub(Arc::clone(&hub));
     run_initial_link(&mut session, initial.as_deref());
     // --tui：优先全屏 TUI；stdin/stdout 任一非终端时 tui 返回
-    // EXIT_NOT_TTY，重建 Session 回退行式 REPL（Session 非 Clone）。
+    // EXIT_NOT_TTY，重建 Session 回退行式 REPL（Session 非 Clone；
+    // hub 复用同一实例，ingress 不断线）。
     if config.tui {
         let code = sekai_router::tui::run(session);
         if code != sekai_router::tui::EXIT_NOT_TTY {
             return code;
         }
-        let mut session = build_session(&config, trace);
+        let mut session = build_session(&config, trace, llm, &policy, &agent_config);
+        session.set_prompt_hub(hub);
         run_initial_link(&mut session, initial.as_deref());
         return sekai_router::repl::run(session);
     }

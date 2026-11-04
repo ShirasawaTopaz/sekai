@@ -24,6 +24,7 @@
 //! 命令后调用。`/start` 挂起态下，非 '/' 输入由向导消费（选菜单/填参数），
 //! 任何 '/' 命令取消挂起态并照常执行。
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sekai::sekai_device_list::Endpoint;
@@ -33,6 +34,7 @@ use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::link_builder::{self, LinkOptions};
 use crate::llm::ChatClient;
 use crate::prompt::worker_summary;
+use crate::prompt_server::PromptCore;
 use crate::tools::Policy;
 use crate::topic::TopicRoot;
 use crate::trace::TraceWriter;
@@ -106,6 +108,9 @@ pub struct Session<C: ChatClient + Clone> {
     wizard: Option<LinkWizard>,
     /// 上次看到的 Worker id 快照（[`Session::poll`] 据此报「已上线」）。
     last_workers: Vec<String>,
+    /// prompt 通道共享核心（可选；ingress 由 bin 构造并注入，
+    /// 建链/关链/策略变更时同步，见 [`Session::sync_hub`]）。
+    hub: Option<Arc<PromptCore<C>>>,
 }
 
 impl<C: ChatClient + Clone> Session<C> {
@@ -127,6 +132,7 @@ impl<C: ChatClient + Clone> Session<C> {
             config,
             wizard: None,
             last_workers: Vec::new(),
+            hub: None,
         }
     }
 
@@ -136,6 +142,14 @@ impl<C: ChatClient + Clone> Session<C> {
         self.gateway = Some(gateway);
         // 注入即基线：poll 只报此后新增的 Worker。
         self.refresh_worker_baseline();
+        self.sync_hub();
+    }
+
+    /// 挂接 prompt 通道共享核心（bin 在启动 ingress 前注入）；
+    /// 注入时同步当前网关与策略。
+    pub fn set_prompt_hub(&mut self, hub: Arc<PromptCore<C>>) {
+        self.hub = Some(hub);
+        self.sync_hub();
     }
 
     /// 当前策略（测试用）。
@@ -336,6 +350,7 @@ impl<C: ChatClient + Clone> Session<C> {
                 self.link_desc = format!("tcp 监听（{actual}）");
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
+                self.sync_hub();
                 (
                     vec![
                         SessionMessage::Line(format!("已监听 {actual}，等待 Worker 连入…")),
@@ -390,6 +405,7 @@ impl<C: ChatClient + Clone> Session<C> {
                 // 子进程 Hello 通常在数百毫秒内到达；这里不阻塞，交给 /wait。
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
+                self.sync_hub();
                 (
                     vec![SessionMessage::Line(format!(
                         "已拉起 {program}（等待 Hello，用 /workers 查看）"
@@ -437,6 +453,7 @@ impl<C: ChatClient + Clone> Session<C> {
                 self.link_desc = format!("mqtt broker（{display}）");
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
+                self.sync_hub();
                 (
                     vec![
                         SessionMessage::Line(format!(
@@ -469,6 +486,7 @@ impl<C: ChatClient + Clone> Session<C> {
             // 旧句柄 Drop：MqttGateway/DirectGateway 在 Drop 中停 IO 线程。
             self.link_desc = String::from("未连接");
             self.last_workers.clear();
+            self.sync_hub();
             true
         } else {
             false
@@ -558,6 +576,7 @@ impl<C: ChatClient + Clone> Session<C> {
                 ))];
             }
         }
+        self.sync_hub();
         vec![SessionMessage::Line(format!("{name} 已更新"))]
     }
 
@@ -661,6 +680,15 @@ impl<C: ChatClient + Clone> Session<C> {
     }
 
     // ---- 辅助 ----
+
+    /// 把网关与策略同步进 prompt 共享核心（建链 / 关链 / 注入 /
+    /// `/policy` 修改后调用；未挂接 hub 时为 no-op）。
+    fn sync_hub(&mut self) {
+        if let Some(hub) = &self.hub {
+            hub.set_gateway(self.gateway.clone());
+            hub.set_policy(self.policy.clone());
+        }
+    }
 
     /// 链路构造参数（网关装配统一走 [`crate::link_builder`] 共享层）。
     fn link_options(&self) -> LinkOptions {
@@ -928,8 +956,8 @@ fn render_agent_error(error: &AgentError) -> Vec<SessionMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::{CommandRequest, CommandResult};
-    use crate::gateway::GatewayError;
+    use crate::control::CommandRequest;
+    use crate::gateway::{CommandReceipt, GatewayError};
     use crate::llm::{ChatRequest, ChatResponse, LlmError};
     use crate::worker::WorkerInfo;
     use std::sync::{Arc, Mutex};
@@ -957,8 +985,13 @@ mod tests {
                 .clone()
         }
 
-        fn call(&mut self, _request: CommandRequest) -> Result<CommandResult, GatewayError> {
-            Err(GatewayError::new("worker_offline", "测试网关不支持 call"))
+        fn submit(&mut self, _request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let _ = sender.send(Err(GatewayError::new(
+                "worker_offline",
+                "测试网关不支持 call",
+            )));
+            Ok(CommandReceipt::new(receiver, 60_000, "内存"))
         }
 
         fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {

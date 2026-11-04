@@ -1879,18 +1879,18 @@ dependencies = [
 
 [[package]]
 name = "sekai"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "sekai-build"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "sekai-embedded",
 ]
 
 [[package]]
 name = "sekai-embedded"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-router"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "sekai-worker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "sekai",
  "sekai-gpio",

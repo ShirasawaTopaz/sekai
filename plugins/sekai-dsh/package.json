@@ -2,6 +2,7 @@
   "name": "@sekai/dsh-plugin",
   "version": "0.1.0",
   "description": "Sekai bridge plugins for dsh (DeepSeek Harness): drives `sekai-router --serve` (JSONL over stdio) and the `sekai-worker connect` lifecycle, publishing sekai_* tools.",
+  "license": "Apache-2.0",
   "type": "module",
   "main": "./lib/index.js",
   "icon": "./icon.svg",

@@ -12,9 +12,15 @@
 //! - **dispatcher 线程**：独占协议状态（网关句柄 / 策略），串行处理请求，
 //!   写响应与 link_state 通知（调用天然串行，无需额外排队）；
 //! - **poll 线程**：约 200ms diff `list_workers()`，发 worker_online /
-//!   worker_offline 通知。
+//!   worker_offline 通知；
+//! - **prompt ingress 线程**（--prompt-addr 启用时）：TCP JSONL 通道，
+//!   见 [`crate::prompt_server`]。
 //!
 //! ## 协议（v1，冻结，插件侧并行开发，不得偏离）
+//!
+//! **v1.1 additive**：新增 `prompt` 方法（参数/响应形状与错误码见
+//! [`crate::prompt_server`]；由 Router 调 LLM 后返回回答）。该方法为
+//! 纯增量——旧插件不调用它，行为不变，向后兼容。
 //!
 //! - 请求：`{"id":<整数>,"method":"<名>","params":{...}}`
 //! - 响应：`{"id":..,"ok":true,"result":{...}}` /
@@ -24,7 +30,7 @@
 //!   `{"event":"worker_online","worker_id":"..","worker":{...}}`、
 //!   `{"event":"worker_offline","worker_id":".."}`
 //! - 方法：link / link_off / workers / tool_call / task / policy.get /
-//!   policy.set / status / shutdown
+//!   policy.set / status / shutdown / prompt（v1.1 additive）
 //! - 畸形 JSON 行：跳行回 `invalid_json`；无法取 id 时以通知形式
 //!   `{"event":"invalid_json","message":"..."}` 回错，进程不得崩溃。
 //! - stdin EOF 或 shutdown 请求：优雅退出，进程退出码 0。
@@ -38,15 +44,20 @@ use std::time::Duration;
 use sekai::sekai_device_list::Endpoint;
 use sekai::sekai_wire::validate_worker_id;
 
+use crate::agent::AgentConfig;
 use crate::agent::retryable_gateway_code;
 use crate::config;
 use crate::control::{CommandKind, CommandRequest};
 use crate::direct_gateway::DirectMode;
 use crate::gateway::{GatewayHandle, WorkerGateway};
+use crate::http::StdHttpClient;
 use crate::json::Json;
 use crate::link_builder::{self, LinkOptions};
+use crate::llm::{self, LlmClient, LlmConfig};
+use crate::prompt_server::{self, PromptCore};
 use crate::tools::{self, Policy};
 use crate::topic::TopicRoot;
+use crate::trace::TraceWriter;
 use crate::worker::WorkerInfo;
 
 /// poll 线程轮询间隔（毫秒，200ms 级别）。
@@ -86,6 +97,21 @@ pub struct ServeConfig {
     pub tool_timeout_ms: Option<u64>,
     /// Task 超时覆盖（绝对毫秒）。
     pub task_timeout_ms: Option<u64>,
+    /// DeepSeek API key（`prompt` 方法用；None/空 → `llm_unavailable`）。
+    pub api_key: Option<String>,
+    /// OpenAI 兼容 base URL（prompt 方法用）。
+    pub base_url: String,
+    /// 模型名（prompt 方法用）。
+    pub model: String,
+    /// Agent 最大步数（prompt 方法用；请求 max_steps 可覆盖到 1..=32）。
+    pub max_steps: u32,
+    /// 温度（prompt 方法用）。
+    pub temperature: f64,
+    /// 最大输出 token（prompt 方法用）。
+    pub max_tokens: u32,
+    /// prompt ingress 监听地址（`--prompt-addr`；None = 不起 ingress，
+    /// serve 的 `prompt` 方法仍可用）。
+    pub prompt_addr: Option<String>,
 }
 
 impl ServeConfig {
@@ -102,6 +128,13 @@ impl ServeConfig {
             default_ddl_ms: config.ddl_ms,
             tool_timeout_ms: config.timeout_ms,
             task_timeout_ms: config.timeout_ms,
+            api_key: config.api_key.clone(),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            max_steps: config.max_steps,
+            temperature: 0.0,
+            max_tokens: 4_096,
+            prompt_addr: config.prompt_addr.clone(),
         }
     }
 
@@ -118,6 +151,13 @@ impl ServeConfig {
             default_ddl_ms: 1_000,
             tool_timeout_ms: None,
             task_timeout_ms: None,
+            api_key: None,
+            base_url: String::from(config::DEFAULT_BASE_URL),
+            model: String::from(config::DEFAULT_MODEL),
+            max_steps: config::DEFAULT_MAX_STEPS,
+            temperature: 0.0,
+            max_tokens: 4_096,
+            prompt_addr: None,
         }
     }
 }
@@ -146,6 +186,9 @@ pub struct ServeState {
     policy: Policy,
     config: ServeConfig,
     poll_view: Arc<Mutex<PollView>>,
+    /// prompt 通道共享核心（serve `prompt` 方法与 ingress 共用；
+    /// None 时首次 prompt 请求按 config 惰性构造）。
+    prompt_hub: Option<Arc<PromptCore<LlmClient>>>,
 }
 
 impl ServeState {
@@ -158,6 +201,7 @@ impl ServeState {
             policy,
             config,
             poll_view: Arc::new(Mutex::new(PollView::default())),
+            prompt_hub: None,
         }
     }
 
@@ -173,6 +217,14 @@ impl ServeState {
         self.link_mode = mode;
         self.link_desc = desc.into();
         self.sync_poll_view();
+        self.sync_prompt_hub();
+    }
+
+    /// 注入 prompt 通道共享核心（测试 / 嵌入场景；覆盖惰性构造），
+    /// 注入时同步当前网关与策略。
+    pub fn set_prompt_hub(&mut self, hub: Arc<PromptCore<LlmClient>>) {
+        self.prompt_hub = Some(hub);
+        self.sync_prompt_hub();
     }
 
     /// poll 共享视图（serve_loop 转交 poll 线程）。
@@ -274,6 +326,8 @@ impl ServeState {
             "policy.get" => (vec![ok_response(id, self.policy_json())], false),
             "policy.set" => (self.method_policy_set(id, params), false),
             "status" => (vec![ok_response(id, self.status_json())], false),
+            // v1.1 additive：prompt 方法（见模块注释与 prompt_server）。
+            "prompt" => (self.method_prompt(id, params), false),
             // shutdown：先回响应再退出（退出动作由运行层执行）。
             "shutdown" => (vec![ok_response(id, Json::Null)], true),
             other => (
@@ -521,6 +575,7 @@ impl ServeState {
             self.link_desc = String::from(DESC_OFFLINE);
             self.link_mode = "off";
             self.sync_poll_view();
+            self.sync_prompt_hub();
             true
         } else {
             false
@@ -677,7 +732,31 @@ impl ServeState {
                 )];
             }
         }
+        self.sync_prompt_hub();
         vec![ok_response(id, self.policy_json())]
+    }
+
+    // ---- prompt（v1.1 additive）----
+
+    /// prompt 方法：参数解析与执行复用 [`crate::prompt_server`]（与 TCP
+    /// ingress 同一核心）；hub 惰性构造，无 API key → `llm_unavailable`。
+    fn method_prompt(&mut self, id: i64, params: &Json) -> Vec<Json> {
+        if self.prompt_hub.is_none() {
+            let hub = build_prompt_hub(&self.config, self.policy.clone());
+            self.prompt_hub = Some(Arc::clone(&hub));
+            // 首次构造后同步当前网关，使先前的 link/注入对 prompt 可见。
+            if let Some(gateway) = self.gateway.clone() {
+                hub.set_gateway(Some(gateway));
+            }
+        }
+        let hub = self
+            .prompt_hub
+            .as_ref()
+            .expect("上面已保证 prompt_hub 存在");
+        match prompt_server::dispatch_prompt(hub, params) {
+            Ok(result) => vec![ok_response(id, result)],
+            Err(error) => vec![error_response(id, &error.code, &error.message)],
+        }
     }
 
     // ---- status ----
@@ -735,6 +814,58 @@ impl ServeState {
             None => Vec::new(),
         };
     }
+
+    /// 把当前网关与策略同步进 prompt 共享核心（建链 / 关链 / 注入 /
+    /// policy.set 后；hub 未构造时跳过，首次 prompt 请求构造时会重新快照）。
+    fn sync_prompt_hub(&mut self) {
+        if let Some(hub) = &self.prompt_hub {
+            hub.set_gateway(self.gateway.clone());
+            hub.set_policy(self.policy.clone());
+        }
+    }
+}
+
+/// 按 [`ServeConfig`] 构造 prompt 通道共享核心。
+///
+/// chat 客户端惰性构造（首次 prompt 请求才建）；无 API key 时构造器
+/// 返回 None → `llm_unavailable`。
+fn build_prompt_hub(config: &ServeConfig, policy: Policy) -> Arc<PromptCore<LlmClient>> {
+    let api_key = config.api_key.clone().unwrap_or_default();
+    let builder: Box<dyn Fn() -> Option<LlmClient> + Send + Sync> = if api_key.trim().is_empty() {
+        Box::new(|| None::<LlmClient>)
+    } else {
+        let base_url = config.base_url.clone();
+        let model = config.model.clone();
+        let max_tokens = config.max_tokens;
+        let temperature = config.temperature;
+        Box::new(move || {
+            let llm_config = LlmConfig {
+                base_url: base_url.clone(),
+                model: model.clone(),
+                api_key: api_key.clone(),
+                max_tokens,
+                temperature,
+                timeout: Duration::from_secs(llm::DEFAULT_TIMEOUT_SECS),
+                retry_base_ms: llm::DEFAULT_RETRY_BASE_MS,
+                max_retries: llm::DEFAULT_MAX_RETRIES,
+            };
+            Some(LlmClient::new(Box::new(StdHttpClient::new()), llm_config))
+        })
+    };
+    let agent_config = AgentConfig {
+        model: config.model.clone(),
+        max_steps: config.max_steps,
+        ddl_ms: config.default_ddl_ms,
+        timeout_ms: config.tool_timeout_ms,
+        temperature: config.temperature,
+        max_tokens: config.max_tokens,
+    };
+    Arc::new(PromptCore::lazy(
+        builder,
+        policy,
+        agent_config,
+        TraceWriter::disabled(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -902,7 +1033,23 @@ where
     // 启动即宣告 ready（stdout 第一行）。
     write_shared_line(&writer, &ready_notification());
 
+    // prompt 通道共享核心：serve `prompt` 方法与 ingress 共用同一快照。
+    let prompt_hub = build_prompt_hub(&config, policy.clone());
+    // prompt ingress（--prompt-addr；serve 模式默认 127.0.0.1:7422，off 关闭）。
+    // 监听失败（端口占用等）只打 stderr 中文错误并继续运行：JSONL 主流程
+    // 不受影响（用户仍可经 serve prompt 方法使用 LLM 中继），这是本实现
+    // 在「报错继续」与「非 0 退出」之间的明确取舍。
+    if let Some(addr) = &config.prompt_addr {
+        match prompt_server::start_ingress(Arc::clone(&prompt_hub), addr) {
+            Ok(actual) => eprintln!("sekai-router: 提示通道已监听 {actual}"),
+            Err(error) => {
+                eprintln!("sekai-router: 提示通道监听失败（{addr}）：{error}；serve 继续运行");
+            }
+        }
+    }
+
     let mut state = ServeState::new(config, policy);
+    state.set_prompt_hub(prompt_hub);
     if let Some(injected) = injected {
         state.set_gateway(injected.handle, injected.mode, injected.desc);
     }

@@ -123,17 +123,28 @@ mod tests {
             allow_tasks: false,
             allow_admin: false,
             worker_filter: Some(String::from("host-gpio")),
+            deny_llm_relay: false,
         };
         let prompt = system_prompt(&[worker("host-gpio", true)], &policy);
-        assert!(prompt.contains("GPIO 写：允许"));
+        assert!(prompt.contains("写操作：允许"));
         assert!(prompt.contains("Task：拒绝"));
         assert!(prompt.contains("管理/其他用户工具：拒绝"));
         assert!(prompt.contains("只允许操作Worker host-gpio"));
 
         let prompt = system_prompt(&[], &Policy::default());
-        assert!(prompt.contains("GPIO 写：拒绝"));
+        assert!(prompt.contains("写操作：拒绝"));
         assert!(prompt.contains("不限制Worker"));
         assert!(prompt.contains("当前没有已发现的Worker"));
+    }
+
+    #[test]
+    fn prompt_notes_nested_prompt_denial_for_relay_runs() {
+        let policy = Policy {
+            deny_llm_relay: true,
+            ..Policy::default()
+        };
+        let prompt = system_prompt(&[], &policy);
+        assert!(prompt.contains("嵌套 prompt：拒绝"), "{prompt}");
     }
 
     #[test]

@@ -30,6 +30,8 @@
 //! - [`tools`]：LLM 工具 schema、参数解析与服务端策略；
 //! - [`prompt`]：system prompt 构造（含注入防护）；
 //! - [`agent`]：多步 tool-calling agent 循环；
+//! - [`prompt_server`]：prompt 通道（TCP ingress + serve `prompt` 方法，
+//!   PC Worker 把 prompt 交给 Router 调 LLM 并返回回答）；
 //! - [`trace`]：脱敏 JSONL 轨迹。
 #![forbid(unsafe_code)]
 
@@ -45,6 +47,7 @@ pub mod json;
 pub mod link_builder;
 pub mod llm;
 pub mod prompt;
+pub mod prompt_server;
 pub mod repl;
 pub mod serve;
 pub mod session;

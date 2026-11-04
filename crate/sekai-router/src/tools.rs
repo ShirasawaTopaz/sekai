@@ -27,9 +27,19 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "sekai.info",
     "sekai.time",
     "sekai.workers",
+    "pc.read",
+    "pc.ls",
+    "pc.info",
 ];
 /// 写工具白名单：需要 --allow-write。
-pub const WRITE_TOOLS: &[&str] = &["gpio.config", "gpio.write"];
+pub const WRITE_TOOLS: &[&str] = &["gpio.config", "gpio.write", "pc.write", "pc.exec"];
+
+/// Worker侧的 prompt 中继工具（PC Worker 把 prompt 交给 Router 调 LLM）；
+/// 在 prompt 通道发起的 Agent 运行里被 [`Policy::deny_llm_relay`] 拒绝，
+/// 防止 worker → router → worker 的递归派工死循环。
+pub const NESTED_PROMPT_TOOL: &str = "pc.ask";
+/// 嵌套 prompt 拒绝时的能力描述（PolicyDenied::Forbidden 的 what）。
+pub const DENIED_NESTED_PROMPT_WHAT: &str = "嵌套 prompt（pc.ask）";
 
 /// 工具结果 payload 的展示上限（约 3.5 KiB）；超过时截断并标 truncated。
 pub const PAYLOAD_TRUNCATE_BYTES: usize = 3_584;
@@ -109,7 +119,7 @@ pub fn tool_defs() -> Vec<ToolDef> {
         ToolDef {
             name: String::from(FN_WORKER_TASK),
             description: String::from(
-                "Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled. Returns the worker result or a structured error.",
+                "Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled. Returns the worker result or a structured error. Long-running tasks (e.g. pc.ask) must pass an explicit ddl_ms (>=60000 recommended): the default 1s budget will time out.",
             ),
             parameters: object_schema(
                 vec![
@@ -183,7 +193,7 @@ fn object_schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
 /// 服务端策略。
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
-    /// 允许 GPIO 写。
+    /// 允许写操作（gpio.config/gpio.write/pc.write/pc.exec）。
     pub allow_write: bool,
     /// 允许 Task。
     pub allow_tasks: bool,
@@ -191,6 +201,12 @@ pub struct Policy {
     pub allow_admin: bool,
     /// Worker过滤器：只允许操作该Worker。
     pub worker_filter: Option<String>,
+    /// 内部位：拒绝嵌套 prompt 中继（`pc.ask`）。
+    ///
+    /// 仅由 prompt 通道（ingress / serve `prompt` 方法）发起的 Agent 运行
+    /// 置位，防止递归派工；不出现在 CLI 旗标与 serve policy.get/policy.set
+    /// 的现有四键语义里（[`Policy::summary`] 在 true 时追加说明）。
+    pub deny_llm_relay: bool,
 }
 
 impl Policy {
@@ -203,7 +219,13 @@ impl Policy {
             Some(worker_id) => format!("只允许操作Worker {worker_id}"),
             None => String::from("不限制Worker（可操作所有已发现Worker）"),
         };
-        format!("GPIO 写：{write}；Task：{tasks}；管理/其他用户工具：{admin}；Worker过滤：{filter}")
+        let mut summary = format!(
+            "写操作：{write}；Task：{tasks}；管理/其他用户工具：{admin}；Worker过滤：{filter}"
+        );
+        if self.deny_llm_relay {
+            summary.push_str("；嵌套 prompt：拒绝");
+        }
+        summary
     }
 }
 
@@ -456,6 +478,12 @@ pub fn check_policy(policy: &Policy, call: &ParsedCall) -> Result<(), PolicyDeni
     match call {
         ParsedCall::ListWorkers => Ok(()),
         ParsedCall::WorkerTask { name, .. } => {
+            // 嵌套 prompt 中继：即使 allow_tasks=true 也拒绝（防递归优先）。
+            if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
+                return Err(PolicyDenied::Forbidden {
+                    what: String::from(DENIED_NESTED_PROMPT_WHAT),
+                });
+            }
             if policy.allow_tasks {
                 Ok(())
             } else {
@@ -465,6 +493,12 @@ pub fn check_policy(policy: &Policy, call: &ParsedCall) -> Result<(), PolicyDeni
             }
         }
         ParsedCall::WorkerTool { name, .. } => {
+            // 嵌套 prompt 中继：即使其余策略全开也拒绝（防递归优先）。
+            if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
+                return Err(PolicyDenied::Forbidden {
+                    what: String::from(DENIED_NESTED_PROMPT_WHAT),
+                });
+            }
             if is_read_only_tool(name) {
                 Ok(())
             } else if is_write_tool(name) {
@@ -472,7 +506,7 @@ pub fn check_policy(policy: &Policy, call: &ParsedCall) -> Result<(), PolicyDeni
                     Ok(())
                 } else {
                     Err(PolicyDenied::Forbidden {
-                        what: format!("写操作 {name}（gpio.config/gpio.write）"),
+                        what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
                     })
                 }
             } else if policy.allow_admin {
@@ -491,7 +525,7 @@ pub fn is_read_only_tool(name: &str) -> bool {
     READ_ONLY_TOOLS.contains(&name)
 }
 
-/// 工具是否为 GPIO 写。
+/// 工具是否为写操作（gpio.config/gpio.write/pc.write/pc.exec）。
 pub fn is_write_tool(name: &str) -> bool {
     WRITE_TOOLS.contains(&name)
 }
@@ -989,6 +1023,144 @@ mod tests {
             ddl_ms: None,
         };
         assert!(check_policy(&policy, &call).is_ok());
+    }
+
+    #[test]
+    fn pc_tools_are_classified() {
+        let policy = policy();
+        // pc.read/pc.ls/pc.info：只读白名单，默认允许。
+        for name in ["pc.read", "pc.ls", "pc.info"] {
+            let call = ParsedCall::WorkerTool {
+                worker_id: String::from("pc-1"),
+                name: String::from(name),
+                args: String::new(),
+                ddl_ms: None,
+            };
+            assert!(check_policy(&policy, &call).is_ok(), "只读工具 {name}");
+            assert!(is_read_only_tool(name));
+        }
+        // pc.write/pc.exec：写白名单，默认拒绝、allow_write 放开。
+        for name in ["pc.write", "pc.exec"] {
+            let call = ParsedCall::WorkerTool {
+                worker_id: String::from("pc-1"),
+                name: String::from(name),
+                args: String::new(),
+                ddl_ms: None,
+            };
+            assert_eq!(
+                check_policy(&policy, &call),
+                Err(PolicyDenied::Forbidden {
+                    what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
+                }),
+                "写工具 {name}"
+            );
+            assert!(is_write_tool(name));
+        }
+        let mut open = policy.clone();
+        open.allow_write = true;
+        for name in ["pc.write", "pc.exec"] {
+            let call = ParsedCall::WorkerTool {
+                worker_id: String::from("pc-1"),
+                name: String::from(name),
+                args: String::new(),
+                ddl_ms: None,
+            };
+            assert!(
+                check_policy(&open, &call).is_ok(),
+                "allow_write 应放开 {name}"
+            );
+        }
+        // pc.ask：既非只读也非写，默认拒绝（allow_admin 可放开）。
+        let ask = ParsedCall::WorkerTool {
+            worker_id: String::from("pc-1"),
+            name: String::from(NESTED_PROMPT_TOOL),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert_eq!(
+            check_policy(&policy, &ask),
+            Err(PolicyDenied::Forbidden {
+                what: String::from("工具 pc.ask"),
+            })
+        );
+        let mut admin = policy;
+        admin.allow_admin = true;
+        assert!(check_policy(&admin, &ask).is_ok());
+    }
+
+    #[test]
+    fn deny_llm_relay_rejects_nested_pc_ask() {
+        // 全开策略 + deny_llm_relay：pc.ask（WorkerTool 与 WorkerTask 两分支）
+        // 仍被拒，其余工具不受影响。
+        let mut policy = policy();
+        policy.allow_write = true;
+        policy.allow_tasks = true;
+        policy.allow_admin = true;
+        policy.deny_llm_relay = true;
+        let tool = ParsedCall::WorkerTool {
+            worker_id: String::from("pc-1"),
+            name: String::from(NESTED_PROMPT_TOOL),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert_eq!(
+            check_policy(&policy, &tool),
+            Err(PolicyDenied::Forbidden {
+                what: String::from(DENIED_NESTED_PROMPT_WHAT),
+            })
+        );
+        let task = ParsedCall::WorkerTask {
+            worker_id: String::from("pc-1"),
+            name: String::from(NESTED_PROMPT_TOOL),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert_eq!(
+            check_policy(&policy, &task),
+            Err(PolicyDenied::Forbidden {
+                what: String::from(DENIED_NESTED_PROMPT_WHAT),
+            })
+        );
+        for name in ["gpio.info", "pc.read", "gpio.write", "pc.exec"] {
+            let call = ParsedCall::WorkerTool {
+                worker_id: String::from("pc-1"),
+                name: String::from(name),
+                args: String::new(),
+                ddl_ms: None,
+            };
+            assert!(check_policy(&policy, &call).is_ok(), "deny 不应影响 {name}");
+        }
+        assert!(check_policy(&policy, &ParsedCall::ListWorkers).is_ok());
+        // 默认（deny=false）：allow_admin 放开的 pc.ask 不受影响。
+        let mut relaxed = policy;
+        relaxed.deny_llm_relay = false;
+        assert!(check_policy(&relaxed, &tool).is_ok());
+    }
+
+    #[test]
+    fn policy_summary_mentions_nested_prompt_only_when_denied() {
+        let summary = Policy::default().summary();
+        assert!(summary.contains("写操作：拒绝"), "{summary}");
+        assert!(!summary.contains("嵌套 prompt"), "{summary}");
+        let policy = Policy {
+            deny_llm_relay: true,
+            ..Policy::default()
+        };
+        let summary = policy.summary();
+        assert!(summary.contains("嵌套 prompt：拒绝"), "{summary}");
+    }
+
+    #[test]
+    fn worker_task_def_mentions_long_running_ddl_hint() {
+        let defs = tool_defs();
+        let description = defs
+            .iter()
+            .find(|def| def.name == FN_WORKER_TASK)
+            .unwrap()
+            .description
+            .as_str();
+        assert!(description.contains("pc.ask"), "{description}");
+        assert!(description.contains("60000"), "{description}");
     }
 
     #[test]

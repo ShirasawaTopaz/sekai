@@ -9,13 +9,18 @@ use std::io::{BufRead, Cursor, Read, Result as IoResult, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sekai_router::agent::AgentConfig;
 use sekai_router::control::{CommandRequest, CommandResult};
-use sekai_router::gateway::{GatewayError, GatewayHandle, WorkerGateway};
+use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
+use sekai_router::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
 use sekai_router::json::Json;
+use sekai_router::llm::{LlmClient, LlmConfig};
+use sekai_router::prompt_server::PromptCore;
 use sekai_router::serve::{
     InjectedLink, ServeConfig, ServeState, serve_loop, worker_notifications,
 };
 use sekai_router::tools::Policy;
+use sekai_router::trace::TraceWriter;
 use sekai_router::worker::WorkerInfo;
 
 // ---- 测试替身 ----
@@ -31,9 +36,9 @@ impl WorkerGateway for FakeGateway {
         self.workers.lock().unwrap().clone()
     }
 
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         self.calls.lock().unwrap().push(request.clone());
-        Ok(CommandResult {
+        let result = Ok(CommandResult {
             cmd_id: 7,
             worker_id: request.worker_id,
             kind: request.kind,
@@ -42,7 +47,10 @@ impl WorkerGateway for FakeGateway {
             phases: Vec::new(),
             elapsed_ms: 3,
             failure: None,
-        })
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(result);
+        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
@@ -62,8 +70,13 @@ impl WorkerGateway for FailingGateway {
         vec![worker("pc-1")]
     }
 
-    fn call(&mut self, _request: CommandRequest) -> Result<CommandResult, GatewayError> {
-        Err(GatewayError::new("worker_offline", "测试：Worker 已离线"))
+    fn submit(&mut self, _request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(Err(GatewayError::new(
+            "worker_offline",
+            "测试：Worker 已离线",
+        )));
+        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {
@@ -788,4 +801,217 @@ fn serve_loop_emits_worker_online_notification() {
     reader_state.lock().unwrap().closed = true;
     server.join().expect("serve 线程不应 panic");
     assert_eq!(*exit_code.lock().unwrap(), Some(0), "EOF 优雅退出 0");
+}
+
+// ---- prompt 方法（v1.1 additive）----
+
+/// 固定返回一个 chat completions 响应体的脚本化 HTTP 传输（离线）。
+struct ScriptedHttp {
+    body: String,
+}
+
+impl HttpClient for ScriptedHttp {
+    fn execute(&mut self, _request: &HttpRequest) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: self.body.clone().into_bytes(),
+        })
+    }
+}
+
+/// prompt 成功路径用的 hub（mock HTTP 支撑的 LlmClient）。
+fn prompt_hub_with_chat_body(body: &str) -> Arc<PromptCore<LlmClient>> {
+    let llm = LlmClient::new(
+        Box::new(ScriptedHttp {
+            body: String::from(body),
+        }),
+        LlmConfig::new("http://127.0.0.1:9", "deepseek-flash", "sk-test"),
+    );
+    Arc::new(PromptCore::new(
+        llm,
+        Policy::default(),
+        AgentConfig {
+            model: String::from("deepseek-flash"),
+            max_steps: 4,
+            ddl_ms: 1_000,
+            timeout_ms: None,
+            temperature: 0.0,
+            max_tokens: 4_096,
+        },
+        TraceWriter::disabled(),
+    ))
+}
+
+/// prompt 成功：注入 hub + 网关 → 完整 result JSON（answer/status/steps/usage）。
+#[test]
+fn prompt_method_runs_agent_and_returns_result() {
+    let chat_body = r#"{"id":"chatcmpl-1","model":"deepseek-flash","choices":[{"index":0,"message":{"role":"assistant","content":"prompt 回答"},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}"#;
+    let mut state = state();
+    state.set_prompt_hub(prompt_hub_with_chat_body(chat_body));
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "tcp",
+        String::from("测试链路（注入）"),
+    );
+
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"prompt","params":{"text":"你好","max_steps":4}}"#,
+    );
+    assert_eq!(messages.len(), 1, "{messages:?}");
+    assert_eq!(messages[0].get("id").and_then(Json::as_i64), Some(1));
+    assert_eq!(messages[0].get("ok").and_then(Json::as_bool), Some(true));
+    let result = messages[0].get("result").unwrap();
+    assert_eq!(
+        result.get("answer").and_then(Json::as_str),
+        Some("prompt 回答")
+    );
+    assert_eq!(
+        result.get("status").and_then(Json::as_str),
+        Some("completed")
+    );
+    assert_eq!(result.get("steps").and_then(Json::as_u64), Some(1));
+    assert_eq!(
+        result
+            .get_path(&["usage", "prompt_tokens"])
+            .and_then(Json::as_u64),
+        Some(9)
+    );
+    assert_eq!(
+        result
+            .get_path(&["usage", "total_tokens"])
+            .and_then(Json::as_u64),
+        Some(13)
+    );
+    // prompt 不产生 Worker 命令。
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+/// 无 API key：惰性构造 hub → `llm_unavailable`；未建链先报 `not_linked`。
+#[test]
+fn prompt_method_without_key_or_link_reports_errors() {
+    let mut state = state(); // minimal：api_key None。
+    // 未建链：not_linked。
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"prompt","params":{"text":"hi"}}"#,
+    );
+    let error = messages[0].get("error").unwrap();
+    assert_eq!(error.get("code").and_then(Json::as_str), Some("not_linked"));
+
+    // 建链 + Worker 就绪：llm_unavailable（无 API key）。
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "tcp",
+        String::from("测试链路（注入）"),
+    );
+    let messages = request(
+        &mut state,
+        r#"{"id":2,"method":"prompt","params":{"text":"hi"}}"#,
+    );
+    let error = messages[0].get("error").unwrap();
+    assert_eq!(
+        error.get("code").and_then(Json::as_str),
+        Some("llm_unavailable")
+    );
+    assert!(
+        error
+            .get("message")
+            .and_then(Json::as_str)
+            .unwrap()
+            .contains("API key")
+    );
+}
+
+/// 参数校验：text 空/缺失/超限、max_steps 越界/类型错、未知字段 →
+/// `invalid_arguments`（先于链路与 LLM 检查）。
+#[test]
+fn prompt_method_validates_arguments_strictly() {
+    let mut state = state();
+    for (line, needle) in [
+        (
+            r#"{"id":1,"method":"prompt","params":{}}"#,
+            "缺少必填参数 text",
+        ),
+        (
+            r#"{"id":2,"method":"prompt","params":{"text":""}}"#,
+            "不能为空",
+        ),
+        (
+            r#"{"id":3,"method":"prompt","params":{"text":7}}"#,
+            "必须是字符串",
+        ),
+        (
+            r#"{"id":4,"method":"prompt","params":{"text":"hi","max_steps":0}}"#,
+            "max_steps",
+        ),
+        (
+            r#"{"id":5,"method":"prompt","params":{"text":"hi","max_steps":33}}"#,
+            "max_steps",
+        ),
+        (
+            r#"{"id":6,"method":"prompt","params":{"text":"hi","extra":1}}"#,
+            "未知参数",
+        ),
+    ] {
+        let messages = request(&mut state, line);
+        let error = messages[0].get("error").unwrap();
+        assert_eq!(
+            error.get("code").and_then(Json::as_str),
+            Some("invalid_arguments"),
+            "{line}"
+        );
+        assert!(
+            error
+                .get("message")
+                .and_then(Json::as_str)
+                .unwrap()
+                .contains(needle),
+            "{line} 应含「{needle}」"
+        );
+    }
+    // text 超 8192 字节。
+    let over = format!(
+        r#"{{"id":7,"method":"prompt","params":{{"text":"{}"}}}}"#,
+        "a".repeat(8_193)
+    );
+    let messages = request(&mut state, &over);
+    let error = messages[0].get("error").unwrap();
+    assert_eq!(
+        error.get("code").and_then(Json::as_str),
+        Some("invalid_arguments")
+    );
+}
+
+/// hub 跟随 serve 状态：建链后再注入 hub，prompt 也能看到网关
+/// （sync_prompt_hub 在注入时同步）。
+#[test]
+fn prompt_hub_sees_gateway_injected_after_hub() {
+    let chat_body = r#"{"id":"chatcmpl-2","model":"deepseek-flash","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    let mut state = state();
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "tcp",
+        String::from("测试链路（注入）"),
+    );
+    // 先建链、后注入 hub：注入时同步网关。
+    state.set_prompt_hub(prompt_hub_with_chat_body(chat_body));
+    let messages = request(
+        &mut state,
+        r#"{"id":1,"method":"prompt","params":{"text":"hi"}}"#,
+    );
+    assert_eq!(messages[0].get("ok").and_then(Json::as_bool), Some(true));
+    assert_eq!(
+        messages[0]
+            .get_path(&["result", "answer"])
+            .and_then(Json::as_str),
+        Some("ok")
+    );
 }

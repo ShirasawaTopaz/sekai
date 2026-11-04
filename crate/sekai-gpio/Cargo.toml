@@ -1,7 +1,8 @@
 [package]
 name = "sekai-gpio"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Sekai 家族无关 GPIO 抽象、引脚表、虚拟后端与 AI 用户工具"
 
 [dependencies]

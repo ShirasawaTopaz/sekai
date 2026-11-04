@@ -1,6 +1,8 @@
 [package]
 name = "sekai-worker"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Sekai PC Worker 启动层：宿主进程 Worker，通过直连链路（stdio/TCP，V1 帧，非 MQTT broker）与 Router 通信"
 
 [lib]

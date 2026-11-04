@@ -12,7 +12,7 @@ use sekai::sekai_wire::ErrorCode;
 
 use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentStatus};
 use sekai_router::control::{CommandFailure, CommandKind, CommandRequest, CommandResult};
-use sekai_router::gateway::{GatewayError, WorkerGateway};
+use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
 use sekai_router::json::Json;
 use sekai_router::llm::{
     ChatClient, ChatRequest, ChatResponse, LlmError, Message, Role, ToolCall, Usage,
@@ -77,11 +77,15 @@ impl WorkerGateway for FakeGateway {
         self.workers.clone()
     }
 
-    fn call(&mut self, request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         self.calls.lock().unwrap().push(request);
-        self.responses
+        let result = self
+            .responses
             .pop_front()
-            .unwrap_or_else(|| Err(GatewayError::new("worker_not_found", "没有脚本化响应")))
+            .unwrap_or_else(|| Err(GatewayError::new("worker_not_found", "没有脚本化响应")));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = sender.send(result);
+        Ok(CommandReceipt::new(receiver, 60_000, "内存"))
     }
 
     fn wait_ready(&mut self, _timeout_ms: u64) -> Result<(), GatewayError> {

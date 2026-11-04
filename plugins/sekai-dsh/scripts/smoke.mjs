@@ -9,7 +9,11 @@
  *   响应、通知、丢弃告警、超时、本地中止、dispose、崩溃重启、autoLink
  *   重放、四个 sekai_* 工具、错误信封、schema 卫生）；
  * - 用一个假 worker 脚本（打印阶段化 stderr 后退出/长驻）验证 worker 侧
- *   的生命周期与状态工具（重启退避、环形 stderr、spawn 失败告警）。
+ *   的生命周期与状态工具（重启退避、环形 stderr、spawn 失败告警）；
+ * - 用一个假 prompt worker（stdout 发 prompt JSONL 请求行、stdin 收到的行
+ *   回显到 stderr）+ 假 ingress（node net server 回放 prompt 响应）验证
+ *   dsh 通道的 prompt 中转：成功回投、并发独立连接、不可达/超时错误信封、
+ *   llm:'off' 不转发、dispose 清理。
  *
  * 全部断言通过 exit 0；任何失败 exit 1。
  */
@@ -17,6 +21,8 @@ import { strict as assert } from 'node:assert'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import net from 'node:net'
+import readline from 'node:readline'
 import {
   JsonlError,
   JsonlProcess,
@@ -26,7 +32,7 @@ import {
   resolveBin,
 } from '../lib/shared.js'
 import { SekaiRouterPlugin } from '../lib/router.js'
-import { SekaiWorkerPlugin } from '../lib/worker.js'
+import { SekaiWorkerPlugin, resolveWorkerConfig, splitHostPort, parsePromptRequest } from '../lib/worker.js'
 
 // ---------------------------------------------------------------------------
 // 假进程脚本（写入临时目录后以 node 运行）
@@ -117,11 +123,30 @@ const FAKE_WORKER = `
 const lifetime = Number(process.env.FAKE_WORKER_LIFETIME_MS ?? 250)
 const exitCode = Number(process.env.FAKE_WORKER_EXIT ?? 0)
 process.stderr.write('[worker] 阶段1：连接路由器 ' + (process.argv[2] ?? '') + '\\n')
-setTimeout(() => process.stderr.write('[worker] 阶段2：注册工具 gpio.*\\n'), Math.floor(lifetime / 3))
+setTimeout(() => process.stderr.write('[worker] 阶段2：注册工具 pc.*\\n'), Math.floor(lifetime / 3))
 setTimeout(() => process.stderr.write('[worker] 阶段3：进入命令循环\\n'), Math.floor((lifetime * 2) / 3))
 setTimeout(() => process.exit(exitCode), lifetime)
 if (process.env.FAKE_WORKER_HOLD === '1') setInterval(() => {}, 1000)
-// stdout 保持静默（真实 worker connect 模式 stdout 无输出）
+// stdout 保持静默（真实 worker connect 模式下 stdout 只承载 prompt JSONL）
+`
+
+/**
+ * 假 prompt worker：启动即向 stdout 发 prompt 请求行（dsh 通道下插件应
+ * 中转），stdin 收到的每一行回显到 stderr（前缀 [prompt-worker] stdin:）
+ * 供断言响应确实回投。注意保持无反引号/无 ${ }。
+ */
+const FAKE_WORKER_PROMPT = `
+import readline from 'node:readline'
+const ids = String(process.env.FAKE_PROMPT_IDS ?? '7').split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n))
+const emit = () => {
+  for (const id of ids) process.stdout.write(JSON.stringify({ id, method: 'prompt', params: { text: 'hello-' + id } }) + '\\n')
+}
+const delay = Number(process.env.FAKE_PROMPT_DELAY_MS ?? 0)
+if (delay > 0) setTimeout(emit, delay)
+else emit()
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', (line) => process.stderr.write('[prompt-worker] stdin:' + line + '\\n'))
+setInterval(() => {}, 1000)
 `
 
 // ---------------------------------------------------------------------------
@@ -141,6 +166,76 @@ async function waitFor(predicate, { timeoutMs = 10000, label = 'condition' } = {
     if (Date.now() > deadline) throw new Error(`timeout waiting for ${label}`)
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
+}
+
+/** 在 127.0.0.1 上监听临时端口，resolve 端口号。 */
+function listen(server) {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve(server.address().port))
+  })
+}
+
+/** 关停 net server：先断存量连接再 close，1s 兜底保证绝不悬挂。 */
+function closeServer(server) {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    try {
+      server.close(done)
+      server.closeAllConnections?.()
+    } catch {
+      // 已关闭。
+    }
+    setTimeout(done, 1000).unref?.()
+  })
+}
+
+/**
+ * 假 prompt ingress：TCP JSONL，请求一行回一行响应。prompt 立即应答
+ * （id 见 delayForId 延迟），ping 回 {"pong":true}；记录全部请求行与连接数。
+ */
+function createFakeIngress(delayForId = () => 0) {
+  const requests = []
+  const connections = []
+  const server = net.createServer((socket) => {
+    connections.push(socket)
+    const lines = readline.createInterface({ input: socket })
+    // 客户端异常断开时 readline 可能把 socket 错误转发成 Interface 'error'。
+    lines.on('error', () => {})
+    lines.on('line', (line) => {
+      const text = line.trim()
+      if (!text) return
+      requests.push(text)
+      let msg = null
+      try { msg = JSON.parse(text) } catch { return }
+      if (msg === null || typeof msg !== 'object') return
+      if (msg.method === 'ping') {
+        socket.write('{"pong":true}\n')
+        return
+      }
+      if (msg.method === 'prompt' && Number.isInteger(msg.id)) {
+        const respond = () => socket.write(`${JSON.stringify({
+          id: msg.id,
+          ok: true,
+          result: {
+            answer: `pong:${msg.params?.text ?? ''}`,
+            status: 'completed',
+            steps: 2,
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          },
+        })}\n`)
+        const delay = delayForId(msg.id)
+        if (delay > 0) setTimeout(respond, delay)
+        else respond()
+      }
+    })
+  })
+  return { server, requests, connections }
 }
 
 /** 模拟 Cordis 宿主：logger、tools 注册表、延迟执行的 effect 生成器。 */
@@ -613,19 +708,318 @@ function defineWorkerPluginTests(workerPath) {
 }
 
 // ---------------------------------------------------------------------------
+// prompt 中转（dsh 通道）与配置解析
+// ---------------------------------------------------------------------------
+
+function definePromptRelayTests(workerPath, workerPromptPath) {
+  const STDIN_PREFIX = '[prompt-worker] stdin:'
+
+  /** 从 lastStderr 里取出 worker 回显的 stdin 响应信封。 */
+  function echoedEnvelopes(plugin) {
+    return plugin.lastStderr.toArray()
+      .filter((line) => line.startsWith(STDIN_PREFIX))
+      .map((line) => JSON.parse(line.slice(STDIN_PREFIX.length)))
+  }
+
+  test('resolveWorkerConfig：新键默认值与 family→gpio 兼容映射', () => {
+    const cfg = resolveWorkerConfig({})
+    assert.equal(cfg.llm, 'dsh')
+    assert.equal(cfg.promptAddr, '127.0.0.1:7422')
+    assert.equal(cfg.promptTimeoutMs, 300000)
+    assert.equal(cfg.gpio, null)
+    assert.equal(resolveWorkerConfig({ family: 'esp32' }).gpio, 'esp32')
+    assert.equal(resolveWorkerConfig({ family: 'esp32', gpio: 'stm32f1' }).gpio, 'stm32f1')
+    assert.equal(resolveWorkerConfig({ gpio: '' }).gpio, null)
+    assert.equal(resolveWorkerConfig({ llm: 'router' }).llm, 'router')
+    assert.equal(resolveWorkerConfig({ llm: 'bogus' }).llm, 'dsh')
+    assert.equal(resolveWorkerConfig({ promptTimeoutMs: 10 }).promptTimeoutMs, 300000)
+    assert.equal(resolveWorkerConfig({ promptTimeoutMs: 1500 }).promptTimeoutMs, 1500)
+    assert.equal(resolveWorkerConfig({ promptAddr: '  ' }).promptAddr, '127.0.0.1:7422')
+  })
+
+  test('splitHostPort / parsePromptRequest：纯函数行为', () => {
+    assert.deepEqual(splitHostPort('127.0.0.1:7422'), { host: '127.0.0.1', port: 7422 })
+    assert.deepEqual(splitHostPort('[::1]:7422'), { host: '::1', port: 7422 })
+    assert.equal(splitHostPort('localhost'), null)
+    assert.equal(splitHostPort(':7422'), null)
+    assert.equal(splitHostPort('host:'), null)
+    assert.equal(splitHostPort('host:0'), null)
+    assert.equal(splitHostPort('host:99999'), null)
+    assert.deepEqual(parsePromptRequest('  {"id":7,"method":"prompt","params":{"text":"hi"}}  '), {
+      id: 7,
+      raw: '{"id":7,"method":"prompt","params":{"text":"hi"}}',
+    })
+    assert.equal(parsePromptRequest('this-line-is-not-json'), null)
+    assert.equal(parsePromptRequest('{"id":7,"method":"workers","params":{}}'), null)
+    assert.equal(parsePromptRequest('{"method":"prompt","params":{}}'), null)
+    assert.equal(parsePromptRequest('{"id":"x","method":"prompt","params":{}}'), null)
+    assert.equal(parsePromptRequest('{"id":7,"method":"prompt"}'), null)
+    assert.equal(parsePromptRequest('{"id":7,"method":"prompt","params":"text"}'), null)
+  })
+
+  test('worker 插件（dsh 通道）：prompt 请求经假 ingress 中转，响应原样回投 worker stdin', async () => {
+    const ingress = createFakeIngress()
+    const port = await listen(ingress.server)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'dsh',
+      promptAddr: `127.0.0.1:${port}`,
+      promptTimeoutMs: 5000,
+    })
+    let seenArgs = null
+    plugin.workerSpawnTarget = (bin, args) => {
+      seenArgs = args
+      return {
+        command: process.execPath,
+        args: [workerPromptPath, ...args],
+        env: { ...process.env, FAKE_PROMPT_IDS: '7' },
+      }
+    }
+    host.start()
+    try {
+      await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
+      // argv：默认通道 dsh、不带 --prompt-addr、GPIO 默认关闭（无 --gpio/--family）。
+      assert.deepEqual(seenArgs, ['connect', '127.0.0.1:7421', '--worker-id', 'pc-worker', '--llm', 'dsh'])
+      await waitFor(() => ingress.requests.length >= 1, { label: 'ingress received request' })
+      assert.equal(ingress.requests[0], '{"id":7,"method":"prompt","params":{"text":"hello-7"}}')
+      await waitFor(() => echoedEnvelopes(plugin).length >= 1, { label: 'response echoed from worker stdin' })
+      const envelopes = echoedEnvelopes(plugin)
+      assert.deepEqual(envelopes[0], {
+        id: 7,
+        ok: true,
+        result: {
+          answer: 'pong:hello-7',
+          status: 'completed',
+          steps: 2,
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        },
+      })
+      assert.equal(plugin.pendingPrompts.size, 0, 'prompt finished; no pending entry left')
+      const status = await host.tools.get('sekai_worker_status').execute({}, {})
+      assert.equal(status.llm, 'dsh')
+    } finally {
+      host.teardown()
+      await closeServer(ingress.server)
+    }
+    assert.equal(plugin.stopped, true)
+    assert.equal(plugin.pendingPrompts.size, 0)
+  })
+
+  test('worker 插件（dsh 通道）：并发 prompt 各自独立连接、id 各自匹配', async () => {
+    const ingress = createFakeIngress((id) => (id === 3 ? 200 : 0))
+    const port = await listen(ingress.server)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'dsh',
+      promptAddr: `127.0.0.1:${port}`,
+      promptTimeoutMs: 5000,
+    })
+    plugin.workerSpawnTarget = (bin, args) => ({
+      command: process.execPath,
+      args: [workerPromptPath, ...args],
+      env: { ...process.env, FAKE_PROMPT_IDS: '3,9' },
+    })
+    host.start()
+    try {
+      await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
+      await waitFor(() => echoedEnvelopes(plugin).length >= 2, { label: 'both responses echoed' })
+      const envelopes = echoedEnvelopes(plugin)
+      const byId = new Map(envelopes.map((env) => [env.id, env]))
+      assert.equal(byId.size, 2)
+      assert.equal(byId.get(9).result.answer, 'pong:hello-9')
+      assert.equal(byId.get(3).result.answer, 'pong:hello-3')
+      assert.equal(ingress.connections.length, 2, 'one connection per prompt request')
+      assert.equal(plugin.pendingPrompts.size, 0)
+    } finally {
+      host.teardown()
+      await closeServer(ingress.server)
+    }
+  })
+
+  test('worker 插件（dsh 通道）：ingress 不可达 → unreachable 错误信封回投', async () => {
+    // 先占一个临时端口再关掉监听，保证连接被拒绝。
+    const probe = net.createServer(() => {})
+    const port = await listen(probe)
+    await closeServer(probe)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'dsh',
+      promptAddr: `127.0.0.1:${port}`,
+      promptTimeoutMs: 5000,
+    })
+    plugin.workerSpawnTarget = (bin, args) => ({
+      command: process.execPath,
+      args: [workerPromptPath, ...args],
+      env: { ...process.env, FAKE_PROMPT_IDS: '9' },
+    })
+    host.start()
+    try {
+      await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
+      await waitFor(
+        () => echoedEnvelopes(plugin).some((env) => env.error?.code === 'unreachable'),
+        { timeoutMs: 15000, label: 'unreachable envelope written back' },
+      )
+      const envelope = echoedEnvelopes(plugin).find((env) => env.error?.code === 'unreachable')
+      assert.equal(envelope.id, 9)
+      assert.equal(envelope.ok, false)
+      assert.ok(typeof envelope.error.message === 'string' && envelope.error.message.length > 0)
+      assert.equal(plugin.pendingPrompts.size, 0)
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('worker 插件（dsh 通道）：ingress 不应答 → timeout 错误信封回投', async () => {
+    const server = net.createServer(() => { /* 接受连接但永不回答 */ })
+    const port = await listen(server)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'dsh',
+      promptAddr: `127.0.0.1:${port}`,
+      promptTimeoutMs: 1000,
+    })
+    plugin.workerSpawnTarget = (bin, args) => ({
+      command: process.execPath,
+      args: [workerPromptPath, ...args],
+      env: { ...process.env, FAKE_PROMPT_IDS: '11' },
+    })
+    host.start()
+    try {
+      await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
+      await waitFor(
+        () => echoedEnvelopes(plugin).some((env) => env.error?.code === 'timeout'),
+        { timeoutMs: 15000, label: 'timeout envelope written back' },
+      )
+      const envelope = echoedEnvelopes(plugin).find((env) => env.error?.code === 'timeout')
+      assert.equal(envelope.id, 11)
+      assert.equal(envelope.ok, false)
+      assert.match(envelope.error.message, /1000ms/)
+      assert.equal(plugin.pendingPrompts.size, 0)
+    } finally {
+      host.teardown()
+      await closeServer(server)
+    }
+  })
+
+  test('worker 插件（off 通道）：stdout 的 prompt JSON 行只记日志，不建连接', async () => {
+    const ingress = createFakeIngress()
+    const port = await listen(ingress.server)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'off',
+      promptAddr: `127.0.0.1:${port}`,
+    })
+    let seenArgs = null
+    plugin.workerSpawnTarget = (bin, args) => {
+      seenArgs = args
+      return {
+        command: process.execPath,
+        args: [workerPromptPath, ...args],
+        env: { ...process.env, FAKE_PROMPT_IDS: '5' },
+      }
+    }
+    host.start()
+    try {
+      await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
+      assert.deepEqual(seenArgs, ['connect', '127.0.0.1:7421', '--worker-id', 'pc-worker', '--llm', 'off'])
+      await waitFor(
+        () => host.entries.some(([level, message]) => level === 'info' && message.includes('[worker stdout] {"id":5,"method":"prompt"')),
+        { label: 'prompt line logged instead of relayed' },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(ingress.connections.length, 0, 'no ingress connection in off mode')
+      assert.equal(plugin.pendingPrompts.size, 0)
+    } finally {
+      host.teardown()
+      await closeServer(ingress.server)
+    }
+  })
+
+  test('worker 插件：argv 反映 llm=router 的 --prompt-addr 与 --gpio（family 兼容）', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'router',
+      promptAddr: '192.0.2.10:7422',
+      family: 'esp32',
+    })
+    let seenArgs = null
+    plugin.workerSpawnTarget = (bin, args) => {
+      seenArgs = args
+      return {
+        command: process.execPath,
+        args: [workerPath, ...args],
+        env: { ...process.env, FAKE_WORKER_HOLD: '1', FAKE_WORKER_LIFETIME_MS: '600000' },
+      }
+    }
+    host.start()
+    try {
+      await waitFor(() => seenArgs !== null, { label: 'worker spawn' })
+      assert.deepEqual(seenArgs, [
+        'connect', '127.0.0.1:7421', '--worker-id', 'pc-worker',
+        '--llm', 'router', '--prompt-addr', '192.0.2.10:7422',
+        '--gpio', 'esp32',
+      ])
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('prompt 中转单元：timeout 触发与 dispose 清理（aborted）不泄漏挂起项', async () => {
+    const server = net.createServer(() => { /* 接受但不回答 */ })
+    const port = await listen(server)
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      llm: 'dsh',
+      promptAddr: `127.0.0.1:${port}`,
+      promptTimeoutMs: 1000,
+    })
+    // 不跑 effect（不 spawn）：直接驱动中转单元。
+    plugin.relayPrompt({ id: 43, raw: '{"id":43,"method":"prompt","params":{"text":"x"}}' })
+    assert.equal(plugin.pendingPrompts.size, 1)
+    await waitFor(
+      () => host.entries.some(([level, message]) => level === 'warn' && message.includes('#43 failed') && message.includes('timed out')),
+      { label: 'timeout failure logged' },
+    )
+    assert.equal(plugin.pendingPrompts.size, 0)
+    plugin.relayPrompt({ id: 44, raw: '{"id":44,"method":"prompt","params":{"text":"y"}}' })
+    assert.equal(plugin.pendingPrompts.size, 1)
+    plugin.stop()
+    assert.equal(plugin.pendingPrompts.size, 0, 'dispose clears pending prompts')
+    await closeServer(server)
+  })
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // 看门狗：保持事件循环存活。若某个测试的 await 永不返回且不再有定时器，
+  // 事件循环会静默排空并以 exit 0 结束——看门狗把这种停滞变成显式失败。
+  const watchdog = setTimeout(() => {
+    console.error('smoke harness stalled: suite did not finish within 300s')
+    process.exit(1)
+  }, 300000)
+
   const dir = await mkdtemp(join(tmpdir(), 'sekai-dsh-smoke-'))
   const servePath = join(dir, 'fake-serve.mjs')
   const workerPath = join(dir, 'fake-worker.mjs')
+  const workerPromptPath = join(dir, 'fake-prompt-worker.mjs')
   await writeFile(servePath, FAKE_SERVE, 'utf8')
   await writeFile(workerPath, FAKE_WORKER, 'utf8')
+  await writeFile(workerPromptPath, FAKE_WORKER_PROMPT, 'utf8')
 
   defineJsonlProcessTests(servePath)
   defineRouterPluginTests(servePath)
   defineWorkerPluginTests(workerPath)
+  definePromptRelayTests(workerPath, workerPromptPath)
 
   const failures = []
   for (const { name, fn } of tests) {
@@ -643,9 +1037,11 @@ async function main() {
 
   if (failures.length > 0) {
     console.error(`\n${failures.length}/${tests.length} smoke tests failed`)
+    clearTimeout(watchdog)
     process.exit(1)
   }
   console.log(`\nall ${tests.length} smoke tests passed`)
+  clearTimeout(watchdog)
   process.exit(0)
 }
 

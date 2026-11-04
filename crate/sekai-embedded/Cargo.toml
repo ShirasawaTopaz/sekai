@@ -1,6 +1,8 @@
 [package]
 name = "sekai-embedded"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Sekai 嵌入式 Worker 启动层（ESP32 固件）：MQTT 传输、硬件时间与真实 GPIO"
 
 [dependencies]

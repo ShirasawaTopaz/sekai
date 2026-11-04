@@ -1,6 +1,8 @@
 [package]
 name = "sekai-router"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Sekai Router：常驻路由器，把自然语言目标评估/派工给 Worker 并汇总回答（DeepSeek function tools）"
 
 [lib]

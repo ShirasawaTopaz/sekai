@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Sekai bridge",
-    "description": "Sekai router/worker bridge plugins for dsh: drives sekai-router --serve (JSONL over stdio) and the sekai-worker connect lifecycle, publishing sekai_* tools."
+    "description": "Sekai router/worker bridge plugins for dsh: drives sekai-router --serve (JSONL over stdio) and the sekai-worker connect lifecycle (PC agent, with prompt relaying and opt-in virtual GPIO), publishing sekai_* tools."
   }
 }

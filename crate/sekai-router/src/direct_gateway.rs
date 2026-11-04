@@ -31,7 +31,9 @@ use sekai_worker::link::Link;
 
 use crate::control::{CommandKind, CommandRequest, CommandResult, ControlPlaneConfig};
 use crate::direct::{AcceptedTcpLink, DirectListener, DirectWorkerEndpoint, StdioWorkerLink};
-use crate::gateway::{GatewayError, GatewayOp, GatewaySnapshot, WorkerGateway, call_budget_ms};
+use crate::gateway::{
+    CommandReceipt, GatewayError, GatewayOp, GatewaySnapshot, WorkerGateway, call_budget_ms,
+};
 
 /// 主线程等待就绪时的轮询间隔（毫秒）。
 const WAIT_READY_POLL_MS: u64 = 5;
@@ -125,6 +127,10 @@ impl Link for ServerLink {
 }
 
 /// IO 线程状态。
+// Connected 变体（端点 + 可选监听器）显著大于其余变体：该枚举为 IO 线程
+// 独占、切换频率低，装箱省内存会牵动全部构造与 match 位点，得不偿失，
+// 此处显式豁免 large_enum_variant。
+#[allow(clippy::large_enum_variant)]
 enum IoState {
     /// tcp：等待 Worker 连入。
     Accepting { listener: DirectListener },
@@ -290,7 +296,7 @@ impl WorkerGateway for DirectGateway {
         self.snapshot().workers
     }
 
-    fn call(&mut self, mut request: CommandRequest) -> Result<CommandResult, GatewayError> {
+    fn submit(&mut self, mut request: CommandRequest) -> Result<CommandReceipt, GatewayError> {
         if request.ddl_ms == 0 {
             request.ddl_ms = self.config.default_ddl_ms.max(1);
         }
@@ -313,16 +319,7 @@ impl WorkerGateway for DirectGateway {
                 reply: reply_tx,
             })
             .map_err(|_| GatewayError::new("link_lost", "直连 IO 线程已退出"))?;
-        match reply_rx.recv_timeout(Duration::from_millis(budget)) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(GatewayError::new(
-                "timeout",
-                "等待Worker最终事件超时（IO 线程未在预算内回复）",
-            )),
-            Err(RecvTimeoutError::Disconnected) => {
-                Err(GatewayError::new("link_lost", "直连 IO 线程已退出"))
-            }
-        }
+        Ok(CommandReceipt::new(reply_rx, budget, "直连"))
     }
 
     fn wait_ready(&mut self, timeout_ms: u64) -> Result<(), GatewayError> {

@@ -1,6 +1,8 @@
 [package]
 name = "sekai-build"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "builder"
 # `cargo run -p sekai-build` 必须选中宿主驱动，而不是固件镜像。
 default-run = "sekai-build"
