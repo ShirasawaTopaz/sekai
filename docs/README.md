@@ -15,6 +15,7 @@
 | [sekai-gpio.md](sekai-gpio.md) | GPIO 抽象与 `gpio.*` 用户工具：家族引脚表、能力/保留标志、四个工具的语法、错误映射 | 现行（`--gpio` opt-in） |
 | [sekai-esp32.md](sekai-esp32.md) | ESP32 固件指南：Xtensa 工具链安装、`sekai-build` 构建/烧录、WiFi/MQTT 参数、最小链路与排障 | 现行（阶段置后） |
 | [sekai-dsh-plugin.md](sekai-dsh-plugin.md) | Sekai × DSH 插件：双插件形态、serve JSONL 协议概览、安装配置 | 现行 |
+| [sekai-feishu.md](sekai-feishu.md) | 飞书对话入口（`--feishu`）：长连接协议契约、消息回路、安全模型、工作包与建连引导 skill | 现行 |
 | [sekai-ai.md](sekai-ai.md) | AI 控制端（`crate/sekai-ai`/`sekai-agent`）设计与验收记录 | **历史**（角色现由 `crate/sekai-router` 承担） |
 | [sekai-ai-plan.md](sekai-ai-plan.md) | AI 控制端的计划文档 | 历史 |
 | [sekai-gpio-plan.md](sekai-gpio-plan.md) | GPIO 抽象的计划文档 | 历史 |
@@ -63,6 +64,9 @@
    工具面、JSONL 协议 v1 细节。
 3. [sekai-pc-agent.md](sekai-pc-agent.md) —— 模型可调用的 `pc.*` 语法与 prompt
    JSONL 协议；`--gpio` 开启后另见 [sekai-gpio.md](sekai-gpio.md) 的 `gpio.*` 语法。
+4. 想把飞书接成对话入口（`--feishu`）：读
+   [sekai-feishu.md](sekai-feishu.md)，并加载
+   [skills/feishu-setup/SKILL.md](../skills/feishu-setup/SKILL.md) 引导用户建连。
 
 ## 写作约定
 

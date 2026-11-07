@@ -34,6 +34,7 @@ sekai-router
 | 全屏 TUI | `sekai-router --tui` | 状态栏 + 滚动输出 + 输入行；非终端时自动回退 REPL |
 | 只看链路 | `sekai-router --dry-run` | 连接并列出 Worker，不调用 LLM |
 | 无头服务 | `sekai-router --serve` | stdin/stdout JSONL 协议 v1（`link`/`workers`/`tool_call`/`task`/`policy.*`/`prompt`），供 [DSH 插件](../../plugins/sekai-dsh/README.md)驱动 |
+| 飞书对话入口 | `sekai-router --feishu` | WebSocket 长连接收 IM 事件、REST 回复原消息；同会话注入元数据与最近 N 轮问答（内存，`SEKAI_FEISHU_CONTEXT_TURNS`）；详见 [docs/sekai-feishu.md](../../docs/sekai-feishu.md) |
 
 ## prompt ingress 与 `--prompt-addr`
 
@@ -70,7 +71,19 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 `SEKAI_MQTT_ADDR`、`SEKAI_MQTT_USERNAME/PASSWORD`、`SEKAI_TOPIC_ROOT`
 （默认 `sekai/v1`）、`SEKAI_WORKER_BIN`、`SEKAI_ROUTER_TRACE`，以及调参用的
 `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` /
-`SEKAI_HTTP_TIMEOUT_MS`。完整清单以 `sekai-router --help` 为准。
+`SEKAI_HTTP_TIMEOUT_MS`，以及飞书入口的 `SEKAI_FEISHU_*`（凭据/allowlist/
+`SEKAI_FEISHU_CONTEXT_TURNS` 等，见 [docs/sekai-feishu.md](../../docs/sekai-feishu.md) §8）。
+完整清单以 `sekai-router --help` 为准。
+
+> **agent 步数上限按 Worker 形态区分**：`--max-steps` / `SEKAI_MAX_STEPS` 显式给出时
+> 两类链路都用该值；缺省时**直连 PC Worker（`--link stdio/tcp`）不设上限**，只由模型
+> 完成 / 取消（`/cancel`、Ctrl-C、serve `cancel`、飞书 `/cancel`）/ LLM 错误终止；
+> **非 PC Worker（`--link mqtt`，嵌入式）保留 12**。prompt 请求级 `max_steps`
+> （1..=32）与 `SEKAI_FEISHU_MAX_STEPS` 仍是显式上限。
+>
+> 未显式指定时，**运行期改写链路也会重算**：交互 REPL / TUI 的 `/link tcp|stdio|mqtt`
+> 与 serve 的 `link` 请求都会把新链路的默认值同步到会话与 prompt hub（`/link off`
+> 后保持原值；prompt 本身会因未建链失败）。显式 `--max-steps` 则固定不变。
 
 ## 退出码
 
@@ -95,9 +108,10 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 `direct_gateway.rs` / `direct.rs`（WorkerGateway 与直连接入）· `worker.rs`
 （注册表）· `control.rs`（命令下发与超时）· `session.rs`（命令层，REPL 与 TUI
 共用）· `repl.rs` / `tui.rs`（前端）· `serve.rs`（JSONL 无头模式）·
-`prompt_server.rs`（prompt ingress）· `tools.rs`（Policy）· `prompt.rs`
-（提示词）· `link_builder.rs` / `host_link.rs` · `topic.rs` · `http.rs` ·
-`trace.rs`（脱敏 trace）· `config.rs`。
+`prompt_server.rs`（prompt ingress）· `feishu.rs`（飞书前端）· `ws.rs` /
+`pbbp.rs` / `sha1.rs`（飞书长连接协议面）· `tools.rs`（Policy）· `prompt.rs`
+（提示词/会话上下文段）· `link_builder.rs` / `host_link.rs` · `topic.rs` ·
+`http.rs` · `trace.rs`（脱敏 trace）· `config.rs`。
 
 协议细节见 [docs/sekai-protocol.md](../../docs/sekai-protocol.md)；PC agent 与
 prompt 通道见 [docs/sekai-pc-agent.md](../../docs/sekai-pc-agent.md)；serve 协议与

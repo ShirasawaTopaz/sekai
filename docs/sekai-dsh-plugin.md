@@ -83,7 +83,8 @@ profile 的 `cordis.patch.yml`（用户层）：
   **v1.1 追加（additive）**：`prompt{text,max_steps?}`——与 TCP prompt ingress 共用同一
   核心，把 prompt 交给 Router 内置 LLM 回路生成回答（需 API key；响应
   `result:{answer,status,steps,usage}`；错误码与防递归见
-  [sekai-pc-agent.md](sekai-pc-agent.md) §4–§5）。
+  [sekai-pc-agent.md](sekai-pc-agent.md) §4–§5）。未传 `max_steps` 时随 Router 全局：
+  **直连 PC Worker（默认 `link:'tcp'`）不设上限**，MQTT/嵌入式仍为 12。
   **v1.2 追加（additive）**：
   - `tool_call` / `task` 支持 `async:true`：立即回
     `result:{accepted:true,cmd_id,worker_id,kind,name,async:true}`，完成后发无 id 通知

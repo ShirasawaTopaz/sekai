@@ -23,6 +23,11 @@ Worker `pc.ask` 使用的 JSONL 信封是**带外传输层能力**——它只�
 Worker↔DSH 插件的 stdin/stdout 上，不新增帧类型、错误码或 `content_type`，V1
 Stdin/Stdout 帧一字不变。全量定义见 [sekai-pc-agent.md](sekai-pc-agent.md) §4。
 
+**飞书入口（带外，不改变本协议）**：`sekai-router --feishu` 从飞书开放平台长连接
+（WebSocket + pbbp2 帧）接收 IM 事件、经 REST 回复，事件最终进入同一
+`PromptCore::run_prompt`；同样不新增帧类型、错误码或 `content_type`，V1
+Stdin/Stdout 帧一字不变。全量定义见 [sekai-feishu.md](sekai-feishu.md)。
+
 ### 0.2 术语表
 
 | 术语 | 含义 |

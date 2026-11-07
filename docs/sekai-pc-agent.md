@@ -171,6 +171,10 @@ gpio=<esp32|stm32f1|stm32f4|none>
 `params.text` 必填（1..=8192 字节）；可选 `params.max_steps`（1..=32）限定该次评估的
 agent 步数上限。
 
+> 未传 `params.max_steps` 时用 Router 的全局步数设置：**直连 PC Worker（stdio/tcp）
+> 默认不设上限**（只由模型完成 / 取消 / LLM 错误终止），非 PC Worker（MQTT/嵌入式）
+> 默认 12；`SEKAI_MAX_STEPS` / `--max-steps`（1..=64）可显式收敛两类链路。
+
 > **注意**：8192 字节是 ingress / HTTP 类客户端的协议上限。经 Worker `pc.ask` 发出的
 > prompt 会作为 V1 Task 载荷传输，受 `MAX_PAYLOAD = 4096` 字节限制（见
 > `docs/sekai-protocol.md` §9.4）。

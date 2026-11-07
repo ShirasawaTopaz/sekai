@@ -125,6 +125,7 @@ cross-goal context is retained).
 | Spawn subprocess | `sekai-router --link stdio` (or `/link stdio` in REPL) | Router spawns `sekai-worker`; stdin/stdout are the link — single-process demo |
 | Full-screen TUI | `sekai-router --tui` | ratatui UI: status bar + scrolling output + input line; falls back to line REPL when not a TTY |
 | Headless service | `sekai-router --serve` | JSONL over stdio (link operations need no LLM/API key; the `prompt` method invokes the built-in LLM loop) for the [DSH plugin](plugins/sekai-dsh) |
+| Feishu chat entry | `sekai-router --feishu` | Receives IM events over a WebSocket long connection and replies via REST; injects per-chat session metadata and the last N turns (in-memory, `SEKAI_FEISHU_CONTEXT_TURNS`, default 8). Needs `SEKAI_FEISHU_APP_ID`/`_APP_SECRET`; link defaults to tcp; see [docs/sekai-feishu.md](docs/sekai-feishu.md) and the [setup skill](skills/feishu-setup/SKILL.md) |
 | MQTT link | `SEKAI_MQTT_ADDR=127.0.0.1:1883 sekai-router --goal "…"` | Embedded-style link (default `--link mqtt`); needs an MQTT 5 broker |
 | Link check only | `sekai-router --dry-run` | Connect and list Workers without calling the LLM |
 
@@ -135,18 +136,20 @@ cross-goal context is retained).
 | `DEEPSEEK_API_KEY` (or `API_KEY`) | DeepSeek API key | none (required for LLM) |
 | `DEEPSEEK_BASE_URL` (or `BASE_URL`) | OpenAI-compatible base URL | `https://api.deepseek.com` |
 | `SEKAI_ROUTER_MODEL` | Model name | `deepseek-flash` |
+| `SEKAI_ROUTER_REASONING_EFFORT` | Thinking effort: enables thinking and sends `reasoning_effort` (`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`; thinking stays off when unset) | unset (off) |
 | `SEKAI_LINK` | Link type `mqtt`/`stdio`/`tcp` | `mqtt` |
 | `SEKAI_LISTEN_ADDR` | TCP listen address | `127.0.0.1:7421` |
 | `SEKAI_PROMPT_ADDR` | Router prompt ingress address (`HOST:PORT`/`off`; interactive/serve default `127.0.0.1:7422`, batch default `off`) | see left |
 | `SEKAI_INGRESS_TOKEN` | prompt ingress auth token (required for remote peers, optional on loopback) | none |
 | `SEKAI_INGRESS_ALLOW_REMOTE` | Allow ingress to bind a non-loopback address (`1` to opt in) | off |
 | `SEKAI_HTTPS_MODE` | HTTPS backend: `native` (in-process TLS, default) / `helper` (node/curl fallback) | `native` |
+| `SEKAI_FEISHU_APP_ID` / `SEKAI_FEISHU_APP_SECRET` / `SEKAI_FEISHU_ALLOW_USERS` / `SEKAI_FEISHU_ALLOW_CHATS` / `SEKAI_FEISHU_CONTEXT_TURNS` | Feishu entry credentials, allowlist and context turns (default deny, no `*`; credentials required by `--feishu`; `CONTEXT_TURNS` defaults to 8, 0 disables multi-turn memory; other `SEKAI_FEISHU_*` in [docs/sekai-feishu.md](docs/sekai-feishu.md) §8) | none / empty / 8 |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` internal timeout (100..=300000) | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` internal hard timeout (1000..=300000) | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker address (mqtt link) | none |
 | `SEKAI_WORKER_BIN` | Worker binary for the stdio link | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT topic root | `sekai/v1` |
-| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent steps / DDL / command timeout / wait-for-worker | 12 / 10000ms / — / 5000ms |
+| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent steps / DDL / command timeout / wait-for-worker (steps default: unlimited on a direct PC Worker link, `12` over MQTT/embedded) | see left / 10000ms / — / 5000ms |
 | `SEKAI_ROUTER_TRACE` | Redacted JSONL trace path | off |
 
 Full list in `sekai-router --help`.
@@ -185,6 +188,7 @@ self-explanatory.
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO abstraction, pin tables, `gpio.*` tool syntax & AI call flow (embedded demo behind `--gpio`) | Board-level devs, GPIO integrators |
 | [docs/sekai-esp32.md](docs/sekai-esp32.md) | ESP32 firmware: toolchain, build & flash, WiFi/MQTT link, troubleshooting | Firmware devs |
 | [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH plugin topology and the serve protocol at a glance | DSH users, plugin implementers |
+| [docs/sekai-feishu.md](docs/sekai-feishu.md) | Feishu (Lark) chat entry `--feishu`: long-connection protocol, message loop, security model, setup skill | Feishu integrators, Router implementers |
 | [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md) | Full DSH plugin configuration (install, config keys, JSONL protocol) | Plugin users |
 | [docs/sekai-ai.md](docs/sekai-ai.md) | Historical: AI control-plane design record (now realized by the Router) | Evolution history |
 | [docs/sekai-ai-plan.md](docs/sekai-ai-plan.md) / [docs/sekai-gpio-plan.md](docs/sekai-gpio-plan.md) | Historical plan documents | As needed |

@@ -3,6 +3,47 @@
 本文件记录面向使用者的变更。格式参考 Keep a Changelog；版本遵循
 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **飞书对话入口**（`--feishu`）：企业自建应用机器人经 WebSocket 长连接接收
+  IM 事件、REST 回复原消息，复用 prompt 通道共享核心（`deny_llm_relay`、全局
+  4 路并发、策略/网关快照）；支持 `/cancel`、`/status`、allowlist（默认拒绝）、
+  每 chat 限流与 stderr 审计；建连引导见
+  [skills/feishu-setup](skills/feishu-setup/SKILL.md)，协议与安全模型见
+  [docs/sekai-feishu.md](docs/sekai-feishu.md)。零新增依赖（SHA-1/base64/
+  WebSocket/pbbp 均为仓内实现）。
+- **LLM 思考模式**：`SEKAI_ROUTER_REASONING_EFFORT` 启用 thinking 并指定强度
+  （`low`/`high`/`max` 等，缺省仍关闭）；响应 `reasoning_content` 会回填到
+  assistant 消息（带 tools 的多轮必需），`LlmConfig`/`ChatResponse` 同步扩展。
+- **飞书会话上下文（多轮记忆）**：Router 在飞书前端内直接读取 `chat_id`/
+  `chat_type`/`thread_id`/`root_id`/`parent_id`/`message_id`/发送者/消息时间，
+  注入 agent 的会话元数据段；并按会话（话题消息按 `chat_id/thread_id`）在内存
+  中保留最近 `SEKAI_FEISHU_CONTEXT_TURNS` 轮问答（默认 8，0 关闭）作为
+  user/assistant 上下文。仅内存、不落盘、不写审计/trace；重启清空、WebSocket
+  重连保留；长连接与上下文全部在 Router，Worker 不参与飞书。见
+  [docs/sekai-feishu.md](docs/sekai-feishu.md) §5.5。
+
+### 变更
+
+- **agent 步数上限按 Worker 形态区分**：直连 PC Worker（`--link stdio/tcp`，含 DSH
+  插件 `--serve --link tcp` 与飞书默认 tcp 形态）默认**不设上限**，只由模型完成、
+  取消（REPL `/cancel`、TUI Ctrl-C、serve `cancel`、飞书 `/cancel`）或 LLM 错误
+  终止；非 PC Worker（`--link mqtt`，嵌入式）**保留原上限 12**。显式
+  `--max-steps`/`SEKAI_MAX_STEPS`（1..=64）与 prompt 请求级 `max_steps`（1..=32）
+  对两类链路仍然优先。未显式指定时，交互 REPL/TUI 的 `/link` 与 serve 的 `link`
+  请求在运行期改写链路后也会按新链路重算（同步到会话与 prompt hub）。
+  `--help`、README、`docs/sekai-ai.md`、`docs/sekai-pc-agent.md`、
+  `docs/sekai-feishu.md` 同步更新。
+
+### 修复
+
+- 飞书长连接心跳：改为以协议层 **WS ping/pong** 判定存活（`WsMessage::Pong`
+  刷新存活时间），修复真连环境每 2×PingInterval 误判「心跳超时」反复重连的问题；
+  应用层 CONTROL pong 的解析保留（差异记录见
+  [docs/sekai-feishu.md](docs/sekai-feishu.md) §14「心跳实现」）。
+
 ## [0.2.0] - 2026-11-04
 
 本轮把 [缺口审计](docs/sekai-gap-audit.md) 的 B/K/P 组全部闭环（P13 实机除外）。

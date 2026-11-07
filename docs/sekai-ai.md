@@ -405,7 +405,7 @@ OpenAI 函数名必须匹配 `^[a-zA-Z0-9_-]+$`；设备工具名（`gpio.write`
 
 ```text
 messages = [system prompt, user goal]
-for step in 0..max_steps:
+for step in 0..max_steps:        # max_steps 为 None（直连 PC Worker）时不设上限
     resp = LLM.chat(messages, tools, tool_choice=auto)
     if resp.tool_calls 为空:
         return Completed(resp.content)
@@ -426,7 +426,9 @@ return MaxSteps（不伪造成功）
   命令超时用 `AgentConfig.timeout_ms`（未设置时由控制平面按 DDL + 余量计算）。
 - 网关错误里可重试码（`timeout`/`link_lost`/`device_offline`/`device_rebooted`/`device_busy`）
   只作为 `retryable` 提示回填，agent 不会自动重发。
-- `max_steps` 默认 12（`--max-steps`/环境变量可调，范围 1..=64）；达到时返回 `MaxSteps`，CLI 退出码 5。
+- `max_steps` 缺省按链路：**直连 PC Worker（stdio/tcp）不设上限**（只由模型完成 / 取消 /
+  LLM 错误终止）；**非 PC Worker（MQTT/嵌入式）默认 12**。显式 `--max-steps`/环境变量
+  （1..=64）对两类链路都生效；达到上限时返回 `MaxSteps`，CLI 退出码 5。
 - `AgentOutcome`：`status`（`Completed`/`MaxSteps`）、`final_text`、`steps`（LLM 调用次数）、
   `usage`（累加）、`tool_calls` 摘要、`had_device_failure`/`last_tool_failed`。
 
@@ -478,7 +480,7 @@ sekai-agent --dry-run [选项]
 | `--device <ID>` | 设备过滤器：只允许操作该设备；不在已发现设备中 → 退出码 3。 |
 | `--model <NAME>` | 覆盖模型名。 |
 | `--base-url <URL>` | 覆盖 API base URL（必须 `http://`/`https://`）。 |
-| `--max-steps <N>` | agent 最大步数，1..=64，默认 12。 |
+| `--max-steps <N>` | agent 最大步数，1..=64；缺省直连 PC Worker（stdio/tcp）不设上限、MQTT/嵌入式 12。 |
 | `--ddl-ms <N>` | 设备端执行预算，默认 1000；上限 300000。 |
 | `--timeout-ms <N>` | 控制端命令超时覆盖（>0）；缺省用 `DDL + 余量`。 |
 | `--wait-device-ms <N>` | 等待设备上线时间，默认 5000。 |
@@ -504,7 +506,7 @@ sekai-agent --dry-run [选项]
 | `SEKAI_MQTT_USERNAME` / `SEKAI_MQTT_PASSWORD` | 空 | MQTT 凭据。 |
 | `SEKAI_TOPIC_ROOT` | `sekai/v1` | 主题根（允许命名空间）。 |
 | `SEKAI_AI_TRACE` | 空 | trace 路径；`--trace` 优先。 |
-| `SEKAI_MAX_STEPS` | `12` | 1..=64。 |
+| `SEKAI_MAX_STEPS` | 见说明 | 1..=64；缺省按链路：直连 PC Worker 不设上限，MQTT/嵌入式 `12`。 |
 | `SEKAI_DDL_MS` | `1000` | ≤ 300000。 |
 | `SEKAI_TIMEOUT_MS` | 空 | 命令超时覆盖。 |
 | `SEKAI_WAIT_DEVICE_MS` | `5000` | 等待设备时间。 |
@@ -639,8 +641,10 @@ cargo run -p sekai-ai --bin sekai-agent -- \
 - MQTT `Maximum Packet Size = 16384`；分帧缓冲有界，超限断开重连。
 - 每设备最多 1 条在途命令；pending 数量随设备数有界。
 - 去重窗口 256/设备；无限增长的状态只保留每个设备的最新快照。
-- agent 最大步数默认 12（≤64）；tool 结果截断到约 3.5 KiB；HTTP 90s 超时、重试 3 次。
-- 不重放大命令（超时/断链）；不会因为模型输出而无限循环。
+- agent 最大步数：直连 PC Worker 默认不设上限（仅由取消/LLM 错误终止），非 PC Worker
+  默认 12（显式值 1..=64）；tool 结果截断到约 3.5 KiB；HTTP 90s 超时、重试 3 次。
+- 不重放大命令（超时/断链）；不设上限时仍不会「因模型输出而无限循环」——每步都受
+  取消令牌与 LLM 错误约束。
 
 ---
 
@@ -912,7 +916,8 @@ bash .build/check-lib.sh
 - 2：配置问题（参数/环境变量/trace 路径）。
 - 3：设备侧不可用（broker、订阅、设备发现、`--device`）。
 - 4：AI/API 侧（helper、鉴权、限流、响应非法）。
-- 5：步数用尽（目标太复杂或 prompt/工具描述需要调整）。
+- 5：步数用尽（仅在显式 `--max-steps`/`SEKAI_MAX_STEPS` 或非 PC Worker 的默认 12
+  下出现；直连 PC Worker 默认不设上限，因此不会因步数退出）。
 - 6：最终设备命令失败（设备返回 `Failed` 或控制端超时，且 agent 循环在失败调用后结束），
   或网关级错误（链路在命令期间断开等）。若模型在失败后继续查询并解释了原因，按退出码 0 处理。
 

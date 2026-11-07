@@ -84,6 +84,11 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 | `policy.workerFilter` | string | 空 | 只允许操作该 worker id；空 = 不限制 |
 | `requestTimeoutMs` | integer ≥1000 | `120000` | 单个 JSONL 请求的本地超时 |
 
+> **agent 步数**：默认 `link:'tcp'` 即直连 **PC Worker**，Router 的 agent 默认**不设
+> 步数上限**（只由完成 / 取消 / LLM 错误终止）；`link:'mqtt'`（嵌入式）仍为 12。
+> 需要收敛时在 `extraArgs` 里加 `--max-steps <N>`（1..=64），或给 `prompt` 请求传
+> `max_steps`（1..=32）。详见 Router README 与 `docs/sekai-pc-agent.md` §4。
+
 ### sekai-worker
 
 | 键 | 类型 | 默认 | 说明 |

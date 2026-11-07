@@ -114,6 +114,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | 拉起子进程 | `sekai-router --link stdio`（REPL 内 `/link stdio`） | Router 直接 spawn `sekai-worker`，stdin/stdout 即链路，单进程演示 |
 | 全屏 TUI | `sekai-router --tui` | ratatui 界面：状态栏 + 滚动输出 + 输入行；非终端管道下自动回退行式 REPL |
 | 无头服务 | `sekai-router --serve` | stdin/stdout 走 JSONL 协议（链路操作不调 LLM、无需 API key；`prompt` 方法经内置回路调 LLM），供 [DSH 插件](plugins/sekai-dsh)驱动 |
+| 飞书对话入口 | `sekai-router --feishu` | WebSocket 长连接收 IM 事件、REST 回复原消息；同会话注入会话元数据与最近 N 轮问答（内存，`SEKAI_FEISHU_CONTEXT_TURNS`，默认 8）。需 `SEKAI_FEISHU_APP_ID`/`_APP_SECRET`；链路默认 tcp；详见 [docs/sekai-feishu.md](docs/sekai-feishu.md) 与 [建连 skill](skills/feishu-setup/SKILL.md) |
 | MQTT 链路 | `SEKAI_MQTT_ADDR=127.0.0.1:1883 sekai-router --goal "…"` | 嵌入式链路沿用（默认 `--link mqtt`），需要 MQTT 5 broker |
 | 只看链路 | `sekai-router --dry-run` | 连接并列出 Worker，不调用 LLM，无需 API key |
 
@@ -124,18 +125,20 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | `DEEPSEEK_API_KEY`（或 `API_KEY`） | DeepSeek API key | 无（调 LLM 时必需） |
 | `DEEPSEEK_BASE_URL`（或 `BASE_URL`） | OpenAI 兼容 base URL | `https://api.deepseek.com` |
 | `SEKAI_ROUTER_MODEL` | 模型名 | `deepseek-flash` |
+| `SEKAI_ROUTER_REASONING_EFFORT` | 思考强度：设置后启用 thinking 并传 `reasoning_effort`（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`；缺省关闭 thinking） | 无（关闭） |
 | `SEKAI_LINK` | 链路类型 `mqtt`/`stdio`/`tcp` | `mqtt` |
 | `SEKAI_LISTEN_ADDR` | tcp 链路监听地址 | `127.0.0.1:7421` |
 | `SEKAI_PROMPT_ADDR` | Router prompt ingress 地址（`HOST:PORT`/`off`；交互/serve 默认 `127.0.0.1:7422`，批处理默认 `off`） | 见左 |
 | `SEKAI_INGRESS_TOKEN` | prompt ingress 认证 token（远程连接必需；回环可省略） | 无 |
 | `SEKAI_INGRESS_ALLOW_REMOTE` | 允许 ingress 绑定非回环地址（`1` 显式开启） | 关闭 |
 | `SEKAI_HTTPS_MODE` | HTTPS 后端：`native`（默认，进程内 TLS）/ `helper`（node/curl 回退） | `native` |
+| `SEKAI_FEISHU_APP_ID` / `SEKAI_FEISHU_APP_SECRET` / `SEKAI_FEISHU_ALLOW_USERS` / `SEKAI_FEISHU_ALLOW_CHATS` / `SEKAI_FEISHU_CONTEXT_TURNS` | 飞书入口凭据、allowlist 与会话上下文轮数（默认全拒、禁 `*`；`--feishu` 必需凭据；`CONTEXT_TURNS` 默认 8、0 关闭多轮记忆；其余 `SEKAI_FEISHU_*` 见 [docs/sekai-feishu.md](docs/sekai-feishu.md) §8） | 无 / 空 / 8 |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` 内部超时（100..=300000） | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` 内部硬超时（1000..=300000） | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker 地址（mqtt 链路） | 无 |
 | `SEKAI_WORKER_BIN` | stdio 链路拉起的 Worker 程序 | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT 主题根 | `sekai/v1` |
-| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent 步数 / 执行预算 / 命令超时 / 等待上线 | 12 / 10000ms / — / 5000ms |
+| `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent 步数 / 执行预算 / 命令超时 / 等待上线（步数缺省：直连 PC Worker 不设上限，MQTT/嵌入式 `12`） | 见左 / 10000ms / — / 5000ms |
 | `SEKAI_ROUTER_TRACE` | 脱敏 JSONL trace 路径 | 关闭 |
 
 完整清单见 `sekai-router --help`。
@@ -169,6 +172,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO 抽象、引脚表、`gpio.*` 工具语法与 AI 调用流程（`--gpio` opt-in 后的嵌入式演示） | 板级开发者、GPIO 集成者 |
 | [docs/sekai-esp32.md](docs/sekai-esp32.md) | ESP32 固件：工具链、构建烧录、WiFi/MQTT 链路、排障 | 固件开发者 |
 | [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH 插件形态与 serve 协议概览（v1.1 `prompt`、v1.2 异步/取消/管理） | DSH 使用者、插件实现者 |
+| [docs/sekai-feishu.md](docs/sekai-feishu.md) | 飞书对话入口（`--feishu`）：长连接协议、消息回路、安全模型、建连 skill | 飞书接入使用者、Router 实现者 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（0.2.0：B/K/P 缺口闭环、serve v1.2、ingress 安全、进程内 HTTPS） | 所有使用者 |
 | [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md) | DSH 插件配置全量说明（安装、config 键、JSONL 协议） | 插件使用者 |
 | [docs/sekai-ai.md](docs/sekai-ai.md) | 历史文档：AI 控制端设计记录（角色现由 Router 承担） | 了解演进史 |
