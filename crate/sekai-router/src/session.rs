@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 use sekai::sekai_device_list::Endpoint;
 
 use crate::agent::{Agent, AgentConfig, AgentError, AgentOutcome, AgentStatus, CancelToken};
+use crate::config::LinkMode;
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::link_builder::{self, LinkOptions};
 use crate::llm::ChatClient;
@@ -112,6 +113,10 @@ pub struct Session<C: ChatClient + Clone> {
     link_desc: String,
     policy: Policy,
     agent_config: AgentConfig,
+    /// 步数上限是否随链路自动取值（`--max-steps`/`SEKAI_MAX_STEPS` 未显式给出）。
+    max_steps_auto: bool,
+    /// 当前链路类型（`/link` 成功时置位、`/link off` 清空）；自动步数上限用。
+    link_mode: Option<LinkMode>,
     trace: TraceWriter,
     config: SessionConfig,
     /// `/start` 建连向导挂起态（`None` 表示未挂起）。
@@ -142,6 +147,8 @@ impl<C: ChatClient + Clone> Session<C> {
             link_desc: String::from("未连接"),
             policy,
             agent_config,
+            max_steps_auto: false,
+            link_mode: None,
             trace,
             config,
             wizard: None,
@@ -159,6 +166,22 @@ impl<C: ChatClient + Clone> Session<C> {
         // 注入即基线：poll 只报此后新增的 Worker。
         self.refresh_worker_baseline();
         self.sync_hub();
+    }
+
+    /// 让步数上限随链路自动取值（bin 在未显式 `--max-steps`/`SEKAI_MAX_STEPS`
+    /// 时开启）：直连 PC Worker 不设上限、MQTT 保留默认 12。
+    ///
+    /// `/link` 切换链路（含 `/start` 向导）后按新链路重算并同步给 prompt hub；
+    /// 显式指定过步数上限时本开关不生效（保持显式值）。
+    pub fn with_auto_max_steps(mut self, auto: bool) -> Self {
+        self.max_steps_auto = auto;
+        self.apply_auto_max_steps();
+        self
+    }
+
+    /// 当前 agent 步数上限（`None` = 不设上限；status / 测试用）。
+    pub fn max_steps(&self) -> Option<u32> {
+        self.agent_config.max_steps
     }
 
     /// 挂接 prompt 通道共享核心（bin 在启动 ingress 前注入）；
@@ -464,6 +487,7 @@ impl<C: ChatClient + Clone> Session<C> {
                 // 实际地址（端口 0 自动分配、默认端口补全后）取自监听器，
                 // 提示用户可直接复制。
                 self.link_desc = format!("tcp 监听（{actual}）");
+                self.link_mode = Some(LinkMode::Tcp);
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
                 self.sync_hub();
@@ -518,6 +542,7 @@ impl<C: ChatClient + Clone> Session<C> {
         match link_builder::spawn_stdio(&self.link_options(), &program, &spawn_args) {
             Ok((gateway, _)) => {
                 self.link_desc = format!("stdio 子进程（{program}）");
+                self.link_mode = Some(LinkMode::Stdio);
                 // 子进程 Hello 通常在数百毫秒内到达；这里不阻塞，交给 /wait。
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
@@ -567,6 +592,7 @@ impl<C: ChatClient + Clone> Session<C> {
         match link_builder::connect_mqtt(&self.link_options(), &endpoint) {
             Ok((gateway, _)) => {
                 self.link_desc = format!("mqtt broker（{display}）");
+                self.link_mode = Some(LinkMode::Mqtt);
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.refresh_worker_baseline();
                 self.sync_hub();
@@ -602,6 +628,7 @@ impl<C: ChatClient + Clone> Session<C> {
             // 旧句柄 Drop：MqttGateway/DirectGateway 在 Drop 中停 IO 线程。
             self.link_desc = String::from("未连接");
             self.last_workers.clear();
+            self.link_mode = None;
             self.sync_hub();
             true
         } else {
@@ -901,6 +928,8 @@ impl<C: ChatClient + Clone> Session<C> {
             link_desc: self.link_desc.clone(),
             policy: self.policy.clone(),
             agent_config: self.agent_config.clone(),
+            max_steps_auto: self.max_steps_auto,
+            link_mode: self.link_mode,
             trace: self.trace.clone(),
             config: self.config.clone(),
             wizard: None,
@@ -945,6 +974,23 @@ impl<C: ChatClient + Clone> Session<C> {
         if let Some(hub) = &self.hub {
             hub.set_gateway(self.gateway.clone());
             hub.set_policy(self.policy.clone());
+        }
+        // 链路变化时按新链路重算自动步数上限（显式 `--max-steps` 时不生效）。
+        self.apply_auto_max_steps();
+    }
+
+    /// 按当前链路重算步数上限（未开启自动取值 / 无链路时不改）。
+    fn apply_auto_max_steps(&mut self) {
+        if !self.max_steps_auto {
+            return;
+        }
+        let Some(mode) = self.link_mode else {
+            return;
+        };
+        let max_steps = crate::config::default_max_steps_for(mode);
+        self.agent_config.max_steps = max_steps;
+        if let Some(hub) = &self.hub {
+            hub.set_max_steps(max_steps);
         }
     }
 
@@ -1298,7 +1344,7 @@ mod tests {
             Policy::default(),
             AgentConfig {
                 model: String::from("test"),
-                max_steps: 1,
+                max_steps: Some(1),
                 ddl_ms: 1_000,
                 timeout_ms: None,
                 temperature: 0.0,
@@ -1675,5 +1721,47 @@ mod tests {
         session.set_gateway(gateway, "mock（测试）");
         assert!(session.gateway_ready(), "MockGateway 恒就绪");
         assert_eq!(session.worker_count(), 1);
+    }
+
+    /// 未显式指定步数上限时，`/link` 切换链路后按链路重算（含 hub 同步）：
+    /// 直连 PC Worker（tcp/stdio）不设上限，MQTT（非 PC Worker）保留 12。
+    #[test]
+    fn auto_max_steps_follows_link_mode() {
+        let mut session = session().with_auto_max_steps(true);
+        let hub = Arc::new(PromptCore::new(
+            NullChat,
+            Policy::default(),
+            AgentConfig {
+                model: String::from("test"),
+                max_steps: Some(4),
+                ddl_ms: 1_000,
+                timeout_ms: None,
+                temperature: 0.0,
+                max_tokens: 16,
+            },
+            TraceWriter::disabled(),
+        ));
+        session.set_prompt_hub(hub.clone());
+
+        // mqtt（嵌入式，非 PC Worker）：默认 12。
+        session.link_mode = Some(LinkMode::Mqtt);
+        session.sync_hub();
+        assert_eq!(session.max_steps(), Some(crate::config::DEFAULT_MAX_STEPS));
+        assert_eq!(hub.max_steps(), Some(crate::config::DEFAULT_MAX_STEPS));
+
+        // tcp（直连 PC Worker）：不设上限。
+        session.link_mode = Some(LinkMode::Tcp);
+        session.sync_hub();
+        assert_eq!(session.max_steps(), None);
+        assert_eq!(hub.max_steps(), None);
+    }
+
+    /// 显式上限（未开启自动取值）不被 `/link` 覆盖。
+    #[test]
+    fn explicit_max_steps_is_not_overridden_by_link() {
+        let mut session = session(); // agent_config.max_steps = Some(1)
+        session.link_mode = Some(LinkMode::Tcp);
+        session.sync_hub();
+        assert_eq!(session.max_steps(), Some(1), "显式上限保持不变");
     }
 }

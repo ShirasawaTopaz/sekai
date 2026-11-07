@@ -17,7 +17,8 @@
 //! | SEKAI_TOPIC_ROOT | - | 主题根 |
 //! | SEKAI_ROUTER_TRACE | - | JSONL trace 路径 |
 //! | SEKAI_PROMPT_ADDR | - | prompt ingress 监听地址（HOST:PORT 或 off） |
-//! | SEKAI_MAX_STEPS / SEKAI_DDL_MS / SEKAI_TIMEOUT_MS / SEKAI_WAIT_WORKER_MS / SEKAI_HTTP_TIMEOUT_MS | - | 调参 |
+//! | SEKAI_FEISHU_* | - | 飞书入口配置（`--feishu`；见 docs/sekai-feishu.md §8） |
+//! | SEKAI_MAX_STEPS / SEKAI_DDL_MS / SEKAI_TIMEOUT_MS / SEKAI_WAIT_WORKER_MS / SEKAI_HTTP_TIMEOUT_MS | - | 调参（MAX_STEPS 缺省：直连 PC Worker 不设上限、MQTT 为 12） |
 
 use std::collections::HashMap;
 use std::fmt;
@@ -32,8 +33,27 @@ use crate::topic::{DEFAULT_TOPIC_ROOT, TopicError, TopicRoot};
 pub const DEFAULT_MODEL: &str = "deepseek-flash";
 /// 默认 base URL。
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-/// 默认最大 agent 步数。
+/// 默认最大 agent 步数：**非 PC Worker 链路（MQTT/嵌入式）**的默认上限。
+///
+/// 直连 PC Worker（stdio/tcp）默认不设上限（见 [`Config::max_steps`]）；
+/// 显式 `--max-steps` / `SEKAI_MAX_STEPS` 对两类链路都生效。
 pub const DEFAULT_MAX_STEPS: u32 = 12;
+
+/// 未显式给出步数上限时按链路的默认值。
+///
+/// 直连链路 = PC Worker（同机 `crate/sekai-worker`），不设上限；MQTT 链路 =
+/// 嵌入式 Worker，保留 [`DEFAULT_MAX_STEPS`]。显式 `--max-steps`/
+/// `SEKAI_MAX_STEPS`/请求级 `max_steps` 优先，不受本函数影响。
+///
+/// 运行期改写链路（REPL `/link`、serve `link` 请求）的前端在未显式指定步数
+/// 上限时用本函数重新取值（见 `Session::sync_hub`、`ServeState::sync_prompt_hub`）。
+pub const fn default_max_steps_for(link: LinkMode) -> Option<u32> {
+    if link.is_direct() {
+        None
+    } else {
+        Some(DEFAULT_MAX_STEPS)
+    }
+}
 /// 默认 DDL（毫秒）。
 ///
 /// 与 `pc.exec` 自身的 10s 上限对齐（B4.1）：默认 10s + 控制端 5s 余量，
@@ -59,6 +79,8 @@ pub const ENV_BASE_URL: &str = "DEEPSEEK_BASE_URL";
 pub const ENV_BASE_URL_ALT: &str = "BASE_URL";
 /// 环境变量名：模型。
 pub const ENV_MODEL: &str = "SEKAI_ROUTER_MODEL";
+/// 环境变量名：思考强度（设置后启用 thinking；low/high/max 等）。
+pub const ENV_REASONING_EFFORT: &str = "SEKAI_ROUTER_REASONING_EFFORT";
 /// 环境变量名：链路类型（mqtt/stdio/tcp）。
 pub const ENV_LINK: &str = "SEKAI_LINK";
 /// 环境变量名：MQTT 地址。
@@ -89,6 +111,26 @@ pub const ENV_HTTP_TIMEOUT_MS: &str = "SEKAI_HTTP_TIMEOUT_MS";
 pub const ENV_PROMPT_ADDR: &str = "SEKAI_PROMPT_ADDR";
 /// 默认 prompt ingress 监听地址（交互与 --serve 模式；批处理默认 off）。
 pub const DEFAULT_PROMPT_ADDR: &str = "127.0.0.1:7422";
+/// 环境变量名：飞书应用 ID（`--feishu` 必需）。
+pub const ENV_FEISHU_APP_ID: &str = "SEKAI_FEISHU_APP_ID";
+/// 环境变量名：飞书应用密钥（`--feishu` 必需；Debug 脱敏）。
+pub const ENV_FEISHU_APP_SECRET: &str = "SEKAI_FEISHU_APP_SECRET";
+/// 环境变量名：飞书开放平台域名。
+pub const ENV_FEISHU_DOMAIN: &str = "SEKAI_FEISHU_DOMAIN";
+/// 默认飞书开放平台域名（Lark 用 `https://open.larksuite.com`）。
+pub const DEFAULT_FEISHU_DOMAIN: &str = "https://open.feishu.cn";
+/// 环境变量名：飞书允许的用户 id 列表（逗号分隔 open_id/user_id）。
+pub const ENV_FEISHU_ALLOW_USERS: &str = "SEKAI_FEISHU_ALLOW_USERS";
+/// 环境变量名：飞书允许的会话 id 列表（逗号分隔 chat_id）。
+pub const ENV_FEISHU_ALLOW_CHATS: &str = "SEKAI_FEISHU_ALLOW_CHATS";
+/// 环境变量名：收到消息先回「正在处理」（on/off）。
+pub const ENV_FEISHU_ACK: &str = "SEKAI_FEISHU_ACK";
+/// 环境变量名：每消息 agent 步数上限（1..=32；缺省随全局）。
+pub const ENV_FEISHU_MAX_STEPS: &str = "SEKAI_FEISHU_MAX_STEPS";
+/// 环境变量名：每会话保留的最近问答轮数（0 = 只注入会话元数据）。
+pub const ENV_FEISHU_CONTEXT_TURNS: &str = "SEKAI_FEISHU_CONTEXT_TURNS";
+/// 飞书会话上下文默认保留轮数。
+pub const DEFAULT_FEISHU_CONTEXT_TURNS: usize = 8;
 
 /// Worker 链路类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -120,6 +162,14 @@ impl LinkMode {
             Self::Stdio => "stdio",
             Self::Tcp => "tcp",
         }
+    }
+
+    /// 是否为**直连链路**（PC Worker：stdio/tcp）。
+    ///
+    /// 直连即「PC Worker 形态」（`crate/sekai-worker`，同机进程），与
+    /// MQTT 链路的嵌入式 Worker 相对；agent 默认步数上限按此区分。
+    pub const fn is_direct(&self) -> bool {
+        matches!(self, Self::Stdio | Self::Tcp)
     }
 }
 
@@ -197,6 +247,9 @@ pub struct Config {
     pub base_url: String,
     /// 模型名。
     pub model: String,
+    /// 思考强度（`SEKAI_ROUTER_REASONING_EFFORT`）：`Some` 时启用 thinking；
+    /// 取值经 DeepSeek 映射（minimal/low/medium/high/xhigh/max/ultra）。
+    pub reasoning_effort: Option<String>,
     /// 链路类型（mqtt/stdio/tcp）。
     pub link: LinkMode,
     /// MQTT broker 端点（link=mqtt 时必需，批处理模式缺失即报错）。
@@ -213,8 +266,12 @@ pub struct Config {
     pub listen_addr: String,
     /// 主题根。
     pub topic_root: TopicRoot,
-    /// agent 最大步数。
-    pub max_steps: u32,
+    /// agent 最大步数；`None` = 不设上限。
+    ///
+    /// 取值规则：`--max-steps`/`SEKAI_MAX_STEPS` 显式给出 → 两类链路都用该值；
+    /// 未给出时按链路区分——直连 PC Worker（stdio/tcp）为 `None`（不设上限），
+    /// 非 PC Worker（MQTT/嵌入式）保留 [`DEFAULT_MAX_STEPS`]。
+    pub max_steps: Option<u32>,
     /// 默认 DDL。
     pub ddl_ms: u32,
     /// 命令超时覆盖（毫秒）。
@@ -243,6 +300,18 @@ pub struct Config {
     /// 驱动）；链路操作不调用 LLM、不需要 API key（v1.1 `prompt` 方法
     /// 需要），与 --goal/--goal-file/--tui/-i/--dry-run 互斥。
     pub serve: bool,
+    /// 飞书对话入口（`--feishu`）：长连接事件泵 + REST 回复的第 4 前端
+    /// （docs/sekai-feishu.md）；与 --serve/--tui/-i/--goal/--goal-file/
+    /// --dry-run 互斥，链路未显式指定时默认 tcp，prompt ingress 默认 off。
+    pub feishu: bool,
+    /// 飞书入口配置（`SEKAI_FEISHU_*`；凭据仅在 `--feishu` 时要求非空）。
+    pub feishu_config: FeishuConfig,
+    /// link 是否被显式指定（`SEKAI_LINK` 或 `--link`）；feishu 形态据此
+    /// 决定是否覆盖为默认 tcp。
+    link_explicit: bool,
+    /// 步数上限是否被显式指定（`SEKAI_MAX_STEPS` 或 `--max-steps`）；未指定
+    /// 时 apply_args 末尾按最终链路重算默认值。
+    max_steps_explicit: bool,
     /// prompt ingress 监听地址（HOST:PORT）；None = 关闭。
     ///
     /// 默认：交互（REPL/TUI）与 --serve 模式取 [`DEFAULT_PROMPT_ADDR`]，
@@ -260,6 +329,7 @@ impl fmt::Debug for Config {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("link", &self.link.as_str())
             .field("mqtt", &self.mqtt)
             .field("mqtt_username", &self.mqtt_username)
@@ -285,6 +355,8 @@ impl fmt::Debug for Config {
             .field("interactive", &self.interactive)
             .field("tui", &self.tui)
             .field("serve", &self.serve)
+            .field("feishu", &self.feishu)
+            .field("feishu_config", &self.feishu_config)
             .field("prompt_addr", &self.prompt_addr)
             .field("trace_path", &self.trace_path)
             .finish()
@@ -320,6 +392,7 @@ impl Config {
             })?,
             None => LinkMode::default(),
         };
+        let link_explicit = env_string(env, &[ENV_LINK]).is_some();
         let worker_bin =
             env_string(env, &[ENV_WORKER_BIN]).unwrap_or_else(|| String::from(DEFAULT_WORKER_BIN));
         let listen_addr = env_string(env, &[ENV_LISTEN_ADDR])
@@ -331,14 +404,42 @@ impl Config {
             .unwrap_or_else(|| String::from(DEFAULT_BASE_URL));
         validate_base_url(&base_url)?;
         let model = env_string(env, &[ENV_MODEL]).unwrap_or_else(|| String::from(DEFAULT_MODEL));
+        let reasoning_effort = match env_string(env, &[ENV_REASONING_EFFORT]) {
+            Some(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if normalized.is_empty() {
+                    None
+                } else if matches!(
+                    normalized.as_str(),
+                    "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                ) {
+                    Some(normalized)
+                } else {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_REASONING_EFFORT,
+                        message: format!("必须是 minimal/low/medium/high/xhigh/max/ultra：{value}"),
+                    });
+                }
+            }
+            None => None,
+        };
         let api_key = env_string(env, &[ENV_API_KEY, ENV_API_KEY_ALT]);
-        let max_steps = env_u64(env, ENV_MAX_STEPS)?.unwrap_or(u64::from(DEFAULT_MAX_STEPS));
-        if !(1..=64).contains(&max_steps) {
-            return Err(ConfigError::InvalidEnv {
-                name: ENV_MAX_STEPS,
-                message: String::from("必须在 1..=64"),
-            });
-        }
+        // 显式值优先（两类链路同值）；未显式给出时按链路取默认：
+        // 直连 PC Worker 不设上限，MQTT/嵌入式 Worker 保留 DEFAULT_MAX_STEPS。
+        let max_steps_env = env_u64(env, ENV_MAX_STEPS)?;
+        let max_steps_explicit = max_steps_env.is_some();
+        let max_steps = match max_steps_env {
+            Some(value) => {
+                if !(1..=64).contains(&value) {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_MAX_STEPS,
+                        message: String::from("必须在 1..=64"),
+                    });
+                }
+                Some(value as u32)
+            }
+            None => default_max_steps_for(link),
+        };
         let ddl_ms = env_u64(env, ENV_DDL_MS)?.unwrap_or(u64::from(DEFAULT_DDL_MS));
         if ddl_ms > u64::from(MAX_DDL_MS) {
             return Err(ConfigError::InvalidEnv {
@@ -363,11 +464,13 @@ impl Config {
             });
         }
         let wait_worker_ms = env_u64(env, ENV_WAIT_WORKER_MS)?.unwrap_or(DEFAULT_WAIT_WORKER_MS);
+        let feishu_config = FeishuConfig::from_env_map(env)?;
         Ok(Self {
             goal: None,
             api_key,
             base_url,
             model,
+            reasoning_effort,
             link,
             mqtt,
             mqtt_username: env_string(env, &[ENV_MQTT_USERNAME]),
@@ -376,7 +479,7 @@ impl Config {
             worker_args: Vec::new(),
             listen_addr,
             topic_root,
-            max_steps: max_steps as u32,
+            max_steps,
             ddl_ms: ddl_ms as u32,
             timeout_ms,
             http_timeout_ms,
@@ -390,6 +493,10 @@ impl Config {
             interactive: false,
             tui: false,
             serve: false,
+            feishu: false,
+            feishu_config,
+            link_explicit,
+            max_steps_explicit,
             // 环境变量原始值（可为 off）；apply_args 里统一校验并按运行形态
             // 决定默认值。
             prompt_addr: env_string(env, &[ENV_PROMPT_ADDR]),
@@ -422,6 +529,7 @@ impl Config {
                     self.link = LinkMode::parse(&value).ok_or(ConfigError::InvalidArg(format!(
                         "--link 不支持 {value:?}（可选 mqtt/stdio/tcp）"
                     )))?;
+                    self.link_explicit = true;
                 }
                 "--worker-bin" => {
                     let value = take_value("--worker-bin")?;
@@ -474,7 +582,8 @@ impl Config {
                             "--max-steps 必须在 1..=64",
                         )));
                     }
-                    self.max_steps = value as u32;
+                    self.max_steps = Some(value as u32);
+                    self.max_steps_explicit = true;
                 }
                 "--ddl-ms" => {
                     let value = parse_u64("--ddl-ms", &take_value("--ddl-ms")?)?;
@@ -511,6 +620,7 @@ impl Config {
                 "--json" => self.json = true,
                 "--dry-run" => self.dry_run = true,
                 "--serve" => self.serve = true,
+                "--feishu" => self.feishu = true,
                 "--prompt-addr" => {
                     let value = take_value("--prompt-addr")?;
                     if value.trim().is_empty() {
@@ -543,29 +653,28 @@ impl Config {
                 "--goal 与 --goal-file 二选一",
             )));
         }
-        // --serve 与其余运行形态互斥（一次只允许一种前端）。
+        // 前端互斥（一次只允许一种）：--serve / --feishu / 交互（--tui/-i）/
+        // 批处理（--goal/--goal-file/--dry-run）。
+        let mut frontends: Vec<&str> = Vec::new();
         if self.serve {
-            let mut conflicts: Vec<&str> = Vec::new();
-            if goal.is_some() {
-                conflicts.push("--goal");
-            }
-            if goal_file.is_some() {
-                conflicts.push("--goal-file");
-            }
-            if self.tui {
-                conflicts.push("--tui");
-            } else if self.interactive {
-                conflicts.push("-i/--interactive");
-            }
-            if self.dry_run {
-                conflicts.push("--dry-run");
-            }
-            if !conflicts.is_empty() {
-                return Err(ConfigError::Conflict(format!(
-                    "--serve 与 {} 互斥",
-                    conflicts.join("/")
-                )));
-            }
+            frontends.push("--serve");
+        }
+        if self.feishu {
+            frontends.push("--feishu");
+        }
+        if self.tui {
+            frontends.push("--tui");
+        } else if self.interactive {
+            frontends.push("-i/--interactive");
+        }
+        if goal.is_some() || goal_file.is_some() || self.dry_run {
+            frontends.push("--goal/--goal-file/--dry-run");
+        }
+        if frontends.len() > 1 {
+            return Err(ConfigError::Conflict(format!(
+                "{} 互斥（一次只允许一种前端形态）",
+                frontends.join("/")
+            )));
         }
         if let Some(path) = goal_file {
             let text = std::fs::read_to_string(&path)
@@ -577,14 +686,10 @@ impl Config {
             goal = Some(String::from(text));
         }
         if let Some(goal) = goal {
-            if self.interactive {
-                return Err(ConfigError::Conflict(String::from(
-                    "--interactive 与 --goal/--goal-file 二选一（交互会话内直接输入目标）",
-                )));
-            }
+            // goal+交互的冲突已由上方前端互斥检查拦截。
             self.goal = Some(goal);
-        } else if !self.dry_run && !self.serve {
-            // 无 goal 且非 dry-run/serve：进入交互 REPL，而非报错。
+        } else if !self.dry_run && !self.serve && !self.feishu {
+            // 无 goal 且非 dry-run/serve/feishu：进入交互 REPL，而非报错。
             self.interactive = true;
         }
         // prompt ingress 地址：显式值（CLI 覆盖环境变量）校验后生效；
@@ -606,9 +711,28 @@ impl Config {
                 };
             }
         }
+        // --feishu：凭据必需；链路未显式指定时默认 tcp（常驻服务，等
+        // Worker 连入最自然；显式 --link/SEKAI_LINK 尊重用户选择）。
+        if self.feishu {
+            if self.feishu_config.app_id.trim().is_empty() {
+                return Err(ConfigError::MissingEnv(ENV_FEISHU_APP_ID));
+            }
+            if self.feishu_config.app_secret.trim().is_empty() {
+                return Err(ConfigError::MissingEnv(ENV_FEISHU_APP_SECRET));
+            }
+            if !self.link_explicit {
+                self.link = LinkMode::Tcp;
+            }
+        }
+        // 链路可能刚被改写（--link，或 --feishu 缺省 tcp）：步数上限未显式
+        // 给出时按最终链路重算默认值（直连 PC Worker 不设上限，MQTT 12）。
+        if !self.max_steps_explicit {
+            self.max_steps = default_max_steps_for(self.link);
+        }
         if !self.dry_run
             && !self.interactive
             && !self.serve
+            && !self.feishu
             && self
                 .api_key
                 .as_deref()
@@ -629,10 +753,147 @@ impl Config {
         &self.model
     }
 
+    /// 步数上限是否被显式指定（`--max-steps`/`SEKAI_MAX_STEPS`）。
+    ///
+    /// `false` 表示 `max_steps` 是按启动链路推出的默认值；前端在运行期改写
+    /// 链路时应据此重新用 [`default_max_steps_for`] 取值。
+    pub fn max_steps_explicit(&self) -> bool {
+        self.max_steps_explicit
+    }
+
     /// 目标文本；缺失时返回空串。
     pub fn goal_text(&self) -> &str {
         self.goal.as_deref().unwrap_or_default()
     }
+}
+
+/// 飞书入口配置（`SEKAI_FEISHU_*`，docs/sekai-feishu.md §8）。
+///
+/// 安全约束：凭据只从环境变量读取、Debug 脱敏、不落盘；allowlist 默认
+/// 拒绝且禁通配（`*` 直接配置错误）。结构校验（domain 协议、ack 取值、
+/// max_steps 范围）在 [`FeishuConfig::from_env_map`] 无条件执行；
+/// 「app_id/secret 必需」由 [`Config::apply_args`] 按 `--feishu` 形态判定。
+#[derive(Clone, PartialEq, Eq)]
+pub struct FeishuConfig {
+    /// 应用 ID（`cli_` 开头）。
+    pub app_id: String,
+    /// 应用密钥。
+    pub app_secret: String,
+    /// 开放平台域名（必须 `https://`；Lark 用 `https://open.larksuite.com`）。
+    pub domain: String,
+    /// 允许的用户 id 列表（open_id/user_id 混排；空 = 全拒）。
+    pub allow_users: Vec<String>,
+    /// 允许的会话 id 列表（chat_id；p2p 与群聊皆查；空 = 全拒）。
+    pub allow_chats: Vec<String>,
+    /// 收到消息先回「正在处理」（默认开）。
+    pub ack: bool,
+    /// 每消息 agent 步数上限（None = 随全局 `SEKAI_MAX_STEPS`）。
+    pub max_steps: Option<u32>,
+    /// 每会话保留的最近问答轮数（0 = 只注入会话元数据，不保留历史）。
+    pub context_turns: usize,
+}
+
+impl fmt::Debug for FeishuConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FeishuConfig")
+            .field("app_id", &self.app_id)
+            .field("app_secret", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("allow_users", &self.allow_users)
+            .field("allow_chats", &self.allow_chats)
+            .field("ack", &self.ack)
+            .field("max_steps", &self.max_steps)
+            .field("context_turns", &self.context_turns)
+            .finish()
+    }
+}
+
+impl FeishuConfig {
+    /// 从环境构造（含结构校验；见类型文档）。
+    pub fn from_env_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        let app_id = env_string(env, &[ENV_FEISHU_APP_ID]).unwrap_or_default();
+        let app_secret = env_string(env, &[ENV_FEISHU_APP_SECRET]).unwrap_or_default();
+        let domain = env_string(env, &[ENV_FEISHU_DOMAIN])
+            .unwrap_or_else(|| String::from(DEFAULT_FEISHU_DOMAIN));
+        if !domain.starts_with("https://") {
+            return Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_DOMAIN,
+                message: format!(
+                    "必须以 https:// 开头（Lark 用 https://open.larksuite.com）：{domain}"
+                ),
+            });
+        }
+        let allow_users = parse_id_list(env, ENV_FEISHU_ALLOW_USERS)?;
+        let allow_chats = parse_id_list(env, ENV_FEISHU_ALLOW_CHATS)?;
+        let ack = match env_string(env, &[ENV_FEISHU_ACK]).as_deref() {
+            None => true,
+            Some("on") | Some("ON") => true,
+            Some("off") | Some("OFF") => false,
+            Some(other) => {
+                return Err(ConfigError::InvalidEnv {
+                    name: ENV_FEISHU_ACK,
+                    message: format!("必须为 on/off：{other}"),
+                });
+            }
+        };
+        let max_steps = match env_u64(env, ENV_FEISHU_MAX_STEPS)? {
+            None => None,
+            Some(value) => {
+                if !(1..=32).contains(&value) {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_FEISHU_MAX_STEPS,
+                        message: String::from("必须在 1..=32"),
+                    });
+                }
+                Some(value as u32)
+            }
+        };
+        let context_turns = match env_u64(env, ENV_FEISHU_CONTEXT_TURNS)? {
+            None => DEFAULT_FEISHU_CONTEXT_TURNS,
+            Some(value) => {
+                if value > 50 {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_FEISHU_CONTEXT_TURNS,
+                        message: String::from("必须在 0..=50（0 关闭多轮记忆）"),
+                    });
+                }
+                value as usize
+            }
+        };
+        Ok(Self {
+            app_id,
+            app_secret,
+            domain,
+            allow_users,
+            allow_chats,
+            ack,
+            max_steps,
+            context_turns,
+        })
+    }
+}
+
+/// 解析逗号分隔 id 列表：trim、丢弃空项；值含 `*` 视为配置错误
+/// （allowlist 是显式白名单，禁通配）。
+fn parse_id_list(
+    env: &HashMap<String, String>,
+    name: &'static str,
+) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = env_string(env, &[name]) else {
+        return Ok(Vec::new());
+    };
+    if raw.contains('*') {
+        return Err(ConfigError::InvalidEnv {
+            name,
+            message: String::from("禁止通配符 *（allowlist 为显式 id 白名单）"),
+        });
+    }
+    Ok(raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(String::from)
+        .collect())
 }
 
 /// 解析命令行；先处理 --help/--version，再读环境与参数。
@@ -670,6 +931,11 @@ pub fn usage() -> String {
                                         链路操作不调 LLM、无需 API key；
                                         prompt 方法需要 key）
                                         --prompt-addr 另开 prompt ingress
+  sekai-router --feishu [选项]          飞书对话入口：WebSocket 长连接收事件、
+                                        REST 回复原消息（需 SEKAI_FEISHU_APP_ID/
+                                        _APP_SECRET；链路默认 tcp；prompt
+                                        ingress 默认 off；详见
+                                        docs/sekai-feishu.md）
 
 必需环境变量：
   {ENV_API_KEY}        DeepSeek API key（--dry-run、交互会话与 --serve 的链路操作除外；也接受 {ENV_API_KEY_ALT}）
@@ -678,6 +944,9 @@ pub fn usage() -> String {
 可选环境变量：
   {ENV_BASE_URL}        OpenAI 兼容 base URL，默认 {DEFAULT_BASE_URL}
   {ENV_MODEL}           模型名，默认 {DEFAULT_MODEL}
+  {ENV_REASONING_EFFORT}
+                        思考强度：设置后启用 thinking 并传给 API
+                        （minimal/low/medium/high/xhigh/max/ultra；缺省关闭 thinking）
   {ENV_LINK}            链路类型 mqtt/stdio/tcp，默认 mqtt
   {ENV_WORKER_BIN}      stdio 链路拉起的 Worker 程序，默认 {DEFAULT_WORKER_BIN}
   {ENV_LISTEN_ADDR}     tcp 链路监听地址，默认 {DEFAULT_LISTEN_ADDR}
@@ -686,7 +955,13 @@ pub fn usage() -> String {
   {ENV_TOPIC_ROOT}      主题根，默认 {DEFAULT_TOPIC_ROOT}
   {ENV_TRACE}           trace JSONL 路径
   {ENV_PROMPT_ADDR}     prompt ingress 监听地址（HOST:PORT 或 off），默认按运行形态
-  {ENV_MAX_STEPS} / {ENV_DDL_MS} / {ENV_TIMEOUT_MS} / {ENV_WAIT_WORKER_MS} / {ENV_HTTP_TIMEOUT_MS}
+  SEKAI_FEISHU_*        飞书入口配置（--feishu）：_APP_ID/_APP_SECRET 必需，
+                        _DOMAIN/_ALLOW_USERS/_ALLOW_CHATS/_ACK/_MAX_STEPS/
+                        _CONTEXT_TURNS 可选（docs/sekai-feishu.md §8）
+  {ENV_MAX_STEPS}        agent 最大步数（1..=64）；缺省按链路：直连 PC Worker
+                        （stdio/tcp）不设上限，MQTT/嵌入式保留 {DEFAULT_MAX_STEPS}
+  {ENV_DDL_MS} / {ENV_TIMEOUT_MS} / {ENV_WAIT_WORKER_MS} / {ENV_HTTP_TIMEOUT_MS}
+                        执行预算 / 命令超时 / 等待上线 / HTTP 超时
 
 选项：
   --goal <TEXT>         自然语言目标
@@ -702,7 +977,8 @@ pub fn usage() -> String {
   --worker <ID>         只允许操作指定Worker
   --model <NAME>        覆盖模型
   --base-url <URL>      覆盖 API base URL
-  --max-steps <N>       agent 最大步数（1..=64，默认 {DEFAULT_MAX_STEPS}）
+  --max-steps <N>       agent 最大步数（1..=64）；缺省直连 PC Worker（stdio/tcp）
+                        不设上限、MQTT/嵌入式为 {DEFAULT_MAX_STEPS}
   --ddl-ms <N>          Worker端执行预算（默认 {DEFAULT_DDL_MS}；pc.exec 等长命令
                         建议显式传更大值，pc.ask 建议 60000，上限 300000）
   --timeout-ms <N>      控制端命令超时覆盖
@@ -719,6 +995,9 @@ pub fn usage() -> String {
   --json                stdout 输出单个 JSON 结果
   --dry-run             只连接链路并列出Worker，不调用 LLM
   --serve               无头 JSONL 服务模式（与 --goal/--goal-file/--tui/-i/--dry-run 互斥）
+  --feishu              飞书对话入口：长连接事件泵 + REST 回复（docs/sekai-feishu.md；
+                        与 --serve/--tui/-i/--goal/--goal-file/--dry-run 互斥，
+                        链路未显式指定时默认 tcp）
   --trace <PATH>        写脱敏 JSONL trace
   -h, --help            显示本帮助
   --version             显示版本
@@ -830,8 +1109,9 @@ mod tests {
     fn defaults_are_applied() {
         let config = Config::from_env_map(&env()).unwrap();
         assert_eq!(config.model, DEFAULT_MODEL);
+        assert_eq!(config.reasoning_effort, None);
         assert_eq!(config.base_url, DEFAULT_BASE_URL);
-        assert_eq!(config.max_steps, DEFAULT_MAX_STEPS);
+        assert_eq!(config.max_steps, Some(DEFAULT_MAX_STEPS));
         assert_eq!(config.ddl_ms, DEFAULT_DDL_MS);
         assert_eq!(config.topic_root.as_str(), DEFAULT_TOPIC_ROOT);
         assert_eq!(config.link, LinkMode::Mqtt);
@@ -841,6 +1121,96 @@ mod tests {
         assert!(!config.allow_write);
         assert!(!config.dry_run);
         assert!(!config.interactive);
+    }
+
+    #[test]
+    fn max_steps_is_unlimited_for_direct_pc_worker_link() {
+        // MQTT（非 PC Worker，嵌入式）：保留原上限 12。
+        let config = Config::from_env_map(&env()).unwrap();
+        assert_eq!(config.link, LinkMode::Mqtt);
+        assert_eq!(config.max_steps, Some(DEFAULT_MAX_STEPS));
+
+        // 直连 = PC Worker：不设上限（SEKAI_LINK 环境变量）。
+        for link in ["stdio", "tcp"] {
+            let mut map = env();
+            map.insert(String::from(ENV_LINK), String::from(link));
+            let config = Config::from_env_map(&map).unwrap();
+            assert_eq!(config.max_steps, None, "SEKAI_LINK={link} 应不设上限");
+        }
+
+        // --link 是 CLI 覆写，同样生效（DSH 插件即 `--serve --link tcp`）。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&["--serve", "--link", "tcp"]))
+            .unwrap();
+        assert_eq!(config.link, LinkMode::Tcp);
+        assert_eq!(config.max_steps, None);
+
+        // --feishu 未显式指定链路时默认 tcp（PC Worker）：同样不设上限。
+        let mut map = env();
+        map.insert(String::from(ENV_FEISHU_APP_ID), String::from("cli_1"));
+        map.insert(String::from(ENV_FEISHU_APP_SECRET), String::from("secret"));
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&["--feishu"])).unwrap();
+        assert_eq!(config.link, LinkMode::Tcp);
+        assert_eq!(config.max_steps, None);
+    }
+
+    #[test]
+    fn explicit_max_steps_wins_over_link_default() {
+        // 环境变量显式值：直连链路也按该值收敛。
+        let mut map = env();
+        map.insert(String::from(ENV_LINK), String::from("tcp"));
+        map.insert(String::from(ENV_MAX_STEPS), String::from("7"));
+        let mut config = Config::from_env_map(&map).unwrap();
+        assert_eq!(config.max_steps, Some(7));
+
+        // CLI 显式值优先于环境变量。
+        config
+            .apply_args(&args(&["--serve", "--max-steps", "9"]))
+            .unwrap();
+        assert_eq!(config.max_steps, Some(9));
+
+        // 显式值 + 随后使用 --link 改写链路：显式值保持不变。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&["--serve", "--max-steps", "5", "--link", "tcp"]))
+            .unwrap();
+        assert_eq!(config.max_steps, Some(5));
+
+        // MQTT 链路上的显式值同样生效（不因链路丢弃）。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&["--serve", "--max-steps", "3", "--link", "mqtt"]))
+            .unwrap();
+        assert_eq!(config.max_steps, Some(3));
+    }
+
+    #[test]
+    fn reasoning_effort_env_is_validated_and_normalized() {
+        let mut map = env();
+        assert_eq!(Config::from_env_map(&map).unwrap().reasoning_effort, None);
+
+        map.insert(String::from(ENV_REASONING_EFFORT), String::from(" High "));
+        assert_eq!(
+            Config::from_env_map(&map)
+                .unwrap()
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+
+        map.insert(String::from(ENV_REASONING_EFFORT), String::new());
+        assert_eq!(Config::from_env_map(&map).unwrap().reasoning_effort, None);
+
+        map.insert(String::from(ENV_REASONING_EFFORT), String::from("turbo"));
+        assert!(matches!(
+            Config::from_env_map(&map).unwrap_err(),
+            ConfigError::InvalidEnv {
+                name: ENV_REASONING_EFFORT,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1006,6 +1376,196 @@ mod tests {
         );
     }
 
+    fn feishu_env() -> HashMap<String, String> {
+        let mut map = env();
+        map.insert(String::from(ENV_FEISHU_APP_ID), String::from("cli_test"));
+        map.insert(
+            String::from(ENV_FEISHU_APP_SECRET),
+            String::from("secret-value"),
+        );
+        map
+    }
+
+    #[test]
+    fn feishu_flag_conflicts_with_other_frontends() {
+        for bad in [
+            vec!["--feishu", "--serve"],
+            vec!["--feishu", "--goal", "x"],
+            vec!["--feishu", "--goal-file", "no-such-file.txt"],
+            vec!["--feishu", "--dry-run"],
+            vec!["--feishu", "-i"],
+            vec!["--feishu", "--tui"],
+        ] {
+            let mut config = Config::from_env_map(&feishu_env()).unwrap();
+            let error = config.apply_args(&args(&bad)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Conflict(ref text) if text.contains("--feishu")),
+                "{bad:?} 应报 --feishu 冲突，得到 {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn feishu_requires_credentials_and_defaults_link_tcp() {
+        // 缺凭据：MissingEnv，退出码 2。
+        let mut config = Config::from_env_map(&env()).unwrap();
+        let error = config.apply_args(&args(&["--feishu"])).unwrap_err();
+        assert_eq!(error, ConfigError::MissingEnv(ENV_FEISHU_APP_ID));
+        assert_eq!(error.exit_code(), 2);
+
+        let mut map = feishu_env();
+        map.remove(ENV_FEISHU_APP_SECRET);
+        let mut config = Config::from_env_map(&map).unwrap();
+        assert_eq!(
+            config.apply_args(&args(&["--feishu"])).unwrap_err(),
+            ConfigError::MissingEnv(ENV_FEISHU_APP_SECRET)
+        );
+
+        // 凭据齐全：默认链路 tcp、prompt ingress off、非交互、无 goal。
+        let mut config = Config::from_env_map(&feishu_env()).unwrap();
+        config.apply_args(&args(&["--feishu"])).unwrap();
+        assert!(config.feishu);
+        assert_eq!(config.link, LinkMode::Tcp);
+        assert_eq!(config.prompt_addr, None);
+        assert!(!config.interactive);
+        assert!(!config.serve);
+
+        // 无 API key 也可启动（运行期按 llm_unavailable 回复，见
+        // docs/sekai-feishu.md §5.2）。
+        let mut map = feishu_env();
+        map.remove(ENV_API_KEY);
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&["--feishu"])).unwrap();
+    }
+
+    #[test]
+    fn feishu_link_default_respects_explicit_link() {
+        // SEKAI_LINK 显式指定：保持用户选择，不覆盖为 tcp。
+        let mut map = feishu_env();
+        map.insert(String::from(ENV_LINK), String::from("stdio"));
+        let mut config = Config::from_env_map(&map).unwrap();
+        config.apply_args(&args(&["--feishu"])).unwrap();
+        assert_eq!(config.link, LinkMode::Stdio);
+        // --link 显式指定：同样保持。
+        let mut config = Config::from_env_map(&feishu_env()).unwrap();
+        config
+            .apply_args(&args(&["--feishu", "--link", "mqtt"]))
+            .unwrap();
+        assert_eq!(config.link, LinkMode::Mqtt);
+    }
+
+    #[test]
+    fn feishu_env_structural_validation() {
+        let mut map = feishu_env();
+        map.insert(
+            String::from(ENV_FEISHU_DOMAIN),
+            String::from("http://open.feishu.cn"),
+        );
+        assert!(matches!(
+            Config::from_env_map(&map),
+            Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_DOMAIN,
+                ..
+            })
+        ));
+
+        let mut map = feishu_env();
+        map.insert(
+            String::from(ENV_FEISHU_ALLOW_USERS),
+            String::from("ou_a,*,ou_b"),
+        );
+        assert!(matches!(
+            Config::from_env_map(&map),
+            Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_ALLOW_USERS,
+                ..
+            })
+        ));
+
+        let mut map = feishu_env();
+        map.insert(String::from(ENV_FEISHU_ACK), String::from("maybe"));
+        assert!(matches!(
+            Config::from_env_map(&map),
+            Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_ACK,
+                ..
+            })
+        ));
+
+        let mut map = feishu_env();
+        map.insert(String::from(ENV_FEISHU_MAX_STEPS), String::from("33"));
+        assert!(matches!(
+            Config::from_env_map(&map),
+            Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_MAX_STEPS,
+                ..
+            })
+        ));
+
+        for bad in ["51", "not-a-number"] {
+            let mut map = feishu_env();
+            map.insert(String::from(ENV_FEISHU_CONTEXT_TURNS), String::from(bad));
+            assert!(
+                matches!(
+                    Config::from_env_map(&map),
+                    Err(ConfigError::InvalidEnv {
+                        name: ENV_FEISHU_CONTEXT_TURNS,
+                        ..
+                    })
+                ),
+                "SEKAI_FEISHU_CONTEXT_TURNS={bad} 应报配置错误"
+            );
+        }
+    }
+
+    #[test]
+    fn feishu_lists_trim_and_drop_empty() {
+        let mut map = feishu_env();
+        map.insert(
+            String::from(ENV_FEISHU_ALLOW_CHATS),
+            String::from(" oc_1 , oc_2 ,, oc_3,"),
+        );
+        map.insert(String::from(ENV_FEISHU_ALLOW_USERS), String::from("ou_x"));
+        map.insert(String::from(ENV_FEISHU_MAX_STEPS), String::from("8"));
+        map.insert(String::from(ENV_FEISHU_CONTEXT_TURNS), String::from("3"));
+        map.insert(String::from(ENV_FEISHU_ACK), String::from("off"));
+        let config = Config::from_env_map(&map).unwrap();
+        assert_eq!(
+            config.feishu_config.allow_chats,
+            vec!["oc_1", "oc_2", "oc_3"]
+        );
+        assert_eq!(config.feishu_config.allow_users, vec!["ou_x"]);
+        assert!(!config.feishu_config.ack);
+        assert_eq!(config.feishu_config.max_steps, Some(8));
+        assert_eq!(config.feishu_config.context_turns, 3);
+        assert_eq!(config.feishu_config.domain, DEFAULT_FEISHU_DOMAIN);
+    }
+
+    #[test]
+    fn feishu_context_turns_defaults_and_disables() {
+        let config = Config::from_env_map(&feishu_env()).unwrap();
+        assert_eq!(
+            config.feishu_config.context_turns,
+            DEFAULT_FEISHU_CONTEXT_TURNS
+        );
+
+        let mut map = feishu_env();
+        map.insert(String::from(ENV_FEISHU_CONTEXT_TURNS), String::from("0"));
+        let config = Config::from_env_map(&map).unwrap();
+        assert_eq!(config.feishu_config.context_turns, 0);
+    }
+
+    #[test]
+    fn feishu_debug_redacts_secret() {
+        let config = Config::from_env_map(&feishu_env()).unwrap();
+        let text = format!("{config:?}");
+        assert!(
+            !text.contains("secret-value"),
+            "Debug 不得泄漏 app_secret：{text}"
+        );
+        assert!(text.contains("<redacted>"));
+    }
+
     #[test]
     fn prompt_addr_defaults_by_frontend_mode() {
         // 批处理（--goal）：默认 off（进程短命）。
@@ -1127,7 +1687,7 @@ mod tests {
         assert_eq!(config.goal.as_deref(), Some("read IO4"));
         assert_eq!(config.worker_filter.as_deref(), Some("host-gpio"));
         assert_eq!(config.model, "deepseek-v4-pro");
-        assert_eq!(config.max_steps, 3);
+        assert_eq!(config.max_steps, Some(3));
         assert_eq!(config.ddl_ms, 2000);
         assert_eq!(config.timeout_ms, Some(30_000));
         assert!(config.allow_write && config.allow_tasks && config.allow_admin);

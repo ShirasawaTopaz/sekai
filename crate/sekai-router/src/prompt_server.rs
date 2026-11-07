@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::agent::{Agent, AgentConfig, AgentStatus};
+use crate::agent::{Agent, AgentConfig, AgentStatus, CancelToken, ConversationContext};
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::json::Json;
 use crate::llm::{ChatClient, Usage};
@@ -85,7 +85,7 @@ pub const CODE_TOO_MANY_CONNECTIONS: &str = "too_many_connections";
 /// 错误码：未知方法（ingress）。
 const CODE_UNKNOWN_METHOD: &str = "unknown_method";
 /// 同时运行的 prompt 上限（跨 ingress 连接与 serve prompt 共用）。
-const MAX_CONCURRENT_PROMPT_RUNS: usize = 4;
+pub const MAX_CONCURRENT_PROMPT_RUNS: usize = 4;
 /// 等待运行槽位的最长时间（毫秒）；超时回 `busy`。
 const RUN_SLOT_WAIT_MS: u64 = 5_000;
 /// 默认并发连接上限。
@@ -131,8 +131,8 @@ pub struct PromptCore<C: ChatClient + Clone> {
     run_gate: RunGate,
     /// ingress 计数（连接/拒绝/限流/prompt 次数）。
     ingress_stats: Arc<IngressStats>,
-    /// Agent 配置快照（max_steps 可被请求覆盖）。
-    agent_config: AgentConfig,
+    /// Agent 配置快照（max_steps 可被请求覆盖，也可按链路同步）。
+    agent_config: Mutex<AgentConfig>,
     /// 脱敏 trace。
     trace: TraceWriter,
 }
@@ -148,7 +148,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             policy: Mutex::new(policy),
             run_gate: RunGate::new(),
             ingress_stats: Arc::new(IngressStats::default()),
-            agent_config,
+            agent_config: Mutex::new(agent_config),
             trace,
         }
     }
@@ -168,7 +168,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             policy: Mutex::new(policy),
             run_gate: RunGate::new(),
             ingress_stats: Arc::new(IngressStats::default()),
-            agent_config,
+            agent_config: Mutex::new(agent_config),
             trace,
         }
     }
@@ -189,6 +189,25 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// 同步 agent 步数上限（链路类型变化时按链路更新默认值用）。
+    ///
+    /// 只在调用方判定「未显式给出 `--max-steps`/`SEKAI_MAX_STEPS`」时调用；
+    /// 请求级 `max_steps` 仍逐次覆盖。
+    pub fn set_max_steps(&self, max_steps: Option<u32>) {
+        self.agent_config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .max_steps = max_steps;
+    }
+
+    /// 当前 agent 步数上限（`None` = 不设上限；status / 测试用）。
+    pub fn max_steps(&self) -> Option<u32> {
+        self.agent_config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .max_steps
     }
 
     /// 取 chat 客户端：槽位已有则克隆；否则经构造器惰性构造并缓存。
@@ -219,6 +238,47 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         text: &str,
         max_steps: Option<u32>,
     ) -> Result<PromptRunResult, PromptRunError> {
+        self.run_prompt_inner(text, max_steps, None, None)
+    }
+
+    /// 同 [`PromptCore::run_prompt`]，额外挂上协作式取消令牌。
+    ///
+    /// 带外前端（飞书 `/cancel`）需要中止在途运行：`Agent::with_cancel` 在
+    /// 每步开始前检查令牌，置位后本轮以 `agent_error`（消息含 `cancelled`）
+    /// 结束。其余判定顺序与护栏完全不变。
+    pub fn run_prompt_with_cancel(
+        &self,
+        text: &str,
+        max_steps: Option<u32>,
+        cancel: CancelToken,
+    ) -> Result<PromptRunResult, PromptRunError> {
+        self.run_prompt_inner(text, max_steps, Some(cancel), None)
+    }
+
+    /// 同 [`PromptCore::run_prompt_with_cancel`]，额外注入带外前端的会话上下文
+    /// （飞书会话元数据 + 最近若干轮问答）。
+    ///
+    /// 上下文只影响送给 LLM 的 messages：system 段追加会话元数据，历史轮次以
+    /// user/assistant 消息放在当前目标之前。策略、防递归、RunGate 与错误码
+    /// 映射与其它入口完全一致。
+    pub fn run_prompt_with_context(
+        &self,
+        text: &str,
+        max_steps: Option<u32>,
+        cancel: CancelToken,
+        context: ConversationContext,
+    ) -> Result<PromptRunResult, PromptRunError> {
+        self.run_prompt_inner(text, max_steps, Some(cancel), Some(context))
+    }
+
+    /// `run_prompt*` 的共同实现（取消令牌与会话上下文均可选）。
+    fn run_prompt_inner(
+        &self,
+        text: &str,
+        max_steps: Option<u32>,
+        cancel: Option<CancelToken>,
+        context: Option<ConversationContext>,
+    ) -> Result<PromptRunResult, PromptRunError> {
         let gateway = self
             .gateway
             .lock()
@@ -240,9 +300,13 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         // 防递归：本通道发起的 Agent 拒绝嵌套 pc.ask（见模块注释）。
         let mut policy = self.policy();
         policy.deny_llm_relay = true;
-        let mut config = self.agent_config.clone();
+        let mut config = self
+            .agent_config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
         if let Some(steps) = max_steps {
-            config.max_steps = steps;
+            config.max_steps = Some(steps);
         }
         let _permit = self.run_gate.acquire().ok_or_else(|| {
             PromptRunError::new(
@@ -251,6 +315,12 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             )
         })?;
         let mut agent = Agent::new(chat, gateway, policy, config, self.trace.clone());
+        if let Some(cancel) = cancel {
+            agent = agent.with_cancel(cancel);
+        }
+        if let Some(context) = context {
+            agent = agent.with_conversation_context(context);
+        }
         match agent.run(text) {
             Ok(outcome) => Ok(PromptRunResult {
                 answer: outcome.final_text.unwrap_or_default(),
@@ -1131,6 +1201,7 @@ mod tests {
         Ok(ChatResponse {
             model: String::from("deepseek-flash"),
             content: Some(String::from(text)),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             finish_reason: Some(String::from("stop")),
             usage: Usage {
@@ -1145,6 +1216,7 @@ mod tests {
         Ok(ChatResponse {
             model: String::from("deepseek-flash"),
             content: None,
+            reasoning_content: None,
             tool_calls: vec![ToolCall {
                 id: String::from(id),
                 name: String::from(name),
@@ -1162,7 +1234,7 @@ mod tests {
     fn agent_config() -> AgentConfig {
         AgentConfig {
             model: String::from("deepseek-flash"),
-            max_steps: 4,
+            max_steps: Some(4),
             ddl_ms: 1_000,
             timeout_ms: None,
             temperature: 0.0,
@@ -1247,6 +1319,26 @@ mod tests {
         core.set_gateway(Some(gateway_handle(Vec::new(), calls)));
         let error = core.run_prompt("hi", None).expect_err("无 Worker 应报错");
         assert_eq!(error.code, CODE_NO_WORKERS);
+    }
+
+    #[test]
+    fn run_prompt_with_cancel_observes_token() {
+        // 未置位：正常完成（与 run_prompt 行为一致）。
+        let (core, _calls) = core_with(vec![text_response("完成")]);
+        let result = core
+            .run_prompt_with_cancel("继续", None, CancelToken::new())
+            .expect("未取消应成功");
+        assert_eq!(result.answer, "完成");
+
+        // 已置位：第一步循环前即返回 agent_error（消息含 cancelled）。
+        let (core, _calls) = core_with(vec![text_response("不应被调用")]);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        let error = core
+            .run_prompt_with_cancel("中止", None, cancel)
+            .expect_err("已取消应报错");
+        assert_eq!(error.code, CODE_AGENT_ERROR);
+        assert!(error.message.contains("cancelled"), "{}", error.message);
     }
 
     #[test]

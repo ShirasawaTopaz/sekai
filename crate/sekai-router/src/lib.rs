@@ -32,6 +32,10 @@
 //! - [`agent`]：多步 tool-calling agent 循环；
 //! - [`prompt_server`]：prompt 通道（TCP ingress + serve `prompt` 方法，
 //!   PC Worker 把 prompt 交给 Router 调 LLM 并返回回答）；
+//! - [`sha1`]：SHA-1/base64 自备实现（仅 ws 握手所需）；
+//! - [`ws`]：RFC 6455 WebSocket 客户端子集（帧编解码 + 握手）；
+//! - [`pbbp`]：pbbp2.Frame protobuf wire 编解码（飞书长连接）；
+//! - [`feishu`]：飞书对话入口（`--feishu`，长连接事件泵 + REST 回复）；
 //! - [`trace`]：脱敏 JSONL 轨迹。
 #![forbid(unsafe_code)]
 
@@ -40,19 +44,23 @@ pub mod config;
 pub mod control;
 pub mod direct;
 pub mod direct_gateway;
+pub mod feishu;
 pub mod gateway;
 pub mod host_link;
 pub mod http;
 pub mod json;
 pub mod link_builder;
 pub mod llm;
+pub mod pbbp;
 pub mod prompt;
 pub mod prompt_server;
 pub mod repl;
 pub mod serve;
 pub mod session;
+pub mod sha1;
 pub mod tools;
 pub mod topic;
 pub mod trace;
 pub mod tui;
 pub mod worker;
+pub mod ws;

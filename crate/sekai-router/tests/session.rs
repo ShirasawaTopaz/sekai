@@ -95,6 +95,7 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         model: String::from("deepseek-flash"),
         content: Some(String::from(text)),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         finish_reason: Some(String::from("stop")),
         usage: Usage {
@@ -115,7 +116,7 @@ fn session(chat: ScriptedChat) -> Session<ScriptedChat> {
     let policy = Policy::default();
     let agent_config = AgentConfig {
         model: String::from("deepseek-flash"),
-        max_steps: 4,
+        max_steps: Some(4),
         ddl_ms: 1_000,
         timeout_ms: Some(30_000),
         temperature: 0.0,
@@ -299,7 +300,7 @@ fn session_syncs_policy_and_gateway_into_prompt_hub() {
         Policy::default(),
         AgentConfig {
             model: String::from("deepseek-flash"),
-            max_steps: 1,
+            max_steps: Some(1),
             ddl_ms: 1_000,
             timeout_ms: None,
             temperature: 0.0,

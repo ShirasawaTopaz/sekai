@@ -57,13 +57,56 @@ impl CancelToken {
     }
 }
 
+/// 一轮已完成的会话问答（带外前端的多轮上下文）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurn {
+    /// 用户输入。
+    pub user: String,
+    /// 机器人回复（实际发给用户的文本）。
+    pub assistant: String,
+}
+
+/// 带外前端的会话上下文（飞书等）：会话元数据 + 最近若干轮问答。
+///
+/// 由前端（如 `feishu.rs`）在每次运行时注入；REPL、批处理、prompt 通道的
+/// 运行不设置该结构，行为与无上下文时完全一致。上下文只作为对话内容送给
+/// 模型，不改变任何策略或工具权限。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationContext {
+    /// 渠道名（如 `feishu`）。
+    pub channel: String,
+    /// 会话类型（如 `p2p` / `group`）。
+    pub chat_type: String,
+    /// 会话 id（飞书为 `chat_id`）。
+    pub chat_id: String,
+    /// 话题/线程 id（可选）。
+    pub thread_id: Option<String>,
+    /// 触发本次运行的消息 id。
+    pub message_id: String,
+    /// 回复场景的根消息 id（可选）。
+    pub root_id: Option<String>,
+    /// 回复场景的父消息 id（可选）。
+    pub parent_id: Option<String>,
+    /// 发送者 id。
+    pub sender_id: String,
+    /// 消息时间（原样字符串，如飞书毫秒时间戳；可选）。
+    pub message_time: Option<String>,
+    /// 最近若干轮问答（按时间升序）。
+    pub turns: Vec<ConversationTurn>,
+}
+
 /// agent 运行配置。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 模型名。
     pub model: String,
-    /// 最大步数。
-    pub max_steps: u32,
+    /// 最大步数；`None` = 不设上限。
+    ///
+    /// 直连 PC Worker（tcp/stdio）默认 `None`（只受取消令牌约束）；非 PC
+    /// Worker（MQTT/嵌入式）默认 `Some(DEFAULT_MAX_STEPS)`。显式
+    /// `--max-steps`/`SEKAI_MAX_STEPS` 或请求级 `max_steps` 覆盖后，
+    /// 两类链路都按给定上限收敛。
+    pub max_steps: Option<u32>,
     /// 默认 DDL。
     pub ddl_ms: u32,
     /// 命令超时覆盖。
@@ -167,6 +210,8 @@ pub struct Agent<C: ChatClient, G: WorkerGateway> {
     config: AgentConfig,
     trace: TraceWriter,
     cancel: CancelToken,
+    /// 带外前端注入的会话上下文（`None` = 纯文本目标，行为同旧版）。
+    context: Option<ConversationContext>,
 }
 
 impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
@@ -185,6 +230,7 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             config,
             trace,
             cancel: CancelToken::new(),
+            context: None,
         }
     }
 
@@ -194,19 +240,46 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
         self
     }
 
+    /// 挂接带外前端的会话上下文（飞书多轮记忆 + 会话元数据）。
+    pub fn with_conversation_context(mut self, context: ConversationContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
     /// 执行目标，直到模型给出最终回答或达到最大步数。
     pub fn run(&mut self, goal: &str) -> Result<AgentOutcome, AgentError> {
         let workers = self.gateway.list_workers();
+        let context_turns = self
+            .context
+            .as_ref()
+            .map(|context| context.turns.len())
+            .unwrap_or(0);
         self.trace.event(
             "agent_start",
             vec![
                 ("worker_count", Json::from(workers.len())),
                 ("goal_len", Json::from(goal.len())),
                 ("policy", Json::string(self.policy.summary())),
+                ("context_turns", Json::from(context_turns)),
             ],
         );
-        let system = crate::prompt::system_prompt(&workers, &self.policy);
-        let mut messages: Vec<Message> = vec![Message::system(system), Message::user(goal)];
+        let mut system = crate::prompt::system_prompt(&workers, &self.policy);
+        let mut messages: Vec<Message> = Vec::new();
+        if let Some(context) = &self.context {
+            system.push_str(&crate::prompt::conversation_context_block(context));
+        }
+        messages.push(Message::system(system));
+        if let Some(context) = &self.context {
+            for turn in &context.turns {
+                messages.push(Message::user(turn.user.clone()));
+                messages.push(Message::assistant(
+                    Some(turn.assistant.clone()),
+                    Vec::new(),
+                    None,
+                ));
+            }
+        }
+        messages.push(Message::user(goal));
         let tools = tools::tool_defs();
         let mut usage = Usage::default();
         let mut records: Vec<ToolCallRecord> = Vec::new();
@@ -214,9 +287,17 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
         let mut last_tool_failed = false;
         let mut steps: usize = 0;
 
-        for step_index in 0..self.config.max_steps {
+        let mut step_index: u32 = 0;
+        loop {
             if self.cancel.is_cancelled() {
                 return Err(cancelled_error());
+            }
+            // 上限只在显式给出时生效：直连 PC Worker 默认不设上限，
+            // 循环仅由模型完成/取消/LLM 错误终止。
+            if let Some(max_steps) = self.config.max_steps
+                && step_index >= max_steps
+            {
+                break;
             }
             steps = step_index as usize + 1;
             let request = ChatRequest {
@@ -318,12 +399,13 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                 });
             }
 
-            // thinking 默认 disabled，服务端不会返回 reasoning_content；
-            // ChatResponse 也不暴露该字段（跨模块契约），因此回填 None。
+            // 思考模式下回填 reasoning_content：带 tools 的请求在后续轮次
+            // 必须完整回传历史 reasoning_content（DeepSeek 思考模式要求），
+            // 否则 API 返回 400；thinking 关闭时服务端不返回该字段，为 None。
             messages.push(Message::assistant(
                 response.content.clone(),
                 response.tool_calls.clone(),
-                None,
+                response.reasoning_content.clone(),
             ));
             for call in &response.tool_calls {
                 if self.cancel.is_cancelled() {
@@ -342,13 +424,20 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                     return Err(cancelled_error());
                 }
             }
+            step_index += 1;
         }
 
         self.trace.event(
             "max_steps",
             vec![
                 ("steps", Json::from(steps)),
-                ("max_steps", Json::num(i64::from(self.config.max_steps))),
+                (
+                    "max_steps",
+                    match self.config.max_steps {
+                        Some(max_steps) => Json::num(i64::from(max_steps)),
+                        None => Json::Null,
+                    },
+                ),
             ],
         );
         Ok(AgentOutcome {

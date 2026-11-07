@@ -113,6 +113,7 @@ fn real_config(test: &str) -> Option<LlmConfig> {
         api_key,
         max_tokens: 4096,
         temperature: 0.0,
+        reasoning_effort: None,
         timeout: Duration::from_secs(120),
         retry_base_ms: 1_000,
         max_retries: 3,
@@ -267,7 +268,7 @@ fn run_agent(
     };
     let agent_config = AgentConfig {
         model: cfg.model.clone(),
-        max_steps,
+        max_steps: Some(max_steps),
         ddl_ms: 5_000,
         timeout_ms: Some(30_000),
         temperature: 0.0,

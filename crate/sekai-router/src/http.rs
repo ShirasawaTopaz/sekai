@@ -465,6 +465,85 @@ impl HttpClient for StdHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// TLS 裸流（ws.rs 分帧读写用）
+// ---------------------------------------------------------------------------
+
+/// 同时可读可写的字节流（[`connect_tls_stream`] 的返回抽象）。
+///
+/// [`crate::ws::WsStream`] 泛型于 `Read + Write`，本 trait 把两者合成一个
+/// 对象安全类型、并暴露超时设置，让调用方免于泛型传染：事件泵用
+/// `set_read_timeout` 把阻塞读切成心跳节拍（§3.4），用 `set_write_timeout`
+/// 防止挂死对端拖住发送。
+pub trait ReadWrite: Read + Write {
+    /// 设置读超时（`None` = 一直阻塞到有数据）。
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    /// 设置写超时（`None` = 一直阻塞到写完）。
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
+
+#[cfg(feature = "tls")]
+impl ReadWrite for native_tls::TlsStream<TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_read_timeout(timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        self.get_ref().set_write_timeout(timeout)
+    }
+}
+
+/// 明文 TCP 流同样可承载 WS 分帧（`ws://` 测试服务端与未来明文直连）。
+impl ReadWrite for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, timeout)
+    }
+}
+
+/// 建立 TLS 裸流：TCP 连接 + TLS 握手，不做任何 HTTP 读写。
+///
+/// 飞书长连接（`wss://`，docs/sekai-feishu.md §3）由 [`crate::ws`] 在该流
+/// 上自行完成 WebSocket 升级与分帧。仅在 `tls` feature（默认开）下可用；
+/// 外部 helper 后端无法承载长连接分帧，构建未启用 tls 时返回
+/// [`HttpError::NoHttpsHelper`]。
+///
+/// 流上**不设读写超时**：心跳节奏由 ws 调用方按需 `set_read_timeout`。
+/// 错误只报类别，不回显地址以外的 URL 片段（长连接 URL 的 query 含凭据）。
+pub fn connect_tls_stream(
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> Result<Box<dyn ReadWrite + Send>, HttpError> {
+    #[cfg(feature = "tls")]
+    {
+        let address = format!("{host}:{port}");
+        let mut addresses = address
+            .to_socket_addrs()
+            .map_err(|error| HttpError::Connect(error.to_string()))?;
+        let socket = addresses
+            .next()
+            .ok_or_else(|| HttpError::Connect(String::from("没有可用地址")))?;
+        let stream = TcpStream::connect_timeout(&socket, timeout)
+            .map_err(|error| HttpError::Connect(error.to_string()))?;
+        let _ = stream.set_nodelay(true);
+        let connector = native_tls::TlsConnector::new()
+            .map_err(|error| HttpError::Connect(format!("TLS 初始化失败：{error}")))?;
+        let stream = connector
+            .connect(host, stream)
+            .map_err(|error| HttpError::Connect(format!("TLS 握手失败：{error}")))?;
+        Ok(Box::new(stream))
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        let _ = (host, port, timeout);
+        Err(HttpError::NoHttpsHelper)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 明文 HTTP/1.1
 // ---------------------------------------------------------------------------
 

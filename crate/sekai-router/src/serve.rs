@@ -123,7 +123,14 @@ pub struct ServeConfig {
     /// 模型名（prompt 方法用）。
     pub model: String,
     /// Agent 最大步数（prompt 方法用；请求 max_steps 可覆盖到 1..=32）。
-    pub max_steps: u32,
+    ///
+    /// `None` = 不设上限（直连 PC Worker 的缺省；见 `config::Config::max_steps`）。
+    pub max_steps: Option<u32>,
+    /// 步数上限是否随链路自动取值（未显式 `--max-steps`/`SEKAI_MAX_STEPS`）。
+    ///
+    /// 为 `true` 时，运行期 `link` 请求改写链路后按新链路重算默认值并同步给
+    /// prompt hub（直连 PC Worker 不设上限、MQTT 保留 12）。
+    pub max_steps_auto: bool,
     /// 温度（prompt 方法用）。
     pub temperature: f64,
     /// 最大输出 token（prompt 方法用）。
@@ -153,6 +160,7 @@ impl ServeConfig {
             base_url: config.base_url.clone(),
             model: config.model.clone(),
             max_steps: config.max_steps,
+            max_steps_auto: !config.max_steps_explicit(),
             temperature: 0.0,
             max_tokens: 4_096,
             prompt_addr: config.prompt_addr.clone(),
@@ -176,7 +184,11 @@ impl ServeConfig {
             api_key: None,
             base_url: String::from(config::DEFAULT_BASE_URL),
             model: String::from(config::DEFAULT_MODEL),
-            max_steps: config::DEFAULT_MAX_STEPS,
+            // 测试/嵌入场景没有链路信息，取非 PC Worker 的保守默认（12）。
+            max_steps: Some(config::DEFAULT_MAX_STEPS),
+            // 默认不随运行期 link 自动改步数（显式行为更可控）；生产入口
+            // 经 `ServeConfig::from_config` 按 CLI 配置开启。
+            max_steps_auto: false,
             temperature: 0.0,
             max_tokens: 4_096,
             prompt_addr: None,
@@ -576,6 +588,9 @@ impl ServeState {
                 self.link_mode = "tcp";
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.sync_poll_view();
+                // 让新建链路对 serve `prompt` 方法与 ingress 立即可见
+                // （并按新链路重算未显式指定的步数上限）。
+                self.sync_prompt_hub();
                 vec![
                     ok_response(
                         id,
@@ -649,6 +664,7 @@ impl ServeState {
                 self.link_mode = "stdio";
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.sync_poll_view();
+                self.sync_prompt_hub();
                 vec![
                     ok_response(
                         id,
@@ -704,6 +720,7 @@ impl ServeState {
                 self.link_mode = "mqtt";
                 self.gateway = Some(link_builder::handle_of(gateway));
                 self.sync_poll_view();
+                self.sync_prompt_hub();
                 vec![
                     ok_response(
                         id,
@@ -1604,6 +1621,14 @@ impl ServeState {
         if let Some(hub) = &self.prompt_hub {
             hub.set_gateway(self.gateway.clone());
             hub.set_policy(self.policy.clone());
+            // 步数上限未显式指定时按当前链路重算：直连 PC Worker（tcp/stdio）
+            // 不设上限、MQTT 保留默认 12；off 时保持配置值（prompt 本身会
+            // 因 not_linked 失败）。
+            if self.config.max_steps_auto
+                && let Some(link) = config::LinkMode::parse(self.link_mode)
+            {
+                hub.set_max_steps(config::default_max_steps_for(link));
+            }
         }
     }
 }
@@ -1628,6 +1653,7 @@ fn build_prompt_hub(config: &ServeConfig, policy: Policy) -> Arc<PromptCore<LlmC
                 api_key: api_key.clone(),
                 max_tokens,
                 temperature,
+                reasoning_effort: None,
                 timeout: Duration::from_secs(llm::DEFAULT_TIMEOUT_SECS),
                 retry_base_ms: llm::DEFAULT_RETRY_BASE_MS,
                 max_retries: llm::DEFAULT_MAX_RETRIES,

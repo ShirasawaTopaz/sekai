@@ -99,6 +99,7 @@ fn text_response(text: &str) -> ChatResponse {
     ChatResponse {
         model: String::from("deepseek-flash"),
         content: Some(String::from(text)),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         finish_reason: Some(String::from("stop")),
         usage: Usage {
@@ -112,7 +113,7 @@ fn text_response(text: &str) -> ChatResponse {
 fn agent_config() -> AgentConfig {
     AgentConfig {
         model: String::from("deepseek-flash"),
-        max_steps: 4,
+        max_steps: Some(4),
         ddl_ms: 1_000,
         timeout_ms: None,
         temperature: 0.0,

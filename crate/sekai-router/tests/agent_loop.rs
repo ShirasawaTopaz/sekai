@@ -11,7 +11,9 @@ use std::time::Duration;
 use sekai::sekai_stdout::Phase;
 use sekai::sekai_wire::ErrorCode;
 
-use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentStatus, CancelToken};
+use sekai_router::agent::{
+    Agent, AgentConfig, AgentError, AgentStatus, CancelToken, ConversationContext, ConversationTurn,
+};
 use sekai_router::control::{CommandFailure, CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
 use sekai_router::json::Json;
@@ -128,7 +130,7 @@ fn worker(worker_id: &str, online: bool) -> WorkerInfo {
 fn agent_config(max_steps: u32) -> AgentConfig {
     AgentConfig {
         model: String::from("deepseek-flash"),
-        max_steps,
+        max_steps: Some(max_steps),
         ddl_ms: 1_000,
         timeout_ms: Some(30_000),
         temperature: 0.0,
@@ -156,6 +158,7 @@ fn tool_response(calls: Vec<ToolCall>, usage: Usage) -> ChatResponse {
     ChatResponse {
         model: String::from("deepseek-flash"),
         content: None,
+        reasoning_content: None,
         tool_calls: calls,
         finish_reason: Some(String::from("tool_calls")),
         usage,
@@ -166,6 +169,7 @@ fn text_response(text: &str, usage: Usage) -> ChatResponse {
     ChatResponse {
         model: String::from("deepseek-flash"),
         content: Some(String::from(text)),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         finish_reason: Some(String::from("stop")),
         usage,
@@ -299,6 +303,64 @@ fn single_tool_then_final_answer() {
 }
 
 #[test]
+fn conversation_context_is_injected_before_current_goal() {
+    let requests = new_requests();
+    let calls = new_calls();
+    let chat = ScriptedChat::new(
+        vec![Ok(text_response("继续回答。", usage(5, 3, 8)))],
+        requests.clone(),
+    );
+    let gateway = FakeGateway::new(vec![worker("host-gpio", true)], vec![], calls);
+    let context = ConversationContext {
+        channel: String::from("feishu"),
+        chat_type: String::from("p2p"),
+        chat_id: String::from("oc_1"),
+        thread_id: Some(String::from("omt_1")),
+        message_id: String::from("om_2"),
+        root_id: None,
+        parent_id: None,
+        sender_id: String::from("ou_1"),
+        message_time: Some(String::from("1700000000000")),
+        turns: vec![ConversationTurn {
+            user: String::from("第一问"),
+            assistant: String::from("第一答"),
+        }],
+    };
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        agent_config(4),
+        TraceWriter::disabled(),
+    )
+    .with_conversation_context(context);
+    let outcome = agent.run("第二问").unwrap();
+    assert_eq!(outcome.status, AgentStatus::Completed);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].role, Role::System);
+    let system = messages[0].content.as_deref().unwrap();
+    for needle in [
+        "当前会话（Router 注入）",
+        "会话 id：oc_1",
+        "话题 id：omt_1",
+        "当前消息 id：om_2",
+        "最近对话：1 轮",
+    ] {
+        assert!(system.contains(needle), "system 缺少 {needle}：{system}");
+    }
+    assert_eq!(messages[1].role, Role::User);
+    assert_eq!(messages[1].content.as_deref(), Some("第一问"));
+    assert_eq!(messages[2].role, Role::Assistant);
+    assert_eq!(messages[2].content.as_deref(), Some("第一答"));
+    assert_eq!(messages[3].role, Role::User);
+    assert_eq!(messages[3].content.as_deref(), Some("第二问"));
+}
+
+#[test]
 fn multiple_tool_calls_execute_in_order() {
     let requests = new_requests();
     let calls = new_calls();
@@ -425,6 +487,42 @@ fn max_steps_stops_the_loop() {
     assert!(outcome.final_text.is_none());
     assert_eq!(outcome.tool_calls.len(), 2);
     assert_eq!(requests.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn unlimited_max_steps_runs_past_the_old_default_cap() {
+    // 直连 PC Worker 默认不设上限：脚本给 20 个工具步（超过旧默认 12）+ 1 个
+    // 最终回答，循环必须全部走完，而不是在第 12 步被判 MaxSteps。
+    const TOOL_STEPS: usize = 20;
+    let requests = new_requests();
+    let calls = new_calls();
+    let mut scripted: Vec<Result<ChatResponse, LlmError>> = (0..TOOL_STEPS)
+        .map(|index| {
+            Ok(tool_response(
+                vec![tool_call(&format!("call_{index}"), "list_workers", "{}")],
+                usage(1, 1, 2),
+            ))
+        })
+        .collect();
+    scripted.push(Ok(text_response("列完了。", usage(1, 1, 2))));
+    let chat = ScriptedChat::new(scripted, requests.clone());
+    let gateway = FakeGateway::new(vec![worker("host-gpio", true)], vec![], calls);
+    let mut config = agent_config(1);
+    // None = 不设上限。
+    config.max_steps = None;
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        config,
+        TraceWriter::disabled(),
+    );
+    let outcome = agent.run("一直列Worker直到给出结论").unwrap();
+    assert_eq!(outcome.status, AgentStatus::Completed);
+    assert_eq!(outcome.steps, TOOL_STEPS + 1);
+    assert_eq!(outcome.final_text.as_deref(), Some("列完了。"));
+    assert_eq!(outcome.tool_calls.len(), TOOL_STEPS);
+    assert_eq!(requests.lock().unwrap().len(), TOOL_STEPS + 1);
 }
 
 #[test]
@@ -834,6 +932,7 @@ fn empty_response_is_an_agent_error() {
         vec![Ok(ChatResponse {
             model: String::from("deepseek-flash"),
             content: None,
+            reasoning_content: None,
             tool_calls: Vec::new(),
             finish_reason: None,
             usage: Usage::default(),

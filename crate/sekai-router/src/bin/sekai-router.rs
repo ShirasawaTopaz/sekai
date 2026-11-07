@@ -13,7 +13,8 @@
 //!   （协议 v1），供 DSH 插件子进程驱动；`prompt` 方法（v1.1 additive）
 //!   与 prompt ingress 由 serve 内部驱动。
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sekai_router::agent::{Agent, AgentConfig, AgentError, AgentOutcome, AgentStatus};
@@ -85,6 +86,8 @@ fn run_config(config: Config) -> i32 {
 
     if config.interactive {
         run_interactive(config, trace)
+    } else if config.feishu {
+        run_feishu(config, trace)
     } else {
         run_batch(config, &mut trace)
     }
@@ -159,15 +162,7 @@ fn run_batch(config: Config, trace: &mut TraceWriter) -> i32 {
     eprintln!(
         "sekai-router: 建立链路 {}（{})",
         config.link.as_str(),
-        match config.link {
-            LinkMode::Mqtt => config
-                .mqtt
-                .as_ref()
-                .map(|endpoint| format!("{}:{}", endpoint.host, endpoint.port))
-                .unwrap_or_default(),
-            LinkMode::Stdio => config.worker_bin.clone(),
-            LinkMode::Tcp => config.listen_addr.clone(),
-        }
+        link_target_text(&config)
     );
     let mut gateway = match build_gateway(&config) {
         Ok(gateway) => gateway,
@@ -336,12 +331,18 @@ fn report_agent_error(error: &AgentError) -> i32 {
 
 /// CLI 配置 → LlmConfig（批处理 / 交互 / prompt 通道共用形状）。
 fn build_llm_config(config: &Config) -> LlmConfig {
+    eprintln!(
+        "sekai-router: LLM 模型={} 思考强度={}",
+        config.model,
+        config.reasoning_effort.as_deref().unwrap_or("关闭")
+    );
     LlmConfig {
         base_url: config.base_url.clone(),
         model: config.model.clone(),
         api_key: config.api_key.clone().unwrap_or_default(),
         max_tokens: 4_096,
         temperature: 0.0,
+        reasoning_effort: config.reasoning_effort.clone(),
         timeout: Duration::from_millis(config.http_timeout_ms),
         retry_base_ms: 1_000,
         max_retries: 3,
@@ -390,6 +391,8 @@ fn build_session(
         trace,
         session_config,
     )
+    // 未显式指定步数上限时随链路自动取值（直连 PC Worker 不设上限）。
+    .with_auto_max_steps(!config.max_steps_explicit())
 }
 
 /// 按配置启动 prompt ingress（交互模式）；打印「提示通道已监听 <addr>」。
@@ -481,4 +484,78 @@ fn ok_json(value: Json) -> String {
 
 fn optional_string(value: Option<String>) -> Json {
     value.map(Json::from).unwrap_or(Json::Null)
+}
+
+/// 链路目标的人读描述（建链横幅用）。
+fn link_target_text(config: &Config) -> String {
+    match config.link {
+        LinkMode::Mqtt => config
+            .mqtt
+            .as_ref()
+            .map(|endpoint| format!("{}:{}", endpoint.host, endpoint.port))
+            .unwrap_or_default(),
+        LinkMode::Stdio => config.worker_bin.clone(),
+        LinkMode::Tcp => config.listen_addr.clone(),
+    }
+}
+
+/// 飞书入口（第 4 前端，docs/sekai-feishu.md）：建 Worker 链路 → 构造惰性
+/// LLM 核心 → 交给 [`sekai_router::feishu::run`]（阻塞直到优雅退出）。
+///
+/// 退出码：链路建立失败沿用批处理约定 **3**；随后由 feishu 模块决定
+/// （0 优雅退出 / 3 飞书链路永久失败 / 4 构建缺少 TLS）。
+fn run_feishu(config: Config, trace: TraceWriter) -> i32 {
+    eprintln!(
+        "sekai-router: 建立链路 {}（{})",
+        config.link.as_str(),
+        link_target_text(&config)
+    );
+    let gateway = match build_gateway(&config) {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            eprintln!("sekai-router: 链路建立失败：{error}");
+            return 3;
+        }
+    };
+    // 不等 Worker 上线：feishu 是常驻前端，Worker 可后到；无 Worker 时消息
+    // 回「暂无 Worker 在线」（run_prompt 的 no_workers），链路断开回 not_linked。
+    // 监听/连接失败已在 build_gateway 内报错退出。
+    trace.event(
+        "link_ready",
+        vec![("link", Json::from(config.link.as_str()))],
+    );
+    let gateway: sekai_router::gateway::GatewayHandle = Arc::new(Mutex::new(gateway));
+
+    // 惰性 LLM：没有 API key 也允许启动，运行期按 llm_unavailable 回复
+    // 「LLM 未配置」（docs/sekai-feishu.md §5.2）。
+    let llm_config = build_llm_config(&config);
+    let builder_config = llm_config.clone();
+    let builder = Box::new(move || -> Option<LlmClient> {
+        if builder_config.api_key.trim().is_empty() {
+            return None;
+        }
+        Some(LlmClient::new(
+            Box::new(StdHttpClient::new()),
+            builder_config.clone(),
+        ))
+    });
+    let core = Arc::new(PromptCore::<LlmClient>::lazy(
+        builder,
+        policy_from(&config),
+        build_agent_config(&config),
+        trace,
+    ));
+    core.set_gateway(Some(Arc::clone(&gateway)));
+
+    // prompt ingress 在 feishu 形态默认 off；显式 --prompt-addr 才开启
+    // （默认值差异已由 config 处理）。
+    start_prompt_ingress(&config, Arc::clone(&core));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    sekai_router::feishu::run(
+        core,
+        gateway,
+        sekai_router::feishu::FeishuOptions::from_config(&config),
+        stop,
+    )
 }

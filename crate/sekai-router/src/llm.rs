@@ -1,6 +1,9 @@
 //! DeepSeek Chat Completions 客户端（OpenAI 兼容）。
 //!
-//! 默认关闭 thinking 模式，保证 tool_choice 可以指定具体函数、输出可重复。
+//! 默认关闭 thinking 模式，保证 tool_choice 可以指定具体函数、输出可重复；
+//! 通过 [`LlmConfig::reasoning_effort`]（CLI 的 `SEKAI_ROUTER_REASONING_EFFORT`）
+//! 显式开启思考模式并指定强度（low/high/max 等），此时 `reasoning_content`
+//! 会随响应返回并由 agent 回传到后续 assistant 消息（带 tools 多轮必需）。
 //! 传输层通过 HttpClient trait 注入：生产用 StdHttpClient，测试用 mock。
 //!
 //! 安全：API key 只作为 Authorization 请求头使用；LlmConfig 的手写 Debug 会
@@ -204,6 +207,8 @@ pub struct ChatResponse {
     pub model: String,
     /// 文本内容。
     pub content: Option<String>,
+    /// 思考内容（thinking 模式返回；关闭 thinking 时为 None）。
+    pub reasoning_content: Option<String>,
     /// 工具调用。
     pub tool_calls: Vec<ToolCall>,
     /// finish_reason。
@@ -268,6 +273,11 @@ pub struct LlmConfig {
     pub max_tokens: u32,
     /// 温度。
     pub temperature: f64,
+    /// 思考强度（low/high/max 等，见 DeepSeek 思考模式文档）。
+    ///
+    /// `Some` 时请求体带 `thinking: {"type":"enabled"}` + `reasoning_effort`，
+    /// 覆盖 [`ChatRequest::disable_thinking`]；`None` 保持既有 thinking 关闭语义。
+    pub reasoning_effort: Option<String>,
     /// HTTP 超时。
     pub timeout: Duration,
     /// 重试 base 延迟（毫秒），测试可设为 0。
@@ -284,6 +294,7 @@ impl fmt::Debug for LlmConfig {
             .field("api_key", &"<redacted>")
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("timeout", &self.timeout)
             .field("retry_base_ms", &self.retry_base_ms)
             .field("max_retries", &self.max_retries)
@@ -304,6 +315,7 @@ impl LlmConfig {
             api_key: api_key.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
             temperature: DEFAULT_TEMPERATURE,
+            reasoning_effort: None,
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             retry_base_ms: DEFAULT_RETRY_BASE_MS,
             max_retries: DEFAULT_MAX_RETRIES,
@@ -504,7 +516,14 @@ fn build_chat_body(config: &LlmConfig, request: &ChatRequest) -> Result<Json, Ll
     body.set("stream", Json::Bool(false));
     body.set("temperature", Json::float(temperature));
     body.set("max_tokens", Json::num(i64::from(max_tokens)));
-    if request.disable_thinking {
+    if let Some(effort) = &config.reasoning_effort {
+        // 思考模式：默认开启时的显式形态 + 强度（DeepSeek 思考模式文档）。
+        body.set(
+            "thinking",
+            Json::object(vec![("type", Json::string("enabled"))]),
+        );
+        body.set("reasoning_effort", Json::string(effort.as_str()));
+    } else if request.disable_thinking {
         body.set(
             "thinking",
             Json::object(vec![("type", Json::string("disabled"))]),
@@ -635,6 +654,15 @@ fn parse_chat_response(value: &Json) -> Result<ChatResponse, LlmError> {
             )));
         }
     };
+    let reasoning_content = match message.get("reasoning_content") {
+        None | Some(Json::Null) => None,
+        Some(Json::String(text)) => Some(text.clone()),
+        Some(_) => {
+            return Err(LlmError::Protocol(String::from(
+                "message.reasoning_content 必须是字符串或 null",
+            )));
+        }
+    };
     let tool_calls = match message.get("tool_calls") {
         None | Some(Json::Null) => Vec::new(),
         Some(Json::Array(items)) => {
@@ -686,6 +714,7 @@ fn parse_chat_response(value: &Json) -> Result<ChatResponse, LlmError> {
     Ok(ChatResponse {
         model,
         content,
+        reasoning_content,
         tool_calls,
         finish_reason,
         usage,
@@ -865,6 +894,40 @@ mod tests {
             .map(|message| message.get("role").and_then(Json::as_str).unwrap())
             .collect();
         assert_eq!(roles, vec!["system", "user"]);
+    }
+
+    #[test]
+    fn body_enables_thinking_with_effort() {
+        let mut config = config();
+        config.reasoning_effort = Some(String::from("high"));
+        let body = build_chat_body(&config, &request(vec![tool()])).unwrap();
+        assert_eq!(
+            body.get_path(&["thinking", "type"]).and_then(Json::as_str),
+            Some("enabled")
+        );
+        assert_eq!(
+            body.get("reasoning_effort").and_then(Json::as_str),
+            Some("high")
+        );
+        assert_eq!(body.get("tool_choice").and_then(Json::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn parses_reasoning_content() {
+        let value = Json::parse(
+            r#"{"model":"deepseek-flash","choices":[{"message":{"role":"assistant","content":"hi","reasoning_content":"先想一想"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        let response = parse_chat_response(&value).unwrap();
+        assert_eq!(response.content.as_deref(), Some("hi"));
+        assert_eq!(response.reasoning_content.as_deref(), Some("先想一想"));
+        assert!(
+            parse_chat_response(
+                &Json::parse(r#"{"choices":[{"message":{"content":"x","reasoning_content":7}}]}"#)
+                    .unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

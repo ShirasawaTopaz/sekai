@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use sekai::sekai_device_list::DeviceList;
 use sekai_router::agent::AgentConfig;
+use sekai_router::config::DEFAULT_MAX_STEPS;
 use sekai_router::control::{CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
 use sekai_router::http::{HttpClient, HttpError, HttpRequest, HttpResponse};
@@ -868,7 +869,7 @@ fn prompt_hub_with_chat_body(body: &str) -> Arc<PromptCore<LlmClient>> {
         Policy::default(),
         AgentConfig {
             model: String::from("deepseek-flash"),
-            max_steps: 4,
+            max_steps: Some(4),
             ddl_ms: 1_000,
             timeout_ms: None,
             temperature: 0.0,
@@ -1341,4 +1342,67 @@ fn tool_call_routes_advertised_task_names_as_task() {
             .and_then(Json::as_str),
         Some("tool")
     );
+}
+
+/// 步数上限随运行期链路取值：未显式 `--max-steps` 时，直连 PC Worker（tcp）→
+/// 不设上限，MQTT（嵌入式）→ 默认 12（`ServeConfig::max_steps_auto`）。
+#[test]
+fn max_steps_follows_runtime_link_when_not_explicit() {
+    let mut config = ServeConfig::minimal();
+    config.max_steps = Some(DEFAULT_MAX_STEPS);
+    config.max_steps_auto = true;
+    let mut state = ServeState::new(config, Policy::default());
+    let hub = prompt_hub_with_chat_body("{}");
+    hub.set_max_steps(Some(DEFAULT_MAX_STEPS));
+    state.set_prompt_hub(hub.clone());
+    assert_eq!(
+        hub.max_steps(),
+        Some(DEFAULT_MAX_STEPS),
+        "未建链时保持配置值"
+    );
+
+    // 直连 PC Worker：不设上限。
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "tcp",
+        String::from("测试链路（注入）"),
+    );
+    assert_eq!(hub.max_steps(), None, "tcp 直连（PC Worker）应不设上限");
+
+    // 切到 MQTT（非 PC Worker）：回到默认 12。
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "mqtt",
+        String::from("测试链路（注入）"),
+    );
+    assert_eq!(
+        hub.max_steps(),
+        Some(DEFAULT_MAX_STEPS),
+        "MQTT（非 PC Worker）保留原上限"
+    );
+}
+
+/// 显式指定步数上限时，运行期链路变化不再改写（`max_steps_auto=false`）。
+#[test]
+fn explicit_max_steps_survives_runtime_link_change() {
+    let mut config = ServeConfig::minimal();
+    config.max_steps = Some(3);
+    config.max_steps_auto = false;
+    let mut state = ServeState::new(config, Policy::default());
+    let hub = prompt_hub_with_chat_body("{}");
+    hub.set_max_steps(Some(3));
+    state.set_prompt_hub(hub.clone());
+
+    let workers = Arc::new(Mutex::new(vec![worker("pc-1")]));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    state.set_gateway(
+        fake_handle(workers, &calls),
+        "tcp",
+        String::from("测试链路（注入）"),
+    );
+    assert_eq!(hub.max_steps(), Some(3), "显式上限不随链路变化");
 }
