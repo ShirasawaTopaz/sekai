@@ -12,29 +12,54 @@
  *   幂等行为（B11）；
  * - 用一个假 worker 脚本（打印阶段化 stderr 后退出/长驻）验证 worker 侧
  *   的生命周期与状态工具（重启退避、环形 stderr、spawn 失败告警）；
+ * - 用假 worker 的成功连接 / jump 切换行 + 临时状态文件验证 autoConnect
+ *   开关与「上次连接的 Router」持久化：DSH 启动自动连上次地址、关闭开关时
+ *   不自动连接、sekai_worker_connect/disconnect 手动启停与目标切换、无效
+ *   地址信封、跨插件实例复用；
  * - 用一个假 prompt worker（stdout 发 prompt JSONL 请求行、stdin 收到的行
  *   回显到 stderr）+ 假 ingress（node net server 回放 prompt 响应）验证
  *   dsh 通道的 prompt 中转：成功回投、并发独立连接、不可达/超时错误信封、
- *   llm:'off' 不转发、dispose 清理。
+ *   llm:'off' 不转发、dispose 清理；
+ * - 覆盖二进制零配置解析顺序（config > env > $DSH_HOME/sekai/bin >
+ *   仓库 target/release > PATH）：全部候选用注入的 env/home/moduleUrl/
+ *   exists 构造，不依赖本机真实 exe，CI Linux 亦可跑。
  *
  * 全部断言通过 exit 0；任何失败 exit 1。
  */
 import { strict as assert } from 'node:assert'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import net from 'node:net'
 import readline from 'node:readline'
 import {
+  dshBinDir,
   JsonlError,
   JsonlProcess,
   RESTART_BACKOFF_INITIAL_MS,
   RingBuffer,
   nextBackoffMs,
+  repoLocalBin,
+  repoRootFromModule,
   resolveBin,
+  resolveDshHome,
 } from '../lib/shared.js'
 import { SekaiRouterPlugin } from '../lib/router.js'
-import { SekaiWorkerPlugin, resolveWorkerConfig, splitHostPort, parsePromptRequest } from '../lib/worker.js'
+import {
+  SekaiWorkerPlugin,
+  defaultWorkerStateFile,
+  lastRouterFromState,
+  parseConnectedLine,
+  parsePromptRequest,
+  parseReachedRouterLine,
+  parseSwitchLine,
+  readWorkerState,
+  resolveWorkerConfig,
+  splitHostPort,
+  withLastRouter,
+} from '../lib/worker.js'
 
 // ---------------------------------------------------------------------------
 // 假进程脚本（写入临时目录后以 node 运行）
@@ -136,6 +161,10 @@ const FAKE_WORKER = `
 const lifetime = Number(process.env.FAKE_WORKER_LIFETIME_MS ?? 250)
 const exitCode = Number(process.env.FAKE_WORKER_EXIT ?? 0)
 process.stderr.write('[worker] 阶段1：连接路由器 ' + (process.argv[2] ?? '') + '\\n')
+const reached = process.env.FAKE_WORKER_REACHED
+if (reached) process.stderr.write('sekai-worker: TCP 已连接 ' + reached + '\\n')
+const switched = process.env.FAKE_WORKER_SWITCHED
+if (switched) process.stderr.write('sekai-worker: 切换到新端点 ' + switched + '\\n')
 setTimeout(() => process.stderr.write('[worker] 阶段2：注册工具 pc.*\\n'), Math.floor(lifetime / 3))
 setTimeout(() => process.stderr.write('[worker] 阶段3：进入命令循环\\n'), Math.floor((lifetime * 2) / 3))
 setTimeout(() => process.exit(exitCode), lifetime)
@@ -357,16 +386,151 @@ test('nextBackoffMs：翻倍且封顶', () => {
 test('resolveBin：config 显式 > 环境变量 > 默认(PATH)', () => {
   const envKey = 'SEKAI_SMOKE_BIN'
   const saved = process.env[envKey]
+  // 注入 exists=()=>false：本机 target/release 恰好有真实 exe 时也不能命中
+  // 自动发现，这里只验证「无显式来源时回落到 PATH 默认名」的旧契约。
+  const noDiscovery = { exists: () => false }
   try {
     delete process.env[envKey]
-    assert.equal(resolveBin('/abs/sekai-router.exe', envKey, 'sekai-router'), '/abs/sekai-router.exe')
-    assert.equal(resolveBin('sekai-router', envKey, 'sekai-router'), 'sekai-router')
+    assert.equal(resolveBin('/abs/sekai-router.exe', envKey, 'sekai-router', noDiscovery), '/abs/sekai-router.exe')
+    assert.equal(resolveBin('sekai-router', envKey, 'sekai-router', noDiscovery), 'sekai-router')
     process.env[envKey] = '/from-env/sekai-router.exe'
-    assert.equal(resolveBin('sekai-router', envKey, 'sekai-router'), '/from-env/sekai-router.exe')
-    assert.equal(resolveBin('/abs/sekai-router.exe', envKey, 'sekai-router'), '/abs/sekai-router.exe')
+    assert.equal(resolveBin('sekai-router', envKey, 'sekai-router', noDiscovery), '/from-env/sekai-router.exe')
+    assert.equal(resolveBin('/abs/sekai-router.exe', envKey, 'sekai-router', noDiscovery), '/abs/sekai-router.exe')
+    // 显式注入空 env + exists=false：PATH 兜底（离线，不受本机环境影响）。
+    assert.equal(
+      resolveBin('sekai-router', envKey, 'sekai-router', { exists: () => false, env: {} }),
+      'sekai-router',
+    )
   } finally {
     if (saved === undefined) delete process.env[envKey]
     else process.env[envKey] = saved
+  }
+})
+
+test('resolveDshHome：DSH_HOME > ~/.dsh，worker 状态文件复用同一解析', () => {
+  assert.equal(resolveDshHome({ DSH_HOME: '  D:/fake-dsh  ' }, 'C:/home'), 'D:/fake-dsh')
+  assert.equal(resolveDshHome({ DSH_HOME: '   ' }, 'C:/home'), join('C:/home', '.dsh'))
+  assert.equal(resolveDshHome({}, 'C:/home'), join('C:/home', '.dsh'))
+  // 与 worker 默认状态文件保持同一套 home 解析（行为不变）。
+  assert.equal(
+    defaultWorkerStateFile({ DSH_HOME: 'D:/fake-dsh' }, 'C:/home'),
+    join('D:/fake-dsh', 'sekai', 'worker-state.json'),
+  )
+  assert.equal(
+    defaultWorkerStateFile({}, 'C:/home'),
+    join(join('C:/home', '.dsh'), 'sekai', 'worker-state.json'),
+  )
+  assert.equal(
+    defaultWorkerStateFile({ DSH_HOME: 'D:/fake-dsh' }),
+    join(resolveDshHome({ DSH_HOME: 'D:/fake-dsh' }), 'sekai', 'worker-state.json'),
+  )
+})
+
+test('resolveBin：自动发现 DSH_HOME/sekai/bin > 仓库 target/release > PATH', async () => {
+  const envKey = 'SEKAI_SMOKE_DISCOVERY_BIN'
+  const env = { DSH_HOME: 'D:/fake-dsh' }
+  const home = 'C:/home'
+  const dshCandidate = join(dshBinDir({ env, home }), 'sekai-router.exe')
+  assert.equal(
+    resolveBin('sekai-router', envKey, 'sekai-router', {
+      env,
+      home,
+      platform: 'win32',
+      exists: (file) => file === dshCandidate,
+    }),
+    dshCandidate,
+    '$DSH_HOME/sekai/bin 命中时优先于仓库 target/release',
+  )
+
+  // 假仓库：用 mkdtemp + pathToFileURL 构造 moduleUrl，仓库根由模块路径上溯
+  // 3 级得到；不依赖本机真实 target/release（CI Linux 可跑）。
+  const fakeRepo = await mkdtemp(join(tmpdir(), 'sekai-dsh-repo-'))
+  // realpath 归一：macOS 等平台 tmpdir 可能是符号链接，repoRootFromModule 按
+  // 模块真实路径上溯，故期望值也用 realpath。
+  const fakeRoot = realpathSync(fakeRepo)
+  try {
+    const fakeLib = join(fakeRepo, 'plugins', 'sekai-dsh', 'lib')
+    await mkdir(fakeLib, { recursive: true })
+    const fakeShared = join(fakeLib, 'shared.js')
+    await writeFile(fakeShared, '', 'utf8')
+    const moduleUrl = pathToFileURL(fakeShared).href
+    const repoCandidate = join(fakeRoot, 'target', 'release', 'sekai-router.exe')
+    assert.equal(repoRootFromModule(moduleUrl), fakeRoot, '仓库根 = 模块真实路径上溯 3 级')
+    assert.equal(repoLocalBin('sekai-router', { moduleUrl, platform: 'win32' }), repoCandidate)
+    assert.equal(
+      resolveBin('sekai-router', envKey, 'sekai-router', {
+        moduleUrl,
+        env,
+        home,
+        platform: 'win32',
+        exists: (file) => file === repoCandidate,
+      }),
+      repoCandidate,
+      'DSH_HOME 候选 miss 后命中仓库 target/release',
+    )
+
+    // 真实模块路径同样上溯到本仓库根（shared.js 与 smoke.mjs 同深度）。
+    const expectedRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+    assert.equal(repoRootFromModule(), expectedRoot, '默认 moduleUrl 指向本仓库真实根')
+    assert.equal(
+      repoLocalBin('sekai-worker', { platform: 'win32' }),
+      join(expectedRoot, 'target', 'release', 'sekai-worker.exe'),
+    )
+
+    // env 优先于两个自动发现候选。
+    assert.equal(
+      resolveBin('sekai-router', envKey, 'sekai-router', {
+        moduleUrl,
+        env: { ...env, [envKey]: '/from-env/sekai-router.exe' },
+        home,
+        platform: 'win32',
+        exists: () => true,
+      }),
+      '/from-env/sekai-router.exe',
+    )
+    // 显式 config 优先于 env 与自动发现。
+    assert.equal(
+      resolveBin('/abs/sekai-router.exe', envKey, 'sekai-router', {
+        moduleUrl,
+        env: { ...env, [envKey]: '/from-env/sekai-router.exe' },
+        home,
+        platform: 'win32',
+        exists: () => true,
+      }),
+      '/abs/sekai-router.exe',
+    )
+
+    // 非 Windows 平台不补 .exe：linux 命中 $DSH_HOME/sekai/bin 的无后缀文件。
+    const linuxCandidate = join(dshBinDir({ env, home }), 'sekai-router')
+    assert.equal(
+      resolveBin('sekai-router', envKey, 'sekai-router', {
+        moduleUrl,
+        env,
+        home,
+        platform: 'linux',
+        exists: (file) => file === linuxCandidate,
+      }),
+      linuxCandidate,
+    )
+    // linux 下仓库候选同样无后缀。
+    assert.equal(
+      repoLocalBin('sekai-router', { moduleUrl, platform: 'linux' }),
+      join(fakeRoot, 'target', 'release', 'sekai-router'),
+    )
+
+    // 所有候选都 miss → PATH 默认名。
+    assert.equal(
+      resolveBin('sekai-router', envKey, 'sekai-router', {
+        moduleUrl,
+        env,
+        home,
+        platform: 'win32',
+        exists: () => false,
+      }),
+      'sekai-router',
+    )
+  } finally {
+    await rm(fakeRepo, { recursive: true, force: true })
   }
 })
 
@@ -680,8 +844,11 @@ function defineWorkerPluginTests(workerPath) {
     })
     host.start()
     try {
-      assert.deepEqual([...host.tools.keys()], ['sekai_worker_status'])
-      assertToolDefinition(host.tools.get('sekai_worker_status'))
+      assert.deepEqual(
+        [...host.tools.keys()],
+        ['sekai_worker_status', 'sekai_worker_connect', 'sekai_worker_disconnect'],
+      )
+      for (const def of host.tools.values()) assertToolDefinition(def)
       await waitFor(() => plugin.child !== null, { label: 'worker spawn' })
       await waitFor(() => plugin.lastStderr.toArray().length >= 1, { label: 'stderr line buffered' })
 
@@ -691,6 +858,9 @@ function defineWorkerPluginTests(workerPath) {
       assert.equal(status.restarts, 0)
       assert.ok(status.uptimeMs >= 0)
       assert.ok(status.lastStderr.some((line) => line.includes('阶段1')))
+      assert.equal(status.autoConnect, true)
+      assert.equal(status.routerAddr, '127.0.0.1:7421')
+      assert.equal(status.lastRouterAddr, undefined, 'no state file entry yet')
 
       // 崩溃重启：kill → 500ms 退避 → 新 pid
       const pidBefore = status.pid
@@ -750,9 +920,13 @@ function defineWorkerPluginTests(workerPath) {
     }
   })
 
-  test('worker 插件：publishStatusTool=false 时不注册工具', () => {
+  test('worker 插件：publishStatusTool=false 且 publishControlTools=false 时不注册工具', () => {
     const host = createFakeHost()
-    const plugin = new SekaiWorkerPlugin(host.ctx, { workerBin: 'unused-sekai-worker', publishStatusTool: false })
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      publishStatusTool: false,
+      publishControlTools: false,
+    })
     plugin.workerSpawnTarget = (bin, args) => ({
       command: process.execPath,
       args: [workerPath, ...args],
@@ -762,6 +936,241 @@ function defineWorkerPluginTests(workerPath) {
     assert.equal(host.tools.size, 0)
     host.teardown()
     assert.equal(plugin.stopped, true)
+  })
+
+  test('worker 插件：publishStatusTool=false 时仍发布手动控制工具', () => {
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      publishStatusTool: false,
+      autoConnect: false,
+    })
+    plugin.workerSpawnTarget = (bin, args) => ({
+      command: process.execPath,
+      args: [workerPath, ...args],
+      env: { ...process.env, FAKE_WORKER_HOLD: '1', FAKE_WORKER_LIFETIME_MS: '600000' },
+    })
+    host.start()
+    try {
+      assert.deepEqual(
+        [...host.tools.keys()],
+        ['sekai_worker_connect', 'sekai_worker_disconnect'],
+      )
+    } finally {
+      host.teardown()
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// autoConnect 开关 / 上次连接的 Router 持久化
+// ---------------------------------------------------------------------------
+
+function defineAutoConnectTests(workerPath, dir) {
+  /** 假 worker spawn 目标：长驻 + 可选成功连接 / jump 切换行。 */
+  function spawnTarget(extraEnv = {}, args = []) {
+    return {
+      command: process.execPath,
+      args: [workerPath, ...args],
+      env: { ...process.env, FAKE_WORKER_HOLD: '1', FAKE_WORKER_LIFETIME_MS: '600000', ...extraEnv },
+    }
+  }
+
+  test('resolveWorkerConfig：autoConnect / publishControlTools / stateFile 归一化', () => {
+    const cfg = resolveWorkerConfig({})
+    assert.equal(cfg.autoConnect, true)
+    assert.equal(cfg.publishControlTools, true)
+    assert.equal(cfg.stateFile, '')
+    assert.equal(resolveWorkerConfig({ autoConnect: false }).autoConnect, false)
+    assert.equal(resolveWorkerConfig({ autoConnect: 0 }).autoConnect, true, 'only literal false disables')
+    assert.equal(resolveWorkerConfig({ publishControlTools: false }).publishControlTools, false)
+    assert.equal(resolveWorkerConfig({ stateFile: ' D:/x/state.json ' }).stateFile, 'D:/x/state.json')
+    assert.equal(resolveWorkerConfig({ stateFile: '' }).stateFile, '', 'blank stays default')
+  })
+
+  test('上次连接的 Router：stderr 行解析与状态文件纯函数', () => {
+    assert.equal(parseConnectedLine('sekai-worker: TCP 已连接 10.0.0.5:7421'), '10.0.0.5:7421')
+    assert.equal(parseConnectedLine('sekai-worker: 正在连接 10.0.0.5:7421 …（第 1 次）'), null)
+    assert.equal(parseSwitchLine('sekai-worker: 切换到新端点 10.0.0.6:7421'), '10.0.0.6:7421')
+    assert.equal(parseSwitchLine('sekai-worker: TCP 已连接 10.0.0.5:7421'), null)
+    assert.equal(parseReachedRouterLine('sekai-worker: TCP 已连接 [::1]:7421'), '[::1]:7421')
+    assert.equal(parseReachedRouterLine('sekai-worker: TCP 已连接 not-an-address'), null)
+    assert.equal(parseReachedRouterLine('[worker] 阶段1：连接路由器 127.0.0.1:7421'), null)
+
+    const state = withLastRouter(
+      { version: 1, workers: { other: { lastRouterAddr: '127.0.0.1:7000' } } },
+      'pc-worker',
+      '192.0.2.9:7421',
+      42,
+    )
+    assert.deepEqual(state, {
+      version: 1,
+      workers: {
+        other: { lastRouterAddr: '127.0.0.1:7000' },
+        'pc-worker': { lastRouterAddr: '192.0.2.9:7421', updatedAt: 42 },
+      },
+    })
+    assert.equal(lastRouterFromState(state, 'pc-worker'), '192.0.2.9:7421')
+    assert.equal(lastRouterFromState(state, 'other'), '127.0.0.1:7000')
+    assert.equal(lastRouterFromState(state, 'missing'), null)
+    assert.equal(lastRouterFromState({ workers: { 'pc-worker': { lastRouterAddr: 'bogus' } } }, 'pc-worker'), null)
+    assert.equal(lastRouterFromState(null, 'pc-worker'), null)
+
+    assert.equal(
+      defaultWorkerStateFile({ DSH_HOME: 'C:/dsh-home' }, 'C:/home').replaceAll('\\', '/'),
+      'C:/dsh-home/sekai/worker-state.json',
+    )
+    assert.ok(
+      defaultWorkerStateFile({}, 'C:/home').replaceAll('\\', '/').endsWith('/.dsh/sekai/worker-state.json'),
+      'DSH_HOME 未设置时回退 ~/.dsh',
+    )
+  })
+
+  test('worker 插件：autoConnect=true 自动连接状态文件里的上次 Router', async () => {
+    const stateFile = join(dir, 'auto-remembered.json')
+    await writeFile(
+      stateFile,
+      JSON.stringify({ version: 1, workers: { 'pc-worker': { lastRouterAddr: '192.0.2.9:7421' } } }),
+      'utf8',
+    )
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, { workerBin: 'unused-sekai-worker', stateFile })
+    const seen = []
+    plugin.workerSpawnTarget = (bin, args) => {
+      seen.push(args)
+      return spawnTarget({}, args)
+    }
+    host.start()
+    try {
+      await waitFor(() => seen.length >= 1, { label: 'worker spawn' })
+      assert.equal(seen[0][1], '192.0.2.9:7421', 'auto-connect target = last connected router')
+      assert.ok(
+        host.entries.some(([, message]) => message.includes('autoConnect') && message.includes('last connected router')),
+        'log explains the remembered target',
+      )
+      const status = await host.tools.get('sekai_worker_status').execute({}, {})
+      assert.equal(status.autoConnect, true)
+      assert.equal(status.routerAddr, '192.0.2.9:7421')
+      assert.equal(status.lastRouterAddr, '192.0.2.9:7421')
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('worker 插件：stderr 成功连接行 → 写状态文件，下次插件实例复用', async () => {
+    const stateFile = join(dir, 'auto-persist.json')
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, { workerBin: 'unused-sekai-worker', stateFile })
+    plugin.workerSpawnTarget = (bin, args) => spawnTarget({ FAKE_WORKER_REACHED: '198.51.100.7:7421' }, args)
+    host.start()
+    try {
+      await waitFor(
+        () => lastRouterFromState(readWorkerState(stateFile), 'pc-worker') === '198.51.100.7:7421',
+        { label: 'state file remembers connected router' },
+      )
+      assert.equal(plugin.lastRouterAddr, '198.51.100.7:7421')
+      assert.equal(plugin.routerAddr, '198.51.100.7:7421')
+      const status = await host.tools.get('sekai_worker_status').execute({}, {})
+      assert.equal(status.lastRouterAddr, '198.51.100.7:7421')
+      const raw = JSON.parse(await readFile(stateFile, 'utf8'))
+      assert.equal(raw.workers['pc-worker'].lastRouterAddr, '198.51.100.7:7421')
+      assert.equal(typeof raw.workers['pc-worker'].updatedAt, 'number')
+    } finally {
+      host.teardown()
+    }
+
+    // 第二个插件实例（模拟 DSH 重启）：自动连到持久化地址，无需再次成功连接行。
+    const host2 = createFakeHost()
+    const plugin2 = new SekaiWorkerPlugin(host2.ctx, { workerBin: 'unused-sekai-worker', stateFile })
+    const seen = []
+    plugin2.workerSpawnTarget = (bin, args) => {
+      seen.push(args)
+      return spawnTarget({}, args)
+    }
+    host2.start()
+    try {
+      await waitFor(() => seen.length >= 1, { label: 'second instance spawn' })
+      assert.equal(seen[0][1], '198.51.100.7:7421')
+    } finally {
+      host2.teardown()
+    }
+  })
+
+  test('worker 插件：jump 切换行同样更新「上次连接的 Router」', async () => {
+    const stateFile = join(dir, 'auto-switched.json')
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, { workerBin: 'unused-sekai-worker', stateFile })
+    plugin.workerSpawnTarget = (bin, args) => spawnTarget({ FAKE_WORKER_SWITCHED: '203.0.113.5:7421' }, args)
+    host.start()
+    try {
+      await waitFor(
+        () => lastRouterFromState(readWorkerState(stateFile), 'pc-worker') === '203.0.113.5:7421',
+        { label: 'jump target remembered' },
+      )
+      assert.equal(plugin.routerAddr, '203.0.113.5:7421')
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('worker 插件：autoConnect=false 不自动连接；connect/disconnect 手动启停', async () => {
+    const stateFile = join(dir, 'auto-manual.json')
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      stateFile,
+      autoConnect: false,
+    })
+    const seen = []
+    plugin.workerSpawnTarget = (bin, args) => {
+      seen.push(args)
+      return spawnTarget({}, args)
+    }
+    host.start()
+    try {
+      assert.ok(host.entries.some(([, message]) => message.includes('autoConnect=false')))
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      assert.equal(seen.length, 0, 'autoConnect=false must not spawn at startup')
+      assert.equal(plugin.child, null)
+
+      const connected = await host.tools.get('sekai_worker_connect').execute({}, {})
+      assert.equal(connected.started, true)
+      assert.equal(connected.running, true)
+      assert.equal(connected.routerAddr, '127.0.0.1:7421', 'falls back to config routerAddr')
+      assert.equal(seen.length, 1)
+      assert.equal(seen[0][1], '127.0.0.1:7421')
+
+      // 幂等：已在连同一目标时不再 spawn。
+      const again = await host.tools.get('sekai_worker_connect').execute({}, {})
+      assert.equal(again.started, false)
+      assert.equal(seen.length, 1)
+
+      const disconnected = await host.tools.get('sekai_worker_disconnect').execute({}, {})
+      assert.equal(disconnected.disconnected, true)
+      assert.equal(disconnected.running, false)
+      await new Promise((resolve) => setTimeout(resolve, 700))
+      assert.equal(plugin.child, null, 'manual disconnect suppresses auto-restart')
+      assert.equal(plugin.restarts, 0)
+
+      // 再次连接可指定新 Router（手动切换）；并写入 lastRouterAddr 之外的独立目标。
+      const restarted = await host.tools.get('sekai_worker_connect').execute({ router_addr: '198.51.100.9:7421' }, {})
+      assert.equal(restarted.started, true)
+      assert.equal(restarted.running, true)
+      assert.equal(seen.length, 2)
+      assert.equal(seen[1][1], '198.51.100.9:7421')
+
+      // 运行中切换到另一个 Router：断旧连新。
+      const switched = await host.tools.get('sekai_worker_connect').execute({ router_addr: '198.51.100.10:7421' }, {})
+      assert.equal(switched.started, true)
+      assert.equal(seen.length, 3)
+      assert.equal(seen[2][1], '198.51.100.10:7421')
+
+      const invalid = await host.tools.get('sekai_worker_connect').execute({ router_addr: 'not-an-address' }, {})
+      assert.equal(invalid.error.code, 'invalid_arguments')
+      assert.match(invalid.error.message, /HOST:PORT/)
+    } finally {
+      host.teardown()
+    }
   })
 }
 
@@ -1067,6 +1476,8 @@ async function main() {
   }, 300000)
 
   const dir = await mkdtemp(join(tmpdir(), 'sekai-dsh-smoke-'))
+  // 隔离默认状态文件路径（$DSH_HOME/sekai/worker-state.json），绝不读写真实 ~/.dsh。
+  process.env.DSH_HOME = join(dir, 'dsh-home')
   const servePath = join(dir, 'fake-serve.mjs')
   const workerPath = join(dir, 'fake-worker.mjs')
   const workerPromptPath = join(dir, 'fake-prompt-worker.mjs')
@@ -1077,6 +1488,7 @@ async function main() {
   defineJsonlProcessTests(servePath)
   defineRouterPluginTests(servePath)
   defineWorkerPluginTests(workerPath)
+  defineAutoConnectTests(workerPath, dir)
   definePromptRelayTests(workerPath, workerPromptPath)
 
   const failures = []

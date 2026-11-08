@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Sekai bridge",
-    "description": "Sekai router/worker bridge plugins for dsh: drives sekai-router --serve (JSONL over stdio) and the sekai-worker connect lifecycle (PC agent, with prompt relaying and opt-in virtual GPIO), publishing sekai_* tools."
+    "description": "Sekai router/worker bridge plugins for dsh: drives sekai-router --serve (JSONL over stdio) and the sekai-worker connect lifecycle (PC agent with prompt relaying and opt-in virtual GPIO). The worker plugin's autoConnect switch decides whether DSH startup reconnects to the last connected router (persisted per workerId), and sekai_worker_connect / sekai_worker_disconnect control the connection on demand; sekai_* tools are published."
   }
 }

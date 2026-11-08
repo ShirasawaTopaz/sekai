@@ -52,7 +52,7 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 | [crate/sekai-gpio](crate/sekai-gpio) | lib（no_std） | 家族无关 GPIO 抽象 + `gpio.info/config/read/write` 用户工具；ESP32/STM32F1/F4 引脚表、真实后端与宿主虚拟后端（`--gpio` opt-in 后的嵌入式演示）。 |
 | [crate/sekai-embedded](crate/sekai-embedded) | 固件（esp32 feature 门控） | 嵌入式 Worker 启动层（ESP32）：MQTT 传输、硬件时间、真实 GPIO。**当前阶段置后**。 |
 | [crate/sekai-build](crate/sekai-build) | bin | 固件构建/烧录编排（`build` / `flash`），服务嵌入式 Worker。 |
-| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH 插件 bundle | 把 `sekai-router --serve` 与 `sekai-worker connect` 接入 DeepSeek Harness，让 DSH 主会话直接操作 Worker。 |
+| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH 插件 bundle | 把 `sekai-router --serve` 与 `sekai-worker connect` 接入 DeepSeek Harness，让 DSH 主会话直接操作 Worker；安装见 [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1（一键脚本）。worker 插件带 `autoConnect` 开关（自动连接上次连接的 Router）与 `sekai_worker_connect`/`sekai_worker_disconnect` 手动控制。 |
 | [docs/](docs/) | 文档 | 协议、架构、GPIO、ESP32、DSH 插件的完整文档，见[文档导航](#文档导航)。 |
 
 ## 快速开始
@@ -72,6 +72,17 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 cargo build --release -p sekai-router -p sekai-worker
 # 产物：target/release/sekai-router(.exe) 与 target/release/sekai-worker(.exe)
 ```
+
+### 在 DSH 里用插件（可选）
+
+构建之后，一条命令把两个二进制接入 DSH（构建 → 部署二进制 → 安装 bundle → 自检）：
+
+```bash
+node scripts/install-dsh-plugin.mjs [--profile <name>]
+```
+
+重启 DSH 会话后出现 `sekai_*` 工具；`--dry-run`/`--uninstall`、profile 自动选择与
+二进制解析顺序见 [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1。
 
 ### 两个终端跑通闭环
 

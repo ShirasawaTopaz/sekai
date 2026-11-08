@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Sekai 桥接",
-    "description": "面向 dsh 的 Sekai 双插件：驱动 sekai-router --serve（stdio JSONL）与 sekai-worker connect（PC agent，含 prompt 中转与可选虚拟 GPIO）生命周期，并发布 sekai_* 工具。"
+    "description": "面向 dsh 的 Sekai 双插件：驱动 sekai-router --serve（stdio JSONL）与 sekai-worker connect（PC agent，含 prompt 中转与可选虚拟 GPIO）生命周期，并发布 sekai_* 工具。worker 插件的 autoConnect 开关决定 DSH 启动后是否自动连接上次连接的 Router（按 workerId 持久化），也可用 sekai_worker_connect / sekai_worker_disconnect 手动控制连接。"
   }
 }

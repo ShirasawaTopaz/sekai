@@ -58,7 +58,7 @@ You ─────────────▶ sekai-router ──────�
 | [crate/sekai-gpio](crate/sekai-gpio) | lib (no_std) | Family-agnostic GPIO abstraction + `gpio.info/config/read/write` user tools; ESP32/STM32F1/F4 pin tables, real backends, and a host virtual backend (embedded demo behind `--gpio`). |
 | [crate/sekai-embedded](crate/sekai-embedded) | firmware (gated by `esp32` feature) | Embedded Worker bootstrap (ESP32): MQTT transport, hardware time, real GPIO. **Deferred phase.** |
 | [crate/sekai-build](crate/sekai-build) | bin | Firmware build/flash orchestration (`build` / `flash`), serving the embedded Worker. |
-| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH plugin bundle | Bridges `sekai-router --serve` and `sekai-worker connect` into DeepSeek Harness so a DSH session drives Workers directly. |
+| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH plugin bundle | Bridges `sekai-router --serve` and `sekai-worker connect` into DeepSeek Harness so a DSH session drives Workers directly; install it with the one-command script in [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1. The worker plugin adds an `autoConnect` switch (resume the last connected router) and `sekai_worker_connect` / `sekai_worker_disconnect` on-demand control. |
 | [docs/](docs/) | docs | Full documentation for protocol, architecture, GPIO, ESP32, and the DSH plugin — see [doc navigation](#documentation). |
 
 ## Quick start
@@ -80,6 +80,19 @@ You ─────────────▶ sekai-router ──────�
 cargo build --release -p sekai-router -p sekai-worker
 # Artifacts: target/release/sekai-router(.exe) and target/release/sekai-worker(.exe)
 ```
+
+### Use the plugin from DSH (optional)
+
+After the build, one command wires both binaries into DSH (build → deploy binaries →
+install the bundle → self-check):
+
+```bash
+node scripts/install-dsh-plugin.mjs [--profile <name>]
+```
+
+Restart the DSH session afterwards and the `sekai_*` tools appear; see
+[docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1 for `--dry-run`/`--uninstall`,
+profile auto-selection and the binary resolution order.
 
 ### Run the loop in two terminals
 

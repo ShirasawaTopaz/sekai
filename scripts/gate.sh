@@ -7,7 +7,7 @@
 #   scripts/gate.sh test       # 只跑测试
 #   scripts/gate.sh fmt        # 只查格式
 #   scripts/gate.sh clippy     # 只跑 clippy
-#   scripts/gate.sh js         # 只跑 DSH 插件语法检查 + 冒烟
+#   scripts/gate.sh js         # 只跑 DSH 插件语法检查 + 冒烟 + 安装器离线测试
 #
 # 说明：
 # - 本仓库在 Windows 上需要能写 target/ 与 .git/；受限沙箱内 cargo 无法
@@ -74,6 +74,26 @@ if need js; then
 
   step "node plugins/sekai-dsh/scripts/smoke.mjs"
   if node plugins/sekai-dsh/scripts/smoke.mjs; then :; else fail "plugin smoke"; fi
+
+  step "node --check scripts/install-dsh-plugin.mjs"
+  if node --check scripts/install-dsh-plugin.mjs \
+    && node --check scripts/install-dsh-plugin.test.mjs; then :; else fail "node --check installer"; fi
+
+  step "node --test scripts/install-dsh-plugin.test.mjs"
+  # DSH 受限沙箱会禁止 `node --test` 的子进程隔离（spawn EPERM：命名管道被拒）；
+  # 普通终端与 CI 用默认隔离即可。这里只在命中该环境限制时回退到进程内模式
+  # （--test-isolation=none 需要较新 Node；CI 走默认隔离，不受影响）。
+  installer_out=$(node --test scripts/install-dsh-plugin.test.mjs 2>&1)
+  installer_rc=$?
+  if [ "$installer_rc" -ne 0 ] && printf '%s\n' "$installer_out" | grep -q 'spawn EPERM'; then
+    printf '受限沙箱禁止 node --test 子进程隔离（spawn EPERM），改用 --test-isolation=none\n'
+    if node --test --test-isolation=none scripts/install-dsh-plugin.test.mjs; then :; else fail "installer tests"; fi
+  elif [ "$installer_rc" -ne 0 ]; then
+    printf '%s\n' "$installer_out" | tail -60
+    fail "installer tests"
+  else
+    printf '%s\n' "$installer_out" | tail -20
+  fi
 fi
 
 if [ "$status" -eq 0 ]; then

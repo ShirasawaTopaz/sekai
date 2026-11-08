@@ -8,8 +8,10 @@ Worker（PC agent 的 `pc.*` 命令/文件能力、可选 GPIO）。
   `sekai-router --serve`（无头 JSONL over stdio 模式），并向 DSH 注册 4 个 `sekai_*` 工具。
 - **worker 插件**（`@sekai/dsh-plugin/worker`，组件 id `sekai-worker`）：spawn
   `sekai-worker connect <addr> --llm dsh` 管理本机 Worker（PC agent）的生命周期，注册
-  `sekai_worker_status` 状态工具；默认通道 `dsh` 下还把 Worker 的 `pc.ask` prompt
-  中转到 Router 的 prompt ingress（见下文「prompt 中转」）。
+  `sekai_worker_status` 状态工具；**`autoConnect` 开关**决定 DSH 启动且 worker 启用后是否
+  自动连接**上次连接的 Router**（持久化在 `$DSH_HOME/sekai/worker-state.json`，无记录回退
+  `routerAddr`），关闭时用 `sekai_worker_connect` / `sekai_worker_disconnect` 手动控制；默认通道
+  `dsh` 下还把 Worker 的 `pc.ask` prompt 中转到 Router 的 prompt ingress（见下文「prompt 中转」）。
 
 纯 ESM JavaScript，无构建步骤、无运行时 npm 依赖（只用 `node:child_process` / `node:net`
 / `node:readline` 等内置模块）；`@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery` 为 optional peer 依赖。
@@ -27,15 +29,29 @@ DSH Host
 
 ## 安装
 
-由 DSH 管理者执行（本仓库不代办）：
+在仓库根目录、**普通终端**用一条命令完成构建、部署二进制、安装 bundle 与自检：
 
-```
-# dsh 插件管理器（本地绝对目录安装；<repo> = 本仓库的克隆目录）
-dsh plugin add <repo>/plugins/sekai-dsh
+```bash
+node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-或手动在 profile 的 bundles 配置中列出 `@sekai/dsh-plugin`。bundle 自带的
-`cordis.patch.yml` 会插入两行组件（默认 config），无需手工编辑 patch：
+脚本做四件事：`cargo build --release -p sekai-router -p sekai-worker`（`--no-build`
+跳过；`--bin-dir <dir>` 用已有构建）→ 把两个二进制原子部署到 `<DSH_HOME>/sekai/bin/`
+（`DSH_HOME` 未设置 = `~/.dsh`）→ `dsh plugin --profile <p> add
+file:<repo>/plugins/sekai-dsh`（DSH 自动把包名写进 profile 的 `dsh.profile.bundles`）→
+自检（部署文件 / 依赖与 bundles / 从 profile import 并 `resolveBin` 闭环 /
+`--dump-config` 两行）。
+
+**重启 DSH 会话**后出现 `sekai_*` 工具（运行中的会话不会热加载 bundle）；升级 =
+`git pull` 后重跑同一条命令。其他选项：`--dry-run` 只看计划、`--uninstall` 卸载
+（保留二进制与 worker 状态文件）、`--strict` 让 `--dump-config` 校验失败也算失败；
+profile 自动选择 `--profile` > `$DSH_PROFILE` > 唯一 profile > `desktop` > 报错列出，
+`--help` 查看全部。完整说明见 [docs/sekai-dsh-plugin.md §1](../../docs/sekai-dsh-plugin.md)。
+
+> 脚本要调用 `cargo` / `dsh` 子进程：在 DSH 受限沙箱会话（workspace-write）里 Node
+> 子进程会被拒（`spawn EPERM`），请在普通终端运行，或让 DSH 以提权模式运行。
+
+bundle 自带的 `cordis.patch.yml` 会插入两行组件（默认 config），无需手工编辑 patch：
 
 ```yaml
 - insert:
@@ -49,22 +65,35 @@ dsh plugin add <repo>/plugins/sekai-dsh
 
 已保存的 profile 行覆盖优先于补丁默认值生效。
 
-## 构建二进制
+### 二进制解析顺序（零配置）
 
-两个插件分别驱动仓库里的 Rust 二进制：
+两个插件一致（`lib/shared.js::resolveBin`）：**config `routerBin`/`workerBin` >
+`SEKAI_ROUTER_BIN`/`SEKAI_WORKER_BIN` > `$DSH_HOME/sekai/bin/<name>(.exe)` >
+`<repo>/target/release/<name>(.exe)` > PATH**。
 
-```
+- router：`routerBin` config 键 > `SEKAI_ROUTER_BIN` > `$DSH_HOME/sekai/bin/sekai-router(.exe)`
+  > `<repo>/target/release/sekai-router(.exe)` > PATH 上的 `sekai-router`
+- worker：同理 `workerBin` > `SEKAI_WORKER_BIN` > `$DSH_HOME/sekai/bin/sekai-worker(.exe)`
+  > `<repo>/target/release/sekai-worker(.exe)` > PATH 上的 `sekai-worker`
+
+第 3 项由一键安装脚本负责部署，所以安装后默认零配置。config 值与默认二进制同名时视为
+「未显式配置」（此时环境变量优先）；需要覆盖时可在 profile 行级 config 写
+`routerBin` / `workerBin`。
+
+### 备选：不用安装脚本
+
+`dsh plugin --profile <p> add <仓库目录>` 是 `link:` 安装，`cargo build` 后插件自动命中
+`<repo>/target/release`（解析顺序第 4 项），通常仍零配置；只有 `file:` 拷贝安装或二进制
+不在仓库内时，才需要手动放二进制/设路径：
+
+```bash
+# 构建
 cargo build --release -p sekai-router -p sekai-worker
-# 产物：target/release/sekai-router(.exe) 与 target/release/sekai-worker(.exe)
+# 安装（二选一）：DSH 会话内 plugin_manager install_bundle target=<repo>/plugins/sekai-dsh
+#               或 CLI：dsh plugin --profile <p> add <repo>/plugins/sekai-dsh
+# 仅当二进制不在 <repo>/target/release 时（任选其一）：复制到 $DSH_HOME/sekai/bin；
+# 把二进制目录加入 PATH；设 SEKAI_ROUTER_BIN / SEKAI_WORKER_BIN；行级覆盖 routerBin / workerBin。
 ```
-
-二进制解析顺序（两个插件一致）：**config 显式路径 > 环境变量 > PATH**。
-
-- router：`routerBin` config 键 > `SEKAI_ROUTER_BIN` > PATH 上的 `sekai-router`
-- worker：`workerBin` config 键 > `SEKAI_WORKER_BIN` > PATH 上的 `sekai-worker`
-
-config 值与默认二进制同名时视为「未显式配置」（此时环境变量优先生效）。最省事的配法是把
-`routerBin` / `workerBin` 设为 `target\release` 下 exe 的绝对路径。
 
 ## 配置
 
@@ -103,11 +132,52 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 | `gpio` | string\|null | `null` | 虚拟 GPIO 家族（`esp32\|stm32f1\|stm32f4`），非 null 时传 `--gpio <family>`；默认关闭（PC agent 形态）。旧键 `family` 兼容映射到本键 |
 | `restartBackoffMaxMs` | integer ≥500 | `30000` | 重启退避上限 |
 | `publishStatusTool` | boolean | `true` | 是否注册 `sekai_worker_status` |
+| `autoConnect` | boolean | `true` | **自动连接开关**：DSH 启动且 `enabled` 时，是否自动 spawn worker 连接上次连接的 Router（无记录回退 `routerAddr`）；`false` 时不自动连接，改用 `sekai_worker_connect` 工具 |
+| `publishControlTools` | boolean | `true` | 是否注册 `sekai_worker_connect` / `sekai_worker_disconnect` 手动控制工具 |
+| `stateFile` | string | 空 | 「上次连接的 Router」状态文件路径；空 = `$DSH_HOME/sekai/worker-state.json`（`DSH_HOME` 未设置时 `~/.dsh/...`） |
+
+### 自动连接开关与「上次连接的 Router」
+
+```
+DSH 启动 + worker 插件 enabled
+ ├─ autoConnect: true  ──▶ spawn sekai-worker connect <上次连接>  (无记录 → routerAddr)
+ └─ autoConnect: false ──▶ 不 spawn；等 sekai_worker_connect（省略地址同样优先「上次连接」）
+                            断开用 sekai_worker_disconnect（抑制自动重启，直到再次 connect）
+```
+
+- **「上次连接的 Router」怎么来**：插件逐行观察 worker stderr 的稳定进度行——
+  `sekai-worker: TCP 已连接 <addr>`（连接成功）与 `sekai-worker: 切换到新端点 <addr>`
+  （jump 迁移）。识别到即按 `workerId` 隔离写入状态文件；与当前记录相同则跳过写盘。
+  写盘异步、原子（`tmp` + `rename`），失败只 warn，不影响链路。
+- **状态文件格式**（可手工查看/清理，删除后回退 `routerAddr`）：
+
+  ```json
+  {
+    "version": 1,
+    "workers": {
+      "pc-worker": { "lastRouterAddr": "198.51.100.7:7421", "updatedAt": 1794112472780 }
+    }
+  }
+  ```
+
+- **profile 行级覆盖**（关掉自动连接，改为按需手动连）：在 profile 已有的
+  `- id: sekai-worker` 行 `config` 里加一行即可（其余键沿用 bundle 默认/profile 原值）：
+
+  ```yaml
+  - id: sekai-worker
+    config:
+      autoConnect: false
+  ```
+
+- 手动 `disconnect` 后 worker 进程退出不再触发退避重启（状态工具里 `restarts` 不增长）；
+  `sekai_worker_connect` 恢复连接并清零退避。运行中 `connect` 到另一个地址会先断旧连接再连新目标。
 
 ## 工具
 
 模型侧描述为英文；经 router 的 4 个工具串行转发（serve 端 dispatcher 本身串行执行，
-长命令会阻塞后续调用）；`sekai_worker_status` 是 worker 插件本地状态，不走 serve。
+长命令会阻塞后续调用）；`sekai_worker_status` 与 connect/disconnect 是 worker 插件本地
+工具，不走 serve。`sekai_worker_connect` / `sekai_worker_disconnect` 由 `autoConnect:false`
+或运行期切换 Router 时使用（`publishControlTools:false` 可关闭注册）。
 
 | 工具 | 参数 | 返回 |
 | --- | --- | --- |
@@ -115,7 +185,9 @@ config 值与默认二进制同名时视为「未显式配置」（此时环境�
 | `sekai_list_workers` | 无 | workers 响应原样：`{count, workers[]}`（worker_id/online/boot_id/firmware/uptime_ms/tools/tasks/active_tasks…） |
 | `sekai_worker_tool` | `{worker_id, tool, args, ddl_ms?}` | tool_call 响应原样（command_result 形状） |
 | `sekai_worker_task` | `{worker_id, task, args, ddl_ms?}` | task 响应原样（command_result 形状） |
-| `sekai_worker_status` | 无 | `{running, pid?, restarts, uptimeMs, lastStderr[], llm}` |
+| `sekai_worker_status` | 无 | `{running, pid?, restarts, uptimeMs, lastStderr[], llm, autoConnect, routerAddr, lastRouterAddr?}` |
+| `sekai_worker_connect` | `{router_addr?}` | `{started, running, disconnected:false, routerAddr, lastRouterAddr?}`；省略 `router_addr` = 上次连接 / `routerAddr`；运行中连另一地址会断旧连新；非法地址回 `invalid_arguments` 信封 |
+| `sekai_worker_disconnect` | 无 | `{disconnected, running:false, started:false, routerAddr}`；抑制自动重启直到再次 connect |
 
 约定（镜像 router `tools.rs` 的语义）：**先调 `sekai_list_workers`，worker id、工具名、任务名
 必须来自其结果**。`args` 是原始 UTF-8 文本（如 `gpio.info help`）；`ddl_ms` ∈ [1, 300000]。
@@ -194,9 +266,12 @@ JSON 行与非 JSON 行一样只记宿主日志。
   指数退避重启并在 ready 后重放 link/policy、退避复位；worker 计数由
   `worker_online`/`worker_offline` 通知与 `workers` 响应维护，进程死亡时清零重建。
   dispose 顺序：`shutdown` 请求（短超时）→ 宽限等待 → kill → 强杀。
-- **worker**：stderr 逐行进 40 行环形缓冲并写宿主日志；意外退出按 500ms 起步指数退避重启
-  （封顶 `restartBackoffMaxMs`），稳定运行 ≥5s 后的退出把退避复位；dispose 直接 kill
-  （connect 模式无优雅协议），挂起的 prompt 中转请求回 `aborted` 并销毁连接。
+- **worker**：插件加载时按 `autoConnect` 决定是否立即连接（目标是上次连接的 Router，
+  无记录回退 `routerAddr`）；stderr 逐行进 40 行环形缓冲并写宿主日志，同时观察
+  `TCP 已连接` / `切换到新端点` 行更新「上次连接的 Router」状态文件；意外退出按 500ms 起步
+  指数退避重启（封顶 `restartBackoffMaxMs`），稳定运行 ≥5s 后的退出把退避复位；手动
+  `disconnect` 后的退出不再重启（直到再次 `connect`）；dispose 直接 kill（connect 模式无
+  优雅协议），挂起的 prompt 中转请求回 `aborted` 并销毁连接。
 
 ## 本地冒烟（无 Rust）
 
@@ -209,10 +284,12 @@ node scripts/smoke.mjs                                              # 冒烟
 
 `scripts/smoke.mjs` 用 node 写的假 serve（按协议 v1 回放通知与响应）验证 router 侧桥接
 （分帧、请求-响应、超时、本地中止、dispose、崩溃重启、autoLink 重放、四工具、错误信封、
-schema 卫生），用假 worker 脚本验证 worker 侧重启与状态工具；另有假 prompt worker +
-假 ingress（node `net` server 回放响应）验证 dsh 通道 prompt 中转（成功回投、并发独立
-连接、不可达/超时错误信封、`llm:'off'` 不转发、argv 旗标、dispose 清理）。全部断言
-通过 exit 0。
+schema 卫生），用假 worker 脚本验证 worker 侧重启与状态工具；另有假 worker 的成功连接 /
+jump 切换行 + 临时状态文件验证 autoConnect 开关与「上次连接的 Router」持久化（自动连上次
+地址、关闭开关不自动连接、手动 connect/disconnect 与目标切换、无效地址信封、跨插件实例
+复用）；另有假 prompt worker + 假 ingress（node `net` server 回放响应）验证 dsh 通道
+prompt 中转（成功回投、并发独立连接、不可达/超时错误信封、`llm:'off'` 不转发、argv 旗标、
+dispose 清理）。全部断言通过 exit 0。
 
 ## 设计取舍
 
@@ -235,6 +312,13 @@ schema 卫生），用假 worker 脚本验证 worker 侧重启与状态工具；
   `pipe`，承载响应回投）。
 - **worker 插件不 `static inject ['tools']`**：宿主没有 tools 服务时也能加载（只跑生命周期），
   状态工具在注册表可用时才发布，缺 registry 只 warn。
+- **「上次连接的 Router」用 stderr 观察而不是改 worker 协议**：worker 的 connect 模式本来
+  就用 stderr 输出阶段化进度行（`TCP 已连接 <addr>` / `切换到新端点 <addr>` 有 Rust 单测
+  冻结文案），插件据此落盘即可，无需在 V1 帧/CLI 增加状态查询接口；状态文件异步原子写、
+  与当前值相同则跳过写盘，链路失败时也不会因为状态文件出错而崩。
+- **手动控制工具与 `autoConnect` 开关分离**：`publishControlTools` 默认开——关掉自动连接后
+  模型仍能按需 `sekai_worker_connect`；不想要这两个工具（例如严格只读会话）可单独关闭，
+  不影响 `sekai_worker_status`。
 - **插件类不用 `#private`**：Cordis 会把插件方法派发到派生接收者上执行，`#private` 品牌检查
   在这种接收者上会误抛（dsh-dcp 的符号键教训）；统一用普通属性 + 闭包。
 
@@ -251,10 +335,26 @@ backoff restarts, and (with the default `llm:'dsh'`) prompt relaying: lines shap
 connections to the router prompt ingress (`promptAddr`, default `127.0.0.1:7422`) and the
 id-matched response is written back to worker stdin verbatim; local failures return
 `unreachable` / `timeout` envelopes and disposal returns `aborted`. Virtual GPIO is
-opt-in via the `gpio` config key (legacy `family` maps to it). It exposes
-`sekai_worker_status` (now including the `llm` channel). Binaries resolve as config path >
-`SEKAI_ROUTER_BIN` / `SEKAI_WORKER_BIN` > PATH; build them with
-`cargo build --release -p sekai-router -p sekai-worker`. No build step, no runtime npm
+opt-in via the `gpio` config key (legacy `family` maps to it). The worker plugin's
+`autoConnect` switch (default `true`) decides whether, after DSH starts with the worker
+plugin enabled, it auto-connects to the **last successfully connected router**, remembered
+per `workerId` in `$DSH_HOME/sekai/worker-state.json` (from the worker's stderr lines
+`TCP 已连接 <addr>` and `切换到新端点 <addr>`; falls back to `routerAddr`); with
+`autoConnect:false` nothing is spawned at startup and the new `sekai_worker_connect` /
+`sekai_worker_disconnect` tools drive the connection on demand (a manual disconnect
+suppresses backoff restarts until the next connect; the state file path is overridable
+via `stateFile`). It exposes `sekai_worker_status` (including the `llm` channel,
+`autoConnect`, current `routerAddr` and the remembered `lastRouterAddr`). Install
+everything from the repo root with `node scripts/install-dsh-plugin.mjs` — it builds both
+binaries, atomically deploys them
+to `$DSH_HOME/sekai/bin`, installs the bundle via
+`dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`, and self-checks the result
+(including that `resolveBin` resolves the deployed paths). Restart the DSH session
+afterwards (`--dry-run` / `--uninstall` / profile auto-selection are documented in
+[docs/sekai-dsh-plugin.md §1](../../docs/sekai-dsh-plugin.md)). Binaries resolve as
+explicit `routerBin`/`workerBin` config > `SEKAI_ROUTER_BIN` / `SEKAI_WORKER_BIN` >
+`$DSH_HOME/sekai/bin` > `<repo>/target/release` > PATH, so a default install needs no
+PATH, env-var or profile edits. No build step, no runtime npm
 deps; schemastery is an optional peer. All tool failures return a structured
 `{error:{code,message,hint}}` envelope (`spawn_error` / `not_ready` / `timeout` /
 `aborted` or the router-side protocol code) and never throw at DSH. Run

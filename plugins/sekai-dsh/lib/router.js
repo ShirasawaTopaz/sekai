@@ -77,7 +77,7 @@ const LINK_WATCH_DOWN_SAMPLES = 2
 export const LONG_TASK_DDL_HINT_MS = 60000
 
 /** spawn 失败的可操作提示（工具信封与日志共用）。 */
-export const ROUTER_SPAWN_HINT = 'Run `cargo build --release` in the sekai repo, then either add target/release to PATH, set the routerBin config to the absolute path of target/release/sekai-router(.exe), or set SEKAI_ROUTER_BIN.'
+export const ROUTER_SPAWN_HINT = 'Run `node scripts/install-dsh-plugin.mjs` in the sekai repo (it builds the binaries and deploys them to $DSH_HOME/sekai/bin). Fallbacks: `cargo build --release` for a local build; the router bin resolves as routerBin config > SEKAI_ROUTER_BIN > $DSH_HOME/sekai/bin/sekai-router(.exe) > <repo>/target/release/sekai-router(.exe) > PATH.'
 
 /** 与 crate/sekai/src/sekai_wire.rs 的 MAX_DDL_MS 冻结一致。 */
 export const MAX_DDL_MS = 300000

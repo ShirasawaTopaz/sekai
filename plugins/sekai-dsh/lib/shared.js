@@ -1,9 +1,10 @@
 /**
  * shared.js — JSONL over stdio 子进程封装与两个插件共用的小工具。
  *
- * 这里唯一的运行时依赖是 Node 内置模块（child_process / readline /
- * module）。@deepseek-ai/schemastery 只在插件文件里以 peer 方式按需加载，
- * 本文件保持零 npm 依赖，仓库冒烟（scripts/smoke.mjs）可直接 import。
+ * 这里唯一的运行时依赖是 Node 内置模块（child_process / fs / os / path /
+ * readline / url）。@deepseek-ai/schemastery 只在插件文件里以 peer 方式
+ * 按需加载，本文件保持零 npm 依赖，仓库冒烟（scripts/smoke.mjs）可直接
+ * import。
  *
  * JsonlProcess 约定（与 sekai-router --serve 的冻结 JSONL 协议 v1 一致）：
  * - 请求：stdin 每行 {"id":<整数>,"method":"<名>","params":{...}}
@@ -15,7 +16,11 @@
  * @module @sekai/dsh-plugin/shared
  */
 import { spawn } from 'node:child_process'
+import { existsSync, realpathSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import readline from 'node:readline'
+import { fileURLToPath } from 'node:url'
 
 /** 退避重启的起始间隔（毫秒），router 与 worker 共用。 */
 export const RESTART_BACKOFF_INITIAL_MS = 500
@@ -87,21 +92,104 @@ export function nextBackoffMs(currentMs, capMs) {
 }
 
 /**
- * 二进制解析：显式 config（≠默认值）> 环境变量 > 默认值（PATH 查找）。
+ * 解析 DSH home 目录：`DSH_HOME` 非空则去掉首尾空白后用它，否则回退
+ * `~/.dsh`（DSH 插件生态约定）。worker 状态文件与二进制自动发现共用这一
+ * 套规则，路径分隔符/大小写不做额外归一。
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {string} [home] 用户主目录（离线单测可注入）。
+ * @returns {string}
+ */
+export function resolveDshHome(env = process.env, home = os.homedir()) {
+  const configured = typeof env?.DSH_HOME === 'string' ? env.DSH_HOME.trim() : ''
+  const base = typeof home === 'string' && home !== '' ? home : os.homedir()
+  return configured !== '' ? configured : path.join(base, '.dsh')
+}
+
+/** 按平台补二进制后缀：Windows 用 `.exe`，其他平台无后缀。 */
+function binFileName(bin, platform) {
+  return platform === 'win32' ? `${bin}.exe` : bin
+}
+
+/**
+ * 仓库根：本模块真实路径上溯 3 级（`lib` → `sekai-dsh` → `plugins` →
+ * 仓库根）。Node 默认按 realpath 解析 ESM 模块，所以从仓库 checkout 加载
+ * （`dsh plugin add` 的 `link:` 安装）时这里就是仓库真实根；`file:` 安装
+ * 时是 profile 内拷贝目录，此时自动发现会先命中 `$DSH_HOME/sekai/bin`。
+ * @param {string} [moduleUrl] 模块 URL，默认本模块（离线单测可注入假 URL）。
+ * @returns {string}
+ */
+export function repoRootFromModule(moduleUrl = import.meta.url) {
+  const file = fileURLToPath(moduleUrl)
+  let real
+  try {
+    real = realpathSync(file)
+  } catch {
+    // 注入的假 URL（文件不存在）无法 realpath：退回字面路径，离线单测无需
+    // 在磁盘上真的造出 plugins/sekai-dsh/lib/shared.js。
+    real = path.resolve(file)
+  }
+  return path.resolve(path.dirname(real), '..', '..', '..')
+}
+
+/**
+ * 零配置自动发现目录：`$DSH_HOME/sekai/bin`（一键安装脚本的部署位置）。
+ * @param {{env?: NodeJS.ProcessEnv, home?: string}} [options]
+ * @returns {string} 目录路径（不等于二进制路径，需再拼文件名）。
+ */
+export function dshBinDir(options = {}) {
+  const env = options.env ?? process.env
+  const home = options.home ?? os.homedir()
+  return path.join(resolveDshHome(env, home), 'sekai', 'bin')
+}
+
+/**
+ * 仓库本地构建候选：`<仓库根>/target/release/<bin><.exe>`。
+ * @param {string} defaultBin 默认二进制名。
+ * @param {{moduleUrl?: string, platform?: string}} [options]
+ * @returns {string} 候选绝对路径（不检查存在性）。
+ */
+export function repoLocalBin(defaultBin, options = {}) {
+  const platform = options.platform ?? process.platform
+  return path.join(
+    repoRootFromModule(options.moduleUrl),
+    'target',
+    'release',
+    binFileName(defaultBin, platform),
+  )
+}
+
+/**
+ * 二进制解析：显式 config（非空且 ≠ 默认名）> 环境变量 >
+ * `$DSH_HOME/sekai/bin/<bin><.exe>`（存在则用）> `<仓库根>/target/release/
+ * <bin><.exe>`（存在则用）> 默认名（PATH 查找）。
+ *
  * config 的默认值与默认二进制同名时无法区分“显式配置”，但两者语义相同
- * （都等价于 PATH 查找），故不产生歧义。
+ * （都等价于继续走后面的自动发现/PATH），故不产生歧义。
  * @param {string | undefined} configured 插件 config 里的值。
  * @param {string} envKey 环境变量名（如 SEKAI_ROUTER_BIN）。
  * @param {string} defaultBin 默认二进制名。
- * @returns {string} 实际使用的命令。
+ * @param {{moduleUrl?: string, platform?: string, env?: NodeJS.ProcessEnv,
+ *   home?: string, exists?: (file: string) => boolean}} [options]
+ *   moduleUrl/platform/env/home/exists 均可注入，便于离线单测（CI 无
+ *   Windows、无真实 exe 时也能覆盖全部解析顺序）。
+ * @returns {string} 实际使用的命令（绝对路径或 PATH 上的名字）。
  */
-export function resolveBin(configured, envKey, defaultBin) {
+export function resolveBin(configured, envKey, defaultBin, options = {}) {
   if (typeof configured === 'string' && configured.trim() !== '' && configured !== defaultBin) {
     return configured
   }
-  const fromEnv = process.env[envKey]
+  const env = options.env ?? process.env
+  const fromEnv = env?.[envKey]
   if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv
-  return configured && configured.trim() !== '' ? configured : defaultBin
+
+  const platform = options.platform ?? process.platform
+  const home = options.home ?? os.homedir()
+  const exists = options.exists ?? existsSync
+  const discovered = path.join(dshBinDir({ env, home }), binFileName(defaultBin, platform))
+  if (exists(discovered)) return discovered
+  const local = repoLocalBin(defaultBin, { moduleUrl: options.moduleUrl, platform })
+  if (exists(local)) return local
+  return defaultBin
 }
 
 /**

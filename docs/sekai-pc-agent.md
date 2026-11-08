@@ -301,5 +301,11 @@ Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`）
 | `promptAddr` | string | `'127.0.0.1:7422'` | `router` 模式传 `--prompt-addr`；`dsh` 模式为中转目标 |
 | `promptTimeoutMs` | integer ≥1000 | `300000` | 中转等待响应的本地超时，超时回 `timeout` 信封 |
 | `gpio` | string\|null | `null` | 非 null 时传 `--gpio <family>`；旧键 `family` 兼容映射到本键 |
+| `autoConnect` | boolean | `true` | **自动连接开关**：DSH 启动且插件 `enabled` 时，是否自动 `connect` 上次连接的 Router（无记录回退 `routerAddr`）；`false` 时不自动连接 |
+| `publishControlTools` | boolean | `true` | 是否发布 `sekai_worker_connect` / `sekai_worker_disconnect` 手动控制工具 |
+| `stateFile` | string | 空 | 「上次连接的 Router」状态文件；空 = `$DSH_HOME/sekai/worker-state.json` |
 
-全量键表与中转时序见 `plugins/sekai-dsh/README.md`。
+「上次连接的 Router」由插件从 worker stderr 的 `TCP 已连接 <addr>` / `切换到新端点 <addr>`
+（jump 迁移）行识别并按 `workerId` 落盘；手动 `disconnect` 抑制自动重启，直到再次
+`connect`（可省略地址，默认回到上次连接的 Router）。全量键表与中转时序见
+`plugins/sekai-dsh/README.md`。

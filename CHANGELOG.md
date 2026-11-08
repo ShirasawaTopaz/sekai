@@ -7,6 +7,30 @@
 
 ### 新增
 
+- **一键安装脚本 `scripts/install-dsh-plugin.mjs`**：一条命令完成
+  `cargo build`（`--no-build` / `--bin-dir` 可跳过或复用已有构建）→ 把
+  `sekai-router`/`sekai-worker` 原子部署到 `<DSH_HOME>/sekai/bin` →
+  `dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`（自动登记 profile
+  `dsh.profile.bundles`）→ 自检（部署文件、依赖与 bundles、从 profile import 并
+  `resolveBin` 闭环、`--dump-config` 两行）。`--dry-run` 只看计划、`--uninstall`
+  卸载、`--strict` 让组合校验失败也算失败；profile 自动选择为 `--profile` >
+  `$DSH_PROFILE` > 唯一 profile > `desktop`。装/升级后需重启 DSH 会话生效。见
+  [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1。
+- **插件二进制零配置自动发现**：`resolveBin` 解析顺序改为显式
+  `routerBin`/`workerBin` config > `SEKAI_ROUTER_BIN`/`SEKAI_WORKER_BIN` >
+  `$DSH_HOME/sekai/bin/<name>(.exe)` > `<repo>/target/release/<name>(.exe)` >
+  PATH；一键脚本负责部署到 `$DSH_HOME/sekai/bin`，安装后默认零配置，
+  PATH / 环境变量 / profile 行级覆盖不再是主路径（仍可显式覆盖，config 优先级最高）。
+- **PC Worker 自动连接开关（DSH worker 插件）**：新增 config `autoConnect`（默认 `true`）——
+  DSH 启动且 worker 启用时自动连接**上次连接的 Router**（插件从 worker stderr 的
+  `TCP 已连接 <addr>` / `切换到新端点 <addr>` 识别，按 `workerId` 持久化到
+  `$DSH_HOME/sekai/worker-state.json`，无记录回退 `routerAddr`；`stateFile` 可覆盖路径）。
+  `autoConnect:false` 时启动不 spawn，新增 `sekai_worker_connect` / `sekai_worker_disconnect`
+  手动控制工具（`publishControlTools` 控制注册）：手动断开抑制退避重启直到再次 connect，
+  运行中 connect 到新地址会断旧连新；`sekai_worker_status` 追加 `autoConnect` /
+  `routerAddr` / `lastRouterAddr`。插件冒烟新增 autoConnect、持久化与手动控制用例。见
+  [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §3.2 与
+  [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md)。
 - **飞书对话入口**（`--feishu`）：企业自建应用机器人经 WebSocket 长连接接收
   IM 事件、REST 回复原消息，复用 prompt 通道共享核心（`deny_llm_relay`、全局
   4 路并发、策略/网关快照）；支持 `/cancel`、`/status`、allowlist（默认拒绝）、

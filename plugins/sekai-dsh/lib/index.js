@@ -8,7 +8,18 @@
  * @module @sekai/dsh-plugin
  */
 export { SekaiRouterPlugin, ROUTER_DEFAULTS, ROUTER_SPAWN_HINT, MAX_DDL_MS } from './router.js'
-export { SekaiWorkerPlugin, WORKER_DEFAULTS, WORKER_SPAWN_HINT } from './worker.js'
+export {
+  SekaiWorkerPlugin,
+  WORKER_DEFAULTS,
+  WORKER_SPAWN_HINT,
+  parseConnectedLine,
+  parseSwitchLine,
+  parseReachedRouterLine,
+  defaultWorkerStateFile,
+  readWorkerState,
+  lastRouterFromState,
+  withLastRouter,
+} from './worker.js'
 export {
   JsonlProcess,
   JsonlError,
@@ -19,4 +30,8 @@ export {
   nextBackoffMs,
   renderJson,
   resolveBin,
+  resolveDshHome,
+  repoRootFromModule,
+  dshBinDir,
+  repoLocalBin,
 } from './shared.js'

@@ -1,20 +1,28 @@
 # sekai-dsh bundle patch：把 router 与 worker 两个 Host 插件挂进 DSH。
 #
-# 把本包加入 profile 的 bundles（dsh plugin add @sekai/dsh-plugin，或在
-# profile 的 cordis.patch.yml / bundles 配置中列出）即自动应用本补丁——
-# 无需手工编辑任何 patch 文件。两行默认 config 见下；已保存的 profile
-# 行覆盖优先于本补丁默认值生效。
+# 推荐用一键脚本安装（在仓库根运行）：
+#   node scripts/install-dsh-plugin.mjs
+# 它会构建二进制、部署到 $DSH_HOME/sekai/bin、把本包加入 profile bundles 并自检；
+# 也可手动 dsh plugin add @sekai/dsh-plugin，或在 profile 的 cordis.patch.yml /
+# bundles 配置中列出。两行默认 config 见下；已保存的 profile 行覆盖优先于本补丁
+# 默认值生效。
 
 - insert:
     - id: sekai-router
       name: '@sekai/dsh-plugin/router'
       config:
         enabled: true
-        # 二进制不写死路径：解析顺序 config routerBin > SEKAI_ROUTER_BIN > PATH。
-        # 构建后（cargo build --release -p sekai-router）把 target/release 加入
-        # PATH、设环境变量，或在 profile 里覆盖 routerBin 为绝对路径。
+        # 二进制默认由 `node scripts/install-dsh-plugin.mjs` 部署到
+        # $DSH_HOME/sekai/bin（插件零配置自动发现）；也可用 routerBin 显式覆盖。
+        # 解析顺序：routerBin > SEKAI_ROUTER_BIN > $DSH_HOME/sekai/bin
+        # > <repo>/target/release > PATH。
     - id: sekai-worker
       name: '@sekai/dsh-plugin/worker'
       config:
         enabled: true
-        # 同理：workerBin > SEKAI_WORKER_BIN > PATH 上的 sekai-worker。
+        # 自动连接开关：DSH 启动且 worker 启用时，是否自动连接上次连接的 Router
+        # （状态文件 $DSH_HOME/sekai/worker-state.json；无记录回退 routerAddr）。
+        # false 时不自动连接，用 sekai_worker_connect / sekai_worker_disconnect 手动控制。
+        autoConnect: true
+        # 同 routerBin：workerBin > SEKAI_WORKER_BIN > $DSH_HOME/sekai/bin
+        # > <repo>/target/release > PATH 上的 sekai-worker。

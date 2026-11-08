@@ -76,3 +76,11 @@ jobs:
 
       - name: 冒烟（假 serve/假 worker 驱动）
         run: node scripts/smoke.mjs
+
+      # 一键安装器的语法检查与离线测试（fixture 在临时 DSH_HOME 中，不碰 ~/.dsh）。
+      # 本 job 的 working-directory 是 plugins/sekai-dsh，故脚本用 ../../ 指回仓库根。
+      - name: 安装器语法检查
+        run: node --check ../../scripts/install-dsh-plugin.mjs && node --check ../../scripts/install-dsh-plugin.test.mjs
+
+      - name: 安装器离线测试
+        run: node --test ../../scripts/install-dsh-plugin.test.mjs
