@@ -1,7 +1,9 @@
-//! LLM prompt 通道：Worker 进程的**带外**传输（TCP JSONL 或 stdin/stdout JSONL）。
+//! LLM prompt 通道与 DSH 工具桥：Worker 进程的**带外**传输（TCP JSONL 或
+//! stdin/stdout JSONL）。
 //!
 //! PC Worker 的 `pc.ask` 任务需要把 prompt 送到一个能调 LLM 的对端并取回
-//! 回答。V1 二进制帧协议**冻结不动**，prompt 走本模块的带外通道，两种实现：
+//! 回答；`dsh.call` / `dsh.tools` 任务需要在 `--dsh-tools` 时调用 DSH 侧
+//! 工具。V1 二进制帧协议**冻结不动**，两者都走本模块的带外通道，实现：
 //!
 //! - [`RouterPromptChannel`]（`--llm router`）：每次 ask 新建一条 TCP 连接，
 //!   发一行请求、读一行响应、关连接。对端是 Router 的 ingress
@@ -12,14 +14,26 @@
 //!   Router 链路是 TCP，stdin/stdout 不被占用；stdio 模式 stdin 是链路，
 //!   故拒绝）。主进程在启动时 spawn 一个 stdin 行读线程 [`DshPromptChannel::pump`]
 //!   喂通道；ask 写一行到 stdout 并等待对应 id 的响应。
+//!   同一通道在 `--dsh-tools` 时也承载 DSH 工具桥：`dsh.call` / `dsh.tools`
+//!   经 [`DshToolTransport`] 复用 [`DshPromptChannel::request`]；`--llm router`
+//!   与 `--dsh-tools` 可并存（prompt 走 TCP、工具走 stdin/stdout）。
 //!
-//! ## JSONL 契约（与 Router ingress 冻结一致）
+//! ## JSONL 契约（与 Router ingress / DSH 插件冻结一致）
 //!
-//! - 请求：`{"id":1,"method":"prompt","params":{"text":"<prompt>"}}`
-//! - 成功：`{"id":1,"ok":true,"result":{"answer":"...","status":"completed",
-//!   "steps":n,"usage":{...}}}` → 返回 `answer`
-//! - 失败：`{"id":1,"ok":false,"error":{"code":"..","message":".."}}` →
-//!   [`PromptError`] 原样透传
+//! 统一信封：请求 `{"id":N,"method":"<method>","params":{...}}`；成功
+//! `{"id":N,"ok":true,"result":{...}}`，失败
+//! `{"id":N,"ok":false,"error":{"code":"..","message":".."}}`（[`PromptError`]
+//! 透传 code/message）。
+//!
+//! - `prompt`（`pc.ask`）：`params {"text":"<prompt>"}`；成功响应取
+//!   `result.answer` → `String`；
+//! - `dsh_tool`（`dsh.call`）：`params {"tool":"<name>","arguments":<JSON>}`；
+//!   成功 `result` 原样返回 [`Json`]（DSH 插件约定 `result.text` 为展示文本、
+//!   `result.is_error=true` 表示工具自身执行失败）；
+//! - `dsh_tools`（`dsh.tools`）：`params {}`；成功 `result` 原样返回；
+//! - `dsh_cancel`（无顶层 id 的取消通知）：
+//!   `{"method":"dsh_cancel","params":{"id":N}}`，请求方放弃等待时尽力发送，
+//!   让对端 abort 仍在执行的工具调用（`prompt` 无取消协议，不发送）。
 //!
 //! `id` 每通道内单调递增；响应按 `id` 关联请求。行内非 JSON 或无匹配 id
 //! 的响应一律忽略。序列化/解析用本 crate 的 [`crate::mini_json`] 子集。
@@ -124,35 +138,55 @@ pub trait PromptTransport: Send + Sync {
     }
 }
 
-/// 构造一条 prompt 请求行（JSONL 契约见模块头）。
-fn prompt_request(id: u64, prompt: &str) -> String {
+/// DSH 工具传输抽象：`dsh.call` / `dsh.tools` 任务使用。
+///
+/// 与 [`PromptTransport`] 共用同一条 stdin/stdout JSONL 通道（`--dsh-tools`），
+/// 区别是每次调用可单独给预算、且支持取消：任务 DDL 到期 / 被 Drop 时由工作
+/// 线程置位 `cancelled`，实现应尽快返回（`code = "cancelled"`）并尽力发
+/// `dsh_cancel` 让对端 abort 仍在执行的调用。
+pub trait DshToolTransport: Send + Sync {
+    /// 调用一个 DSH 工具；`arguments` 为已解析的 JSON 参数（缺省 `{}`）。
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Json,
+        timeout_ms: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<Json, PromptError>;
+
+    /// 列举 DSH 可用工具；成功值由对端定义（DSH 插件回 `{"tools":[...]}`）。
+    fn list_tools(&self, timeout_ms: u64, cancelled: &AtomicBool) -> Result<Json, PromptError>;
+}
+
+/// 构造一条带 `id` 的请求行（JSONL 信封见模块头）。
+fn request_line(id: u64, method: &str, params: Json) -> String {
     Json::object(vec![
         ("id", Json::from(id)),
-        ("method", Json::from("prompt")),
-        ("params", Json::object(vec![("text", Json::from(prompt))])),
+        ("method", Json::from(method)),
+        ("params", params),
     ])
     .to_compact_string()
 }
 
-/// 解析一行响应。
+/// 构造一条 prompt 请求行（`pc.ask` 的线上形状）。
+fn prompt_request(id: u64, prompt: &str) -> String {
+    request_line(
+        id,
+        "prompt",
+        Json::object(vec![("text", Json::from(prompt))]),
+    )
+}
+
+/// 解析一行响应信封。
 ///
-/// 返回 `Some((id, 结果))`：`ok=true` 取 `result.answer`；`ok=false` 透传
-/// `error.code/message`。行不是合法 JSON、缺 `ok` 或缺 `id` 时返回 `None`
-/// （调用方按契约忽略该行）。
-fn parse_response_line(line: &str) -> Option<(Option<u64>, Result<String, PromptError>)> {
+/// 返回 `Some((id, 结果))`：`ok=true` 取 `result`（缺失视为 `Json::Null`）；
+/// `ok=false` 透传 `error.code/message` 到 [`PromptError`]。行不是合法 JSON、
+/// 缺 `ok` 或缺 `id` 时返回 `None`（调用方按契约忽略该行）。
+pub fn parse_envelope_line(line: &str) -> Option<(Option<u64>, Result<Json, PromptError>)> {
     let value = Json::parse(line.trim()).ok()?;
     let id = value.get("id").and_then(Json::as_u64);
     match value.get("ok").and_then(Json::as_bool) {
-        Some(true) => match value.get_path(&["result", "answer"]).and_then(Json::as_str) {
-            Some(answer) => Some((id, Ok(String::from(answer)))),
-            None => Some((
-                id,
-                Err(PromptError::new(
-                    "agent_error",
-                    "prompt 响应缺少 result.answer 字段",
-                )),
-            )),
-        },
+        Some(true) => Some((id, Ok(value.get("result").cloned().unwrap_or(Json::Null)))),
         Some(false) => {
             let code = value
                 .get_path(&["error", "code"])
@@ -161,11 +195,27 @@ fn parse_response_line(line: &str) -> Option<(Option<u64>, Result<String, Prompt
             let message = value
                 .get_path(&["error", "message"])
                 .and_then(Json::as_str)
-                .unwrap_or("prompt 响应未携带错误信息");
+                .unwrap_or("DSH 响应未携带错误信息");
             Some((id, Err(PromptError::new(code, message))))
         }
         None => None,
     }
+}
+
+/// 解析一行 `prompt` 响应：信封 → `result.answer` 字符串。
+fn parse_response_line(line: &str) -> Option<(Option<u64>, Result<String, PromptError>)> {
+    let (id, result) = parse_envelope_line(line)?;
+    let result = match result {
+        Ok(value) => match value.get("answer").and_then(Json::as_str) {
+            Some(answer) => Ok(String::from(answer)),
+            None => Err(PromptError::new(
+                "agent_error",
+                "prompt 响应缺少 result.answer 字段",
+            )),
+        },
+        Err(error) => Err(error),
+    };
+    Some((id, result))
 }
 
 // ---------------------------------------------------------------------------
@@ -388,10 +438,10 @@ impl LineIo for StdioLineIo {
     }
 }
 
-/// 通道共享状态（id 分配 + 已到响应 + EOF 标记）。
+/// 通道共享状态（已到响应 + EOF 标记）；`id` 分配在 [`DshPromptChannel::next_id`]。
 #[derive(Default)]
 struct ChannelState {
-    responses: Vec<(u64, Result<String, PromptError>)>,
+    responses: Vec<(u64, Result<Json, PromptError>)>,
     eof: bool,
 }
 
@@ -452,13 +502,92 @@ impl DshPromptChannel {
         }
     }
 
+    /// 发送一条带 `id` 的 JSONL 请求并等待同 `id` 的响应。
+    ///
+    /// - `method` 为线上方法名（`prompt` / `dsh_tool` / `dsh_tools`）；
+    /// - `timeout_ms` 是本次等待上限（毫秒，<1 按 1），与通道默认值无关——
+    ///   工具桥每次调用可单独给预算；
+    /// - `cancelled` 置位或等待超时时返回对应 [`PromptError`]；`dsh_*` 方法
+    ///   还会尽力发一行 `dsh_cancel`（带本次 id），让对端 abort 仍在执行的
+    ///   调用（`prompt` 没有取消协议，不发送）。
+    pub fn request(
+        &self,
+        method: &str,
+        params: Json,
+        timeout_ms: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<Json, PromptError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let request = request_line(id, method, params);
+        {
+            // 独占写锁写一行请求；失败即管道关闭。
+            let mut writer = self.writer.lock().unwrap();
+            if !writer.write_line(&request) {
+                return Err(PromptError::new(
+                    "llm_unavailable",
+                    "请求写入 stdout 失败：DSH 插件管道可能已关闭",
+                ));
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        let mut state = self.shared.state.lock().unwrap();
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                drop(state);
+                self.cancel_upstream(method, id);
+                return Err(PromptError::new(
+                    "cancelled",
+                    format!("请求 {method} 已取消（id={id}）"),
+                ));
+            }
+            if let Some(index) = state.responses.iter().position(|(rid, _)| *rid == id) {
+                let (_, result) = state.responses.remove(index);
+                return result;
+            }
+            if state.eof {
+                return Err(PromptError::new(
+                    "llm_unavailable",
+                    "DSH 通道已关闭（stdin EOF）：确认本进程由 DSH 插件以 --dsh-tools                      或 --llm dsh 拉起",
+                ));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                drop(state);
+                self.cancel_upstream(method, id);
+                return Err(PromptError::new(
+                    "timeout",
+                    format!("等待 DSH 应答超时（{method}，{timeout_ms}ms）"),
+                ));
+            }
+            // 分片等待：每片不超过 CANCEL_CHECK_MS，以便及时观察取消标志。
+            let slice = (deadline - now).min(Duration::from_millis(CANCEL_CHECK_MS));
+            let (next, _) = self.shared.signal.wait_timeout(state, slice).unwrap();
+            state = next;
+        }
+    }
+
+    /// 放弃等待时尽力通知对端取消（仅 `dsh_*` 方法；写失败只忽略）。
+    fn cancel_upstream(&self, method: &str, id: u64) {
+        if !method.starts_with("dsh_") {
+            return;
+        }
+        let line = Json::object(vec![
+            ("method", Json::from("dsh_cancel")),
+            ("params", Json::object(vec![("id", Json::from(id))])),
+        ])
+        .to_compact_string();
+        let mut writer = self.writer.lock().unwrap();
+        let _ = writer.write_line(&line);
+    }
+
     /// 投递一行响应（读线程调用）。行内非 JSON、缺 `id` 或缺 `ok` 时忽略并
     /// 返回 `false`；合法则登记结果、唤醒等待者并返回 `true`。
     ///
     /// 迟到/无主响应（没有 ask 在等它）仍会入队——但缓冲有上限
     ///（[`MAX_PENDING_RESPONSES`]），超出时丢弃最旧的，避免无限增长（P8）。
     pub fn feed_line(&self, line: &str) -> bool {
-        let Some((Some(id), result)) = parse_response_line(line) else {
+        let Some((Some(id), result)) = parse_envelope_line(line) else {
             return false;
         };
         let mut state = self.shared.state.lock().unwrap();
@@ -513,53 +642,37 @@ impl PromptTransport for DshPromptChannel {
     }
 }
 
-impl DshPromptChannel {
-    /// ask 主体：写一行请求，等对应 `id` 的响应；`cancelled` 置位后尽快返回。
-    fn ask_with(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let request = prompt_request(id, prompt);
-        {
-            // 独占写锁写一行请求；失败即管道关闭。
-            let mut writer = self.writer.lock().unwrap();
-            if !writer.write_line(&request) {
-                return Err(PromptError::new(
-                    "llm_unavailable",
-                    "prompt 请求写入 stdout 失败：DSH 插件管道可能已关闭",
-                ));
-            }
-        }
+impl DshToolTransport for DshPromptChannel {
+    fn call_tool(
+        &self,
+        name: &str,
+        arguments: &Json,
+        timeout_ms: u64,
+        cancelled: &AtomicBool,
+    ) -> Result<Json, PromptError> {
+        let params = Json::object(vec![
+            ("tool", Json::from(name)),
+            ("arguments", arguments.clone()),
+        ]);
+        self.request("dsh_tool", params, timeout_ms, cancelled)
+    }
 
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms.max(1));
-        let mut state = self.shared.state.lock().unwrap();
-        loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(PromptError::new(
-                    "cancelled",
-                    "pc.ask 已取消：不再等待 DSH 插件应答",
-                ));
-            }
-            if let Some(index) = state.responses.iter().position(|(rid, _)| *rid == id) {
-                let (_, result) = state.responses.remove(index);
-                return result;
-            }
-            if state.eof {
-                return Err(PromptError::new(
-                    "llm_unavailable",
-                    "DSH prompt 通道已关闭（stdin EOF）：确认本进程由 DSH 插件以 --llm dsh 拉起",
-                ));
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(PromptError::new(
-                    "timeout",
-                    format!("等待 DSH prompt 应答超时（{}ms）", self.timeout_ms),
-                ));
-            }
-            // 分片等待：每片不超过 CANCEL_CHECK_MS，以便及时观察取消标志。
-            let slice = (deadline - now).min(Duration::from_millis(CANCEL_CHECK_MS));
-            let (next, _) = self.shared.signal.wait_timeout(state, slice).unwrap();
-            state = next;
-        }
+    fn list_tools(&self, timeout_ms: u64, cancelled: &AtomicBool) -> Result<Json, PromptError> {
+        self.request("dsh_tools", Json::object(Vec::new()), timeout_ms, cancelled)
+    }
+}
+
+impl DshPromptChannel {
+    /// ask 主体：发 `prompt` 请求，等对应 `id` 的响应；`cancelled` 置位后
+    /// 尽快返回（见 [`DshPromptChannel::request`]）。
+    fn ask_with(&self, prompt: &str, cancelled: &AtomicBool) -> Result<String, PromptError> {
+        let params = Json::object(vec![("text", Json::from(prompt))]);
+        let result = self.request("prompt", params, self.timeout_ms, cancelled)?;
+        let answer = result
+            .get("answer")
+            .and_then(Json::as_str)
+            .ok_or_else(|| PromptError::new("agent_error", "prompt 响应缺少 result.answer 字段"))?;
+        Ok(String::from(answer))
     }
 }
 
@@ -923,6 +1036,223 @@ mod tests {
         let error = channel.ask("问").expect_err("EOF 后 ask 不应成功");
         assert_eq!(error.code, "llm_unavailable");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // ---- JSONL 信封（prompt 与 dsh_tool/dsh_tools 共用） ----
+
+    #[test]
+    fn envelope_line_parsing_covers_result_null_and_errors() {
+        let (id, result) =
+            parse_envelope_line("{\"id\":3,\"ok\":true,\"result\":{\"text\":\"hi\"}}").unwrap();
+        assert_eq!(id, Some(3));
+        assert_eq!(
+            result.unwrap().get("text").and_then(Json::as_str),
+            Some("hi")
+        );
+
+        // ok=true 缺 result → Json::Null（由方法层按自己的契约解释）。
+        let (id, result) = parse_envelope_line("{\"id\":4,\"ok\":true}").unwrap();
+        assert_eq!(id, Some(4));
+        assert!(result.unwrap().is_null());
+
+        let (id, result) = parse_envelope_line(
+            "{\"id\":5,\"ok\":false,\"error\":{\"code\":\"disabled\",\"message\":\"未启用\"}}",
+        )
+        .unwrap();
+        assert_eq!(id, Some(5));
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "disabled");
+        assert_eq!(error.message, "未启用");
+
+        assert!(parse_envelope_line("not json").is_none());
+        assert!(parse_envelope_line("{\"id\":1}").is_none());
+    }
+
+    // ---- DshToolTransport：dsh_tool / dsh_tools 请求与取消 ----
+
+    #[test]
+    fn dsh_tool_transport_requests_over_memory_lines() {
+        let (worker_io, peer_io) = mem_pair();
+        let channel = Arc::new(DshPromptChannel::with_timeout_ms(
+            boxed(worker_io.clone()),
+            boxed(worker_io),
+            5_000,
+        ));
+        let pump_channel = channel.clone();
+        thread::spawn(move || pump_channel.pump());
+
+        let peer = thread::spawn(move || {
+            let mut peer = peer_io;
+
+            // 1) dsh_tool 成功：对端校验方法与参数形状。
+            let line = peer.read_line().expect("应收到 dsh_tool 请求");
+            let value = Json::parse(line.trim()).expect("请求应是 JSON");
+            assert_eq!(value.get("method").and_then(Json::as_str), Some("dsh_tool"));
+            let id = value.get("id").and_then(Json::as_u64).unwrap();
+            assert_eq!(
+                value.get_path(&["params", "tool"]).and_then(Json::as_str),
+                Some("read")
+            );
+            assert_eq!(
+                value
+                    .get_path(&["params", "arguments", "path"])
+                    .and_then(Json::as_str),
+                Some("a.txt")
+            );
+            peer.write_line(&format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{\"text\":\"hello\",\"is_error\":false}}}}"
+            ))
+            .then_some(())
+            .expect("写响应失败");
+
+            // 2) dsh_tools 清单。
+            let line = peer.read_line().expect("应收到 dsh_tools 请求");
+            let value = Json::parse(line.trim()).expect("请求应是 JSON");
+            assert_eq!(
+                value.get("method").and_then(Json::as_str),
+                Some("dsh_tools")
+            );
+            let id = value.get("id").and_then(Json::as_u64).unwrap();
+            peer.write_line(&format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{\"tools\":[{{\"name\":\"read\"}}]}}}}"
+            ))
+            .then_some(())
+            .expect("写响应失败");
+
+            // 3) 失败信封原样透传 code/message。
+            let line = peer.read_line().expect("应收到第二个 dsh_tool 请求");
+            let value = Json::parse(line.trim()).expect("请求应是 JSON");
+            let id = value.get("id").and_then(Json::as_u64).unwrap();
+            peer.write_line(&format!(
+                "{{\"id\":{id},\"ok\":false,\"error\":{{\"code\":\"disabled\",\"message\":\"未启用\"}}}}"
+            ))
+            .then_some(())
+            .expect("写响应失败");
+        });
+
+        let arguments = Json::object(vec![("path", Json::from("a.txt"))]);
+        let result = channel
+            .call_tool("read", &arguments, 5_000, &NEVER_CANCELLED)
+            .expect("dsh_tool 应成功");
+        assert_eq!(result.get("text").and_then(Json::as_str), Some("hello"));
+
+        let listing = channel
+            .list_tools(5_000, &NEVER_CANCELLED)
+            .expect("dsh_tools 应成功");
+        assert_eq!(
+            listing
+                .get_path(&["tools", "0", "name"])
+                .and_then(Json::as_str),
+            Some("read")
+        );
+
+        let error = channel
+            .call_tool("fail", &Json::Object(Vec::new()), 5_000, &NEVER_CANCELLED)
+            .unwrap_err();
+        assert_eq!(error.code, "disabled");
+        assert_eq!(error.message, "未启用");
+
+        peer.join().unwrap();
+        // id 单调递增：两次 dsh_tool + 一次 dsh_tools。
+        assert_eq!(channel.next_id.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn dsh_request_cancel_sends_cancel_line() {
+        let (worker_io, peer_io) = mem_pair();
+        let channel = Arc::new(DshPromptChannel::with_timeout_ms(
+            boxed(worker_io.clone()),
+            boxed(worker_io),
+            60_000,
+        ));
+        let pump_channel = channel.clone();
+        thread::spawn(move || pump_channel.pump());
+
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut peer = peer_io;
+            let line = peer.read_line().expect("应收到 dsh_tool 请求");
+            let value = Json::parse(line.trim()).expect("请求应是 JSON");
+            let id = value.get("id").and_then(Json::as_u64).unwrap();
+            let _ = request_seen_tx.send(id);
+
+            let line = peer.read_line().expect("取消后应收到 dsh_cancel");
+            let value = Json::parse(line.trim()).expect("取消行应是 JSON");
+            assert_eq!(
+                value.get("method").and_then(Json::as_str),
+                Some("dsh_cancel")
+            );
+            let cancel_id = value
+                .get_path(&["params", "id"])
+                .and_then(Json::as_u64)
+                .unwrap();
+            let _ = cancel_tx.send(cancel_id);
+            // 迟到响应：通道应忽略（无主），不污染后续请求。
+            peer.write_line(&format!(
+                "{{\"id\":{id},\"ok\":true,\"result\":{{\"text\":\"迟到\"}}}}"
+            ))
+            .then_some(())
+            .expect("写迟到响应失败");
+        });
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let call_channel = channel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = call_channel.call_tool("slow", &Json::Object(Vec::new()), 60_000, &flag);
+            let _ = result_tx.send(result);
+        });
+
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("工作线程未发出请求");
+        cancelled.store(true, Ordering::Relaxed);
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("取消后请求未返回")
+            .unwrap_err();
+        assert_eq!(error.code, "cancelled");
+        assert_eq!(
+            cancel_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            1,
+            "dsh_cancel 的 params.id 应是本次请求 id"
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn dsh_request_timeout_sends_cancel_line() {
+        let (worker_io, peer_io) = mem_pair();
+        let channel =
+            DshPromptChannel::with_timeout_ms(boxed(worker_io.clone()), boxed(worker_io), 60_000);
+        let (cancel_tx, cancel_rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut peer = peer_io;
+            let _ = peer.read_line().expect("应收到请求");
+            let line = peer.read_line().expect("超时后应收到 dsh_cancel");
+            let value = Json::parse(line.trim()).expect("取消行应是 JSON");
+            assert_eq!(
+                value.get("method").and_then(Json::as_str),
+                Some("dsh_cancel")
+            );
+            let _ = cancel_tx.send(());
+            // 保持读循环直到对端写半侧关闭。
+            while peer.read_line().is_some() {}
+        });
+
+        let started = Instant::now();
+        let error = channel
+            .call_tool("slow", &Json::Object(Vec::new()), 80, &NEVER_CANCELLED)
+            .unwrap_err();
+        assert_eq!(error.code, "timeout");
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        cancel_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("超时后未发送 dsh_cancel");
+        drop(channel);
+        peer.join().unwrap();
     }
 
     #[test]

@@ -7,6 +7,29 @@
 
 ### 新增
 
+- **插件页显示（DSH 插件管理界面）**：bundle 与两行插件各自带本地化标题/简介/图标——
+  `locale/{en,zh}.json` 的 `meta.title`/`meta.description`/`meta.detail`、顶层
+  `icon`（`icon.svg`）、详情文档 `docs/DETAIL.md` / `docs/DETAIL.zh.md`（各一张
+  `preview.svg`），以及子路径插件专属的 `locale/router|worker/*.json` 与
+  `./router/icon`、`./worker/icon`（`icons/router.svg`、`icons/worker.svg`）。
+  行设置表单来自 `static Config`，所有字段补齐英文 `.description()` 与默认值；
+  保存写 profile 的 `cordis.patch.yml` 覆盖层。安装脚本对 desktop profile 的
+  `--dump-config` 被桌面端独占管理的情况改为「跳过校验」而非告警，并在
+  「依赖已装但 bundle 未选中」时给出重新启用的可操作提示。见
+  [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1「插件页显示」与
+  [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md)。
+- **Worker → DSH 工具桥（`--dsh-tools` / 插件 `dshTools`）**：PC Worker 新增两个 Task
+  `dsh.tools`（发现本机 DSH 工具）与 `dsh.call`（args 为
+  `{"tool":"<名>","arguments":{...},"timeout_ms":<可选>}`），经与 prompt 通道并列的
+  **带外 JSONL**（worker stdin/stdout ↔ DSH worker 插件）调用本机 DSH 工具；**V1 帧不变**。
+  插件 config 新增 `dshTools`（`enabled` 默认 `false`，`allow` 默认只读
+  `[read,glob,grep]`，另有 `deny`/`cwd`/`agentPreset`/`maxConcurrent`/`timeoutMs`/
+  `maxResponseBytes`），`--dsh-tools` 仅 connect/TCP，env `SEKAI_DSH_TOOL_MS` 默认
+  300000。Router 侧 `dsh.tools`/`dsh.call` 是 Task，由 `allow_tasks` 统一门控；system
+  prompt 会先提示用 `dsh.tools` 发现工具、长调用给 `ddl_ms >= 60000`。桥调用在独立
+  bridge agent 上执行，硬拒绝 `run_code` 与 `sekai_worker_*`。见
+  [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) §3.4 与
+  [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §3.3。
 - **一键安装脚本 `scripts/install-dsh-plugin.mjs`**：一条命令完成
   `cargo build`（`--no-build` / `--bin-dir` 可跳过或复用已有构建）→ 把
   `sekai-router`/`sekai-worker` 原子部署到 `<DSH_HOME>/sekai/bin` →
@@ -63,6 +86,18 @@
 
 ### 修复
 
+- **适配 DSH 0.2.2-rc.3**：`plugins/sekai-dsh/package.json` 新增
+  `engines.dsh = ">=0.2.2-rc.3 <0.3.0"`；工具 `output.schema` 按宿主 JSON Schema
+  子集核对（只认 `type`/`oneOf`/`properties`/`required`/`additionalProperties`/
+  `items`/`enum`/`const` 与注释键）。DSH 0.2.2 起 profile 条目不再保证按 bundle
+  顺序完成挂载，worker 插件激活时 `ctx.get('tools')` 可能是 `undefined`，导致
+  `sekai_worker_status` / `sekai_worker_connect` / `sekai_worker_disconnect` 被静默
+  跳过；改用 `ctx.inject(['tools'], …)` 等工具服务出现后再注册（宿主没有工具
+  注册表时只跳过注册，spawn 与 prompt 中转照常）。本机 rc.3 验证：挂载后工具
+  注册表可见 7 个 `sekai_*` 工具，`sekai_status` 走完整执行管线返回
+  `is_error:false`，bundle 冒烟 47/47。见
+  [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1「DSH 版本兼容」与
+  [plugins/sekai-dsh/README.md](plugins/sekai-dsh/README.md)。
 - 飞书长连接心跳：改为以协议层 **WS ping/pong** 判定存活（`WsMessage::Pong`
   刷新存活时间），修复真连环境每 2×PingInterval 误判「心跳超时」反复重连的问题；
   应用层 CONTROL pong 的解析保留（差异记录见

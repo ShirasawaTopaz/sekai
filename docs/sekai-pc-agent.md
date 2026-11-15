@@ -1,11 +1,13 @@
 # Sekai PC Agent（pc.* 工具与 prompt 通道）
 
-本文描述 PC Worker 的 **PC agent 形态**：开箱即执行本机命令与文件操作的 `pc.*` 工具/任务，
-以及把 prompt 交给 LLM 取回回答的 **prompt 通道**（带外 JSONL，不改变 V1 帧）。
+本文描述 PC Worker 的 **PC agent 形态**：开箱即执行本机命令与文件操作的 `pc.*` 工具/任务、
+把 prompt 交给 LLM 取回回答的 **prompt 通道**，以及可选的 **DSH 工具桥**（`--dsh-tools`：
+Worker 调用本机 DSH 工具）。prompt 通道与 DSH 工具桥都是带外 JSONL，不改变 V1 帧。
 
 - **读者**：驱动 PC Worker 的使用者（REPL / DSH 插件）、prompt ingress 的客户端实现者、
   需要 audit `pc.*` 权限面的安全评审者。
-- **实现基线**：`crate/sekai-worker`（`pc.*` 注册、`--llm`/`--prompt-addr`/`--gpio`、prompt 通道客户端）、
+- **实现基线**：`crate/sekai-worker`（`pc.*` 注册、`--llm`/`--prompt-addr`/`--dsh-tools`/`--gpio`、
+  prompt 通道与 DSH 工具桥客户端）、
   `crate/sekai-router`（prompt ingress、serve `prompt` 方法、策略分类）、
   `plugins/sekai-dsh`（dsh 中转）。文中工具语法、旗标、协议字段以这些源码为准。
 - **相关文档**：`docs/sekai-protocol.md`（V1 帧；prompt 通道是带外能力，见其 §0.1）、
@@ -21,11 +23,14 @@
                  sekai-worker（PC agent）
                   ├─ 工具：pc.read / pc.write / pc.ls / pc.info
                   ├─ 任务：pc.exec / pc.job / pc.ask / echo / sleep
+                  ├─ （可选）--dsh-tools → 追加 Task dsh.tools / dsh.call（DSH 工具桥）
                   └─ （可选）--gpio esp32|stm32f1|stm32f4 → 追加 gpio.*（虚拟 GPIO）
                         │
-                        │ prompt 通道（带外 JSONL，帧协议不变）
-                  ├─ router：Worker 直连 Router prompt ingress（TCP）
-                  └─ dsh  ：Worker stdin/stdout JSONL → DSH worker 插件中转 → ingress
+                        ├─ prompt 通道（带外 JSONL，帧协议不变）
+                        │  ├─ router：Worker 直连 Router prompt ingress（TCP）
+                        │  └─ dsh  ：Worker stdin/stdout JSONL → DSH worker 插件中转 → ingress
+                        └─ DSH 工具桥（带外 JSONL，帧协议不变）
+                           └─ Worker stdin/stdout JSONL → DSH worker 插件 → 本机 DSH 工具
 ```
 
 ---
@@ -41,6 +46,7 @@ GPIO 降级为 `--gpio` opt-in（嵌入式演示用）。
 | --- | --- |
 | 工具（Tool） | `pc.read`、`pc.write`、`pc.ls`、`pc.info` + 内置 `sekai.*` |
 | 任务（Task） | `pc.exec`、`pc.job`、`pc.ask`、`echo`、`sleep` |
+| 任务（仅 `--dsh-tools`） | `dsh.tools`、`dsh.call`（DSH 工具桥，见 §3.4） |
 
 加 `--gpio esp32|stm32f1|stm32f4`（`--family` 为兼容别名）后**追加**
 `gpio.info` / `gpio.config` / `gpio.read` / `gpio.write`（虚拟 GPIO，见 `docs/sekai-gpio.md`）。
@@ -116,6 +122,7 @@ host=<COMPUTERNAME / HOSTNAME，缺省 unknown>
 cwd=<当前目录>
 pid=<进程 id>
 llm=<router|dsh|off>
+dsh_tools=<on|off>
 gpio=<esp32|stm32f1|stm32f4|none>
 ```
 
@@ -156,6 +163,28 @@ gpio=<esp32|stm32f1|stm32f4|none>
 
 - `echo`：args 为任意字节，Done 原样返回。
 - `sleep`：args 为毫秒数文本（≤3600000），到期 Done 空载荷。
+
+### 3.4 `dsh.tools` / `dsh.call` —— 本机 DSH 工具桥（任务，仅 `--dsh-tools`）
+
+Worker 以 `--dsh-tools` 启动（仅 connect/TCP 模式；stdio 模式拒绝该旗标）时，额外注册
+两个 Task，把本机 DSH 工具暴露给 Router/模型。**V1 帧不变**：请求/响应走与 prompt 通道
+并列的另一组带外 JSONL 方法（worker stdin/stdout ↔ DSH worker 插件，见 §4.2）。
+
+| 项 | 值 |
+| --- | --- |
+| `dsh.tools` args | 无（空文本） |
+| `dsh.tools` Done | 每行 `<name> — <描述>`（描述取首行/前 200 字符），整体截断 |
+| `dsh.call` args | JSON 对象：`{"tool":"<DSH 工具名>","arguments":<任意 JSON，缺省 {}>,"timeout_ms":<1000..=600000，可选>}`；`tool` 必填非空 |
+| `dsh.call` Done | 工具结果文本（≤4096 字节，截断追加 `[[truncated]]`） |
+| timeout_ms | 缺省取 env `SEKAI_DSH_TOOL_MS`（默认 300000，钳制 1000..=600000） |
+| 阻塞模型 | 实际调用放独立线程 + mpsc，Task 按 poll 推进，不阻塞 V1 帧循环；DDL 到期/取消/Drop 置取消标志并回投 `dsh_cancel` |
+| 错误映射 | 工具自身失败 → `Failed(Internal, <文本>)`；超时/取消（`timeout`/`cancelled`）→ `Failed(Timeout)`；参数非法 → `Failed(InvalidArgument)`；插件/桥未启用（`disabled`/`no_agent`/`unavailable`）→ `Failed(Unsupported)`；其余 → `Failed(Internal)` |
+| 策略 | 两个名字都是 Task → Router 侧统一由 `--allow-tasks` 门控（见 §5.1） |
+| 观测 | `pc.info` 追加 `dsh_tools=on|off` |
+
+> 预算双层：Router 的 `ddl_ms` 管 V1 Task 预算（默认 10000ms，长调用显式给
+> `ddl_ms >= 60000`），桥的 `timeout_ms` 管 DSH 工具执行等待（默认 300000ms）。两者
+> 都要够，否则分别会以 `Failed(Timeout)` / `timeout` 结束。
 
 ## 4. prompt JSONL 协议（三方通用）
 
@@ -234,6 +263,33 @@ ingress 与 serve `prompt` 方法共用同一核心，只做**策略授权**
 
 回环 + 未配置 token 的旧用法保持兼容（本地 DSH 插件不需要改）。
 
+### 4.2 DSH 工具桥 JSONL（与 prompt 通道并列）
+
+`--dsh-tools` 时 Worker 与 DSH worker 插件在 worker stdin/stdout 上再交换一组 JSONL
+（方法名不同于 `prompt`），V1 帧格式、错误码与 `content_type` 均不变。每行一个 JSON 对象：
+
+- **Worker → 插件（请求）**：
+  - 调用工具：`{"id":N,"method":"dsh_tool","params":{"tool":"read","arguments":{"path":"README.md"}}}`
+    （`arguments` 缺省 `{}`；本轮 Worker 不发送 `params.timeout_ms`，等待预算来自
+    `dsh.call` 的 args `timeout_ms`，插件侧另有 config `dshTools.timeoutMs` 兜底）；
+  - 发现工具：`{"id":N,"method":"dsh_tools","params":{}}`；
+  - 取消：`{"method":"dsh_cancel","params":{"id":N}}`（无顶层 id；`params.id` 指向要取消的请求）。
+- **插件 → Worker（响应）**：`{"id":N,"ok":true,"result":{...}}` 或
+  `{"id":N,"ok":false,"error":{"code":"...","message":"..."}}`。成功时 `result` 含
+  `text`（展示文本）、可选 `value`（工具返回值）与 `truncated`（布尔）；**工具自身失败仍是
+  `ok:true`** + `result.is_error:true` + `result.error{name,code}` + `text`（这是 DSH 工具
+  语义，不是协议错误）。`dsh_tools` 成功结果为 `{tools:[{name,description}],count}`，
+  清单已按插件 `allow`/`deny` 过滤。
+- **错误码（插件产生，冻结）**：`disabled`（`dshTools.enabled=false`）、`policy_denied`
+  （allow/deny 拒绝，或硬拒绝 `run_code`/`sekai_worker_*`）、`invalid_arguments`（`params.tool` 缺失、空串或非字符串）、`unknown_tool`（当前 bridge agent 不可见的工具）、`no_agent`
+  （bridge agent 创建失败）、`unavailable`（宿主 tools 服务不可用）、`timeout`、
+  `cancelled`、`bridge_error`（执行器异常）。
+- **并发与限额**：插件 `maxConcurrent`（默认 1，1..=8）排队执行；`timeoutMs` 默认
+  300000（1000..=600000）；`maxResponseBytes` 默认 65536（1024..=262144）限制回投大小。
+- **安全**：桥只暴露 allowlist 中的工具（默认只读 `[read, glob, grep]`，`deny` 优先），
+  并在独立 bridge agent 上执行，不污染 DSH 主会话；与 prompt 通道一样不新增 V1 帧类型
+  或错误码（完整插件侧限制见 [sekai-dsh-plugin.md](sekai-dsh-plugin.md) §3.3）。
+
 ## 5. 安全模型与防递归
 
 ### 5.1 策略分类（Router 侧，发布 Stdin 前强制）
@@ -246,7 +302,7 @@ Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`）
 | `worker_tool` | `pc.read` / `pc.ls` / `pc.info` | 放行 | —（只读白名单） |
 | `worker_tool` | `pc.write` / `pc.exec` | 拒绝 | `--allow-write`（写白名单） |
 | `worker_tool` | 其余一切名字（admin 桶） | 拒绝 | `--allow-admin` |
-| `worker_task` | 一切任务名：`pc.job` / `pc.ask` / `echo` / `sleep` | 拒绝 | `--allow-tasks`（不按名字分类） |
+| `worker_task` | 一切任务名：`pc.job` / `pc.ask` / `echo` / `sleep` / `dsh.tools` / `dsh.call` | 拒绝 | `--allow-tasks`（不按名字分类） |
 
 即：Worker 把 `pc.job`/`pc.ask` 广告为 Task，实际门槛是 `--allow-tasks`；「admin 桶
 （`--allow-admin`）」只作用于 `worker_tool` 通道里不在两个白名单内的名字。
@@ -256,6 +312,10 @@ Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`）
 > **`pc.exec` 的线类型与策略分离**：`pc.exec` 在 Worker 侧实现为 Task（不阻塞帧循环），
 > 但 Router **按名字**把它归为写操作，门槛仍是 `--allow-write`，不是 `--allow-tasks`。
 > 同样地，`worker_tool` 命中 Worker 通告的 tasks 列表时会自动按 Task 下发（D5）。
+
+> **DSH 工具桥同样由 Task 通道门控**：`dsh.tools` / `dsh.call` 在 Worker 侧只是两个普通
+> Task，Router 不新增策略分类，`--allow-tasks` 打开才可派发；插件侧还有独立 allowlist
+> （`dshTools.enabled` 默认关闭、默认只读）作为第二层防线，两层都过才能执行。
 
 `pc.exec`/`pc.job` 在 Worker 本机以 shell 执行任意命令，权限面最大：默认拒绝之外，
 还应仅在受控环境放开。
@@ -288,10 +348,12 @@ Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`）
 | --- | --- |
 | `--llm router\|dsh\|off` | prompt 通道：router=直连 ingress；dsh=经 DSH 插件中转；off=关闭。默认：connect 模式 `router`，stdio 模式 `off`（stdio 的 stdin/stdout 是链路本身，router/dsh 需 connect 模式） |
 | `--prompt-addr HOST:PORT` | router 模式的 ingress 目标；默认 connect 主机 + 端口 `7422`；仅 `--llm router` 时有效 |
+| `--dsh-tools` | 启用 DSH 工具桥（追加 Task `dsh.tools`/`dsh.call`）；**仅 connect/TCP 模式**，stdio 模式拒绝 |
 | `--gpio esp32\|stm32f1\|stm32f4` | opt-in 虚拟 GPIO（`--family` 兼容别名） |
 | `--gpio-inputs IO4=1,PA5=0` | 给虚拟 GPIO 注入初始输入电平（`0/1/low/high`；需同时 `--gpio`；P12） |
 | env `SEKAI_PC_EXEC_MS` | `pc.exec` 内部超时（100..=300000，默认 10000） |
 | env `SEKAI_PC_ASK_MS` | `pc.ask` 内部硬超时（1000..=300000，默认 300000） |
+| env `SEKAI_DSH_TOOL_MS` | `dsh.call` 桥等待上限（1000..=600000，默认 300000；单次调用可被 args `timeout_ms` 覆盖） |
 
 ### 6.3 DSH worker 插件（`@sekai/dsh-plugin/worker`）
 
@@ -300,6 +362,14 @@ Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`）
 | `llm` | `'dsh'\|'router'\|'off'` | `'dsh'` | spawn 时映射为 `--llm`；`dsh` 由插件中转 prompt |
 | `promptAddr` | string | `'127.0.0.1:7422'` | `router` 模式传 `--prompt-addr`；`dsh` 模式为中转目标 |
 | `promptTimeoutMs` | integer ≥1000 | `300000` | 中转等待响应的本地超时，超时回 `timeout` 信封 |
+| `dshTools.enabled` | boolean | `false` | Worker → DSH 工具桥开关；true 时 spawn 追加 `--dsh-tools` |
+| `dshTools.allow` | string[] | `['read','glob','grep']` | 允许的 DSH 工具名白名单（默认只读） |
+| `dshTools.deny` | string[] | `[]` | 显式拒绝名单，优先于 allow |
+| `dshTools.cwd` | string | 空 | bridge agent 工作目录；空 = 主会话 cwd |
+| `dshTools.agentPreset` | string | `'standard'` | bridge agent 的 agentPreset |
+| `dshTools.maxConcurrent` | integer 1..=8 | `1` | 桥调用并发上限（超出排队） |
+| `dshTools.timeoutMs` | integer 1000..=600000 | `300000` | 单次桥调用等待上限 |
+| `dshTools.maxResponseBytes` | integer 1024..=262144 | `65536` | 单个响应回投上限（超出截断/报错） |
 | `gpio` | string\|null | `null` | 非 null 时传 `--gpio <family>`；旧键 `family` 兼容映射到本键 |
 | `autoConnect` | boolean | `true` | **自动连接开关**：DSH 启动且插件 `enabled` 时，是否自动 `connect` 上次连接的 Router（无记录回退 `routerAddr`）；`false` 时不自动连接 |
 | `publishControlTools` | boolean | `true` | 是否发布 `sekai_worker_connect` / `sekai_worker_disconnect` 手动控制工具 |

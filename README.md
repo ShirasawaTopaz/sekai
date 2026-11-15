@@ -37,6 +37,10 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
   策略在 Router 侧发布 Stdin **之前**强制执行。
 - **prompt 通道（带外）**：Worker 的 `pc.ask` 任务可把问题经 Router prompt ingress
   （直连或经 DSH 插件中转）交给 LLM 取回回答；JSONL 带外传输，不改变 V1 帧。
+- **DSH 工具桥（带外，可选）**：PC Worker 加 `--dsh-tools` 后新增 `dsh.tools` /
+  `dsh.call` 两个 Task，经与 prompt 通道并列的 JSONL 调用本机 DSH 工具（DSH worker
+  插件执行）；插件 `dshTools` 默认关闭、默认只读 allowlist，Router 侧仍由
+  `--allow-tasks` 门控，V1 帧不变。
 - **内置 HTTPS**：Router 默认用 `native-tls`（Windows schannel / 系统 OpenSSL）
   直连 DeepSeek API，不再需要 node 或 curl（`SEKAI_HTTPS_MODE=helper` 可回退）。
 - **`no_std` 核心**：`crate/sekai` 只依赖 `core` + `alloc`，同一份协议代码同时
@@ -52,7 +56,7 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 | [crate/sekai-gpio](crate/sekai-gpio) | lib（no_std） | 家族无关 GPIO 抽象 + `gpio.info/config/read/write` 用户工具；ESP32/STM32F1/F4 引脚表、真实后端与宿主虚拟后端（`--gpio` opt-in 后的嵌入式演示）。 |
 | [crate/sekai-embedded](crate/sekai-embedded) | 固件（esp32 feature 门控） | 嵌入式 Worker 启动层（ESP32）：MQTT 传输、硬件时间、真实 GPIO。**当前阶段置后**。 |
 | [crate/sekai-build](crate/sekai-build) | bin | 固件构建/烧录编排（`build` / `flash`），服务嵌入式 Worker。 |
-| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH 插件 bundle | 把 `sekai-router --serve` 与 `sekai-worker connect` 接入 DeepSeek Harness，让 DSH 主会话直接操作 Worker；安装见 [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1（一键脚本）。worker 插件带 `autoConnect` 开关（自动连接上次连接的 Router）与 `sekai_worker_connect`/`sekai_worker_disconnect` 手动控制。 |
+| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH 插件 bundle | 把 `sekai-router --serve` 与 `sekai-worker connect` 接入 DeepSeek Harness，让 DSH 主会话直接操作 Worker；安装见 [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1（一键脚本）。worker 插件带 `autoConnect` 开关（自动连接上次连接的 Router）与 `sekai_worker_connect`/`sekai_worker_disconnect` 手动控制；可选 worker→DSH 工具桥（`dshTools`）。 |
 | [docs/](docs/) | 文档 | 协议、架构、GPIO、ESP32、DSH 插件的完整文档，见[文档导航](#文档导航)。 |
 
 ## 快速开始
@@ -81,8 +85,10 @@ cargo build --release -p sekai-router -p sekai-worker
 node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-重启 DSH 会话后出现 `sekai_*` 工具；`--dry-run`/`--uninstall`、profile 自动选择与
-二进制解析顺序见 [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1。
+重启 DSH 会话后出现 `sekai_*` 工具（共 7 个：router 4 个 + worker 3 个）；插件适配
+**DSH 0.2.2-rc.3**（`engines.dsh = ">=0.2.2-rc.3 <0.3.0"`，工具注册等待 `tools`
+服务），`--dry-run`/`--uninstall`、profile 自动选择与二进制解析顺序见
+[docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1。
 
 ### 两个终端跑通闭环
 
@@ -146,6 +152,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | `SEKAI_FEISHU_APP_ID` / `SEKAI_FEISHU_APP_SECRET` / `SEKAI_FEISHU_ALLOW_USERS` / `SEKAI_FEISHU_ALLOW_CHATS` / `SEKAI_FEISHU_CONTEXT_TURNS` | 飞书入口凭据、allowlist 与会话上下文轮数（默认全拒、禁 `*`；`--feishu` 必需凭据；`CONTEXT_TURNS` 默认 8、0 关闭多轮记忆；其余 `SEKAI_FEISHU_*` 见 [docs/sekai-feishu.md](docs/sekai-feishu.md) §8） | 无 / 空 / 8 |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` 内部超时（100..=300000） | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` 内部硬超时（1000..=300000） | `300000` |
+| `SEKAI_DSH_TOOL_MS` | Worker `dsh.call` DSH 工具桥等待上限（1000..=600000） | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker 地址（mqtt 链路） | 无 |
 | `SEKAI_WORKER_BIN` | stdio 链路拉起的 Worker 程序 | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT 主题根 | `sekai/v1` |
@@ -165,6 +172,9 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
   权限面最大，仅在受控环境放开。
 - **prompt 防递归**：经 prompt ingress / serve `prompt` 到达的 LLM 运行内再派
   `pc.ask` 一律拒绝（`policy_denied`「嵌套 prompt（pc.ask）」），与开关状态无关。
+- **DSH 工具桥**：Worker 的 `dsh.tools`/`dsh.call` 是普通 Task（按 `--allow-tasks`
+  门控）；插件侧 `dshTools` 默认关闭且默认只读（`read`/`glob`/`grep`），并硬拒绝
+  `run_code` 与 `sekai_worker_*`；两层都通过才执行。
 - **ingress 访问控制**：prompt ingress 默认只监听回环；绑定非回环地址必须显式
   `SEKAI_INGRESS_ALLOW_REMOTE=1`，且必须配置 `SEKAI_INGRESS_TOKEN`（连接第一行
   需 `hello` 握手）。另有限制：并发连接默认 4、每连接 60 请求/分钟，每个请求都会
@@ -179,7 +189,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | [docs/sekai-architecture.md](docs/sekai-architecture.md) | Router/Worker 总体架构、通信矩阵、PC agent 与 prompt 通道、阶段计划 | 所有贡献者，**先读这篇** |
 | [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) | 缺口审计：未实现/未闭环清单、证据、优先级与建议工作包 | 评估范围、排期与验收的人 |
 | [docs/sekai-protocol.md](docs/sekai-protocol.md) | V1 控制平面协议：帧格式、主题、QoS/retain、Hello、错误码 | 协议实现者、调试链路的工程师 |
-| [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent：`pc.*` 工具/任务全表、prompt JSONL 协议、三方配置与安全 | PC Worker 使用者、插件/客户端实现者 |
+| [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent：`pc.*` 工具/任务全表、prompt JSONL 协议、DSH 工具桥（`--dsh-tools`）、三方配置与安全 | PC Worker 使用者、插件/客户端实现者 |
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO 抽象、引脚表、`gpio.*` 工具语法与 AI 调用流程（`--gpio` opt-in 后的嵌入式演示） | 板级开发者、GPIO 集成者 |
 | [docs/sekai-esp32.md](docs/sekai-esp32.md) | ESP32 固件：工具链、构建烧录、WiFi/MQTT 链路、排障 | 固件开发者 |
 | [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH 插件形态与 serve 协议概览（v1.1 `prompt`、v1.2 异步/取消/管理） | DSH 使用者、插件实现者 |

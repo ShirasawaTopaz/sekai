@@ -42,6 +42,11 @@ You ─────────────▶ sekai-router ──────�
 - **Prompt channel (out-of-band)**: the Worker's `pc.ask` task can hand a
   question to the LLM via the Router prompt ingress (direct, or relayed by the
   DSH plugin); JSONL out-of-band, V1 frames unchanged.
+- **DSH tool bridge (out-of-band, opt-in)**: with `--dsh-tools` the PC Worker adds
+  two Tasks, `dsh.tools` and `dsh.call`, which call local DSH tools over JSONL next
+  to the prompt channel (executed by the DSH worker plugin); the plugin's
+  `dshTools` config is off by default, defaults to a read-only allowlist, and the
+  Router still gates both Tasks behind `--allow-tasks`. V1 frames unchanged.
 - **Built-in HTTPS**: the Router talks to the DeepSeek API with `native-tls`
   (Windows schannel / system OpenSSL) by default — no node or curl needed
   (`SEKAI_HTTPS_MODE=helper` falls back to the old helper).
@@ -58,7 +63,7 @@ You ─────────────▶ sekai-router ──────�
 | [crate/sekai-gpio](crate/sekai-gpio) | lib (no_std) | Family-agnostic GPIO abstraction + `gpio.info/config/read/write` user tools; ESP32/STM32F1/F4 pin tables, real backends, and a host virtual backend (embedded demo behind `--gpio`). |
 | [crate/sekai-embedded](crate/sekai-embedded) | firmware (gated by `esp32` feature) | Embedded Worker bootstrap (ESP32): MQTT transport, hardware time, real GPIO. **Deferred phase.** |
 | [crate/sekai-build](crate/sekai-build) | bin | Firmware build/flash orchestration (`build` / `flash`), serving the embedded Worker. |
-| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH plugin bundle | Bridges `sekai-router --serve` and `sekai-worker connect` into DeepSeek Harness so a DSH session drives Workers directly; install it with the one-command script in [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1. The worker plugin adds an `autoConnect` switch (resume the last connected router) and `sekai_worker_connect` / `sekai_worker_disconnect` on-demand control. |
+| [plugins/sekai-dsh](plugins/sekai-dsh) | DSH plugin bundle | Bridges `sekai-router --serve` and `sekai-worker connect` into DeepSeek Harness so a DSH session drives Workers directly; install it with the one-command script in [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1. The worker plugin adds an `autoConnect` switch (resume the last connected router) and `sekai_worker_connect` / `sekai_worker_disconnect` on-demand control, plus an opt-in Worker→DSH tool bridge (`dshTools`). |
 | [docs/](docs/) | docs | Full documentation for protocol, architecture, GPIO, ESP32, and the DSH plugin — see [doc navigation](#documentation). |
 
 ## Quick start
@@ -90,8 +95,10 @@ install the bundle → self-check):
 node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-Restart the DSH session afterwards and the `sekai_*` tools appear; see
-[docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1 for `--dry-run`/`--uninstall`,
+Restart the DSH session afterwards and the `sekai_*` tools appear (7 in total: 4 from the
+router plugin and 3 from the worker plugin); the plugin targets **DSH 0.2.2-rc.3**
+(`engines.dsh = ">=0.2.2-rc.3 <0.3.0"`, tool registration waits for the `tools` service).
+See [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1 for `--dry-run`/`--uninstall`,
 profile auto-selection and the binary resolution order.
 
 ### Run the loop in two terminals
@@ -159,6 +166,7 @@ cross-goal context is retained).
 | `SEKAI_FEISHU_APP_ID` / `SEKAI_FEISHU_APP_SECRET` / `SEKAI_FEISHU_ALLOW_USERS` / `SEKAI_FEISHU_ALLOW_CHATS` / `SEKAI_FEISHU_CONTEXT_TURNS` | Feishu entry credentials, allowlist and context turns (default deny, no `*`; credentials required by `--feishu`; `CONTEXT_TURNS` defaults to 8, 0 disables multi-turn memory; other `SEKAI_FEISHU_*` in [docs/sekai-feishu.md](docs/sekai-feishu.md) §8) | none / empty / 8 |
 | `SEKAI_PC_EXEC_MS` | Worker `pc.exec` internal timeout (100..=300000) | `10000` |
 | `SEKAI_PC_ASK_MS` | Worker `pc.ask` internal hard timeout (1000..=300000) | `300000` |
+| `SEKAI_DSH_TOOL_MS` | Worker `dsh.call` DSH tool-bridge wait limit (1000..=600000) | `300000` |
 | `SEKAI_MQTT_ADDR` | MQTT broker address (mqtt link) | none |
 | `SEKAI_WORKER_BIN` | Worker binary for the stdio link | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT topic root | `sekai/v1` |
@@ -182,6 +190,10 @@ Full list in `sekai-router --help`.
 - **Prompt recursion guard**: any LLM run arriving via the prompt ingress or the
   serve `prompt` method refuses to dispatch `pc.ask` again
   (`policy_denied`, "nested prompt (pc.ask)"), regardless of switches.
+- **DSH tool bridge**: the Worker's `dsh.tools` / `dsh.call` are ordinary Tasks gated
+  by `--allow-tasks`; the plugin-side `dshTools` config is off by default, defaults to
+  a read-only allowlist (`read`/`glob`/`grep`), and always rejects `run_code` and
+  `sekai_worker_*`; both layers must pass.
 - **`--worker <ID>`** (or `policy.worker_filter`): locks operations to a single
   Worker.
 - Credentials are read only from environment variables or explicit CLI
@@ -197,7 +209,7 @@ self-explanatory.
 | [docs/sekai-architecture.md](docs/sekai-architecture.md) | Router/Worker architecture, transport matrix, PC agent & prompt channel, phase plan | Every contributor — **read this first** |
 | [docs/sekai-gap-audit.md](docs/sekai-gap-audit.md) | Gap audit: what is unimplemented / not closed-loop, with evidence, priorities and suggested work packages | Anyone scoping, sequencing or accepting work |
 | [docs/sekai-protocol.md](docs/sekai-protocol.md) | V1 control-plane protocol: frames, topics, QoS/retain, Hello, error codes | Protocol implementers, link debuggers |
-| [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent: full `pc.*` tool/task table, prompt JSONL protocol, three-party config, security | PC Worker users, plugin/client implementers |
+| [docs/sekai-pc-agent.md](docs/sekai-pc-agent.md) | PC agent: full `pc.*` tool/task table, prompt JSONL protocol, DSH tool bridge (`--dsh-tools`), three-party config, security | PC Worker users, plugin/client implementers |
 | [docs/sekai-gpio.md](docs/sekai-gpio.md) | GPIO abstraction, pin tables, `gpio.*` tool syntax & AI call flow (embedded demo behind `--gpio`) | Board-level devs, GPIO integrators |
 | [docs/sekai-esp32.md](docs/sekai-esp32.md) | ESP32 firmware: toolchain, build & flash, WiFi/MQTT link, troubleshooting | Firmware devs |
 | [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) | Sekai × DSH plugin topology and the serve protocol at a glance | DSH users, plugin implementers |

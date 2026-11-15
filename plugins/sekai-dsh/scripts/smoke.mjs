@@ -20,6 +20,10 @@
  *   回显到 stderr）+ 假 ingress（node net server 回放 prompt 响应）验证
  *   dsh 通道的 prompt 中转：成功回投、并发独立连接、不可达/超时错误信封、
  *   llm:'off' 不转发、dispose 清理；
+ * - 用假 dsh 桥 worker + 直接驱动桥单元验证 worker→DSH 工具桥：dshTools
+ *   配置默认值与归一化、spawn 的 --dsh-tools、dsh_tool/dsh_tools/dsh_cancel
+ *   解析、allowlist/deny/硬拒绝、成功与 is_error 信封、bridge agent 懒创建
+ *   与降级重试、超时/取消/串行化/清理、maxResponseBytes 截断、llm:'off' 仍处理；
  * - 覆盖二进制零配置解析顺序（config > env > $DSH_HOME/sekai/bin >
  *   仓库 target/release > PATH）：全部候选用注入的 env/home/moduleUrl/
  *   exists 构造，不依赖本机真实 exe，CI Linux 亦可跑。
@@ -48,10 +52,12 @@ import {
 } from '../lib/shared.js'
 import { SekaiRouterPlugin } from '../lib/router.js'
 import {
+  DSH_TOOLS_DEFAULTS,
   SekaiWorkerPlugin,
   defaultWorkerStateFile,
   lastRouterFromState,
   parseConnectedLine,
+  parseDshToolRequest,
   parsePromptRequest,
   parseReachedRouterLine,
   parseSwitchLine,
@@ -191,6 +197,25 @@ rl.on('line', (line) => process.stderr.write('[prompt-worker] stdin:' + line + '
 setInterval(() => {}, 1000)
 `
 
+/**
+ * 假 dsh 工具桥 worker：按 FAKE_DSH_LINES 发 JSONL 请求行（dsh_tools /
+ * dsh_tool / dsh_cancel），stdin 收到的回包行回显到 stderr（前缀
+ * [dsh-worker] stdin:）供断言。注意保持无反引号/无 ${ }。
+ */
+const FAKE_WORKER_DSH = `
+import readline from 'node:readline'
+const lines = JSON.parse(process.env.FAKE_DSH_LINES ?? '[]')
+const emit = () => {
+  for (const line of lines) console.log(JSON.stringify(line))
+}
+const delay = Number(process.env.FAKE_DSH_DELAY_MS ?? 0)
+if (delay > 0) setTimeout(emit, delay)
+else emit()
+const rl = readline.createInterface({ input: process.stdin })
+rl.on('line', (line) => console.error('[dsh-worker] stdin:' + line))
+setInterval(() => {}, 1000)
+`
+
 // ---------------------------------------------------------------------------
 // 微型测试架
 // ---------------------------------------------------------------------------
@@ -280,7 +305,24 @@ function createFakeIngress(delayForId = () => 0) {
   return { server, requests, connections }
 }
 
-/** 模拟 Cordis 宿主：logger、tools 注册表、延迟执行的 effect 生成器。 */
+/** 默认的 DSH 工具清单：桥测试用（默认 allowlist 只读 read/glob/grep）。 */
+const FAKE_DSH_TOOL_DEFINITIONS = Object.freeze([
+  { name: 'read', description: 'Read a file from disk.' },
+  { name: 'glob', description: 'Find files by path pattern.' },
+  { name: 'grep', description: 'Search file contents.' },
+  { name: 'shell', description: 'Run a shell command.' },
+  { name: 'run_code', description: 'Execute arbitrary code.' },
+  { name: 'sekai_worker_status', description: 'Fake worker plugin status tool.' },
+])
+
+/**
+ * 模拟 Cordis 宿主：logger、tools 注册表（register / definitions /
+ * execute）、agents 服务（create / list）与延迟执行的 effect 生成器。
+ *
+ * toolsService.definitionsImpl / toolsService.executeImpl 与
+ * agents.createImpl 可注入假实现（桥测试用）：未注入时给出伪造的 DSH
+ * 工具清单、成功的 execute 结果和可 dispose 的假 agent 句柄。
+ */
 function createFakeHost() {
   const tools = new Map()
   const disposers = []
@@ -291,17 +333,52 @@ function createFakeHost() {
     error: (m) => entries.push(['error', String(m)]),
   }
   const generators = []
+  const agents = {
+    created: [],
+    disposed: [],
+    listValue: [],
+    createImpl: null,
+  }
+  agents.create = async (options) => {
+    agents.created.push(options)
+    if (typeof agents.createImpl === 'function') return agents.createImpl(options, agents)
+    const agent = { id: options.sessionId, session: { header: { ...(options.meta ?? {}) } } }
+    return { agent, dispose: async () => { agents.disposed.push(agent) } }
+  }
+  agents.list = () => agents.listValue
   const toolsService = {
+    lastExecute: null,
+    definitionsImpl: null,
+    executeImpl: null,
     register(def) {
       if (tools.has(def.name)) throw new Error('duplicate tool: ' + def.name)
       tools.set(def.name, def)
       return () => tools.delete(def.name)
     },
+    definitions() {
+      if (typeof toolsService.definitionsImpl === 'function') return toolsService.definitionsImpl()
+      return FAKE_DSH_TOOL_DEFINITIONS.map((definition) => ({ ...definition }))
+    },
+    async execute(input) {
+      toolsService.lastExecute = input
+      if (typeof toolsService.executeImpl === 'function') return toolsService.executeImpl(input)
+      const call = input?.calls?.[0] ?? {}
+      return {
+        results: [{
+          callId: call.id,
+          result: { content: [{ type: 'text', text: 'executed ' + call.name }], value: { ok: true, name: call.name } },
+        }],
+        additionalContexts: [],
+        concluded: false,
+      }
+    },
   }
   const ctx = {
     logger,
     get(name) {
-      return name === 'tools' ? toolsService : undefined
+      if (name === 'tools') return toolsService
+      if (name === 'agents') return agents
+      return undefined
     },
     effect(generator) {
       generators.push(generator)
@@ -310,6 +387,8 @@ function createFakeHost() {
   return {
     ctx,
     tools,
+    toolsService,
+    agents,
     entries,
     logger,
     /** 逐个执行收集到的 effect 生成器（收集 yield 的清理函数）。 */
@@ -1464,6 +1543,509 @@ function definePromptRelayTests(workerPath, workerPromptPath) {
 }
 
 // ---------------------------------------------------------------------------
+// worker→DSH 工具桥（config.dshTools）
+// ---------------------------------------------------------------------------
+
+function defineDshToolsBridgeTests(workerPath, workerDshPath) {
+  /** 桥 worker 回显的 stdin 行前缀。 */
+  const DSH_STDIN_PREFIX = '[dsh-worker] stdin:'
+
+  /** 直接驱动桥单元（不 spawn）：覆写 stdin 写入以截获回投信封。 */
+  function createBridgePlugin(host, config = {}, dshTools = {}) {
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      autoConnect: false,
+      ...config,
+      dshTools: { enabled: true, ...dshTools },
+    })
+    const written = []
+    plugin.writeWorkerStdin = (chunk) => {
+      written.push(String(chunk))
+      return true
+    }
+    const envelopes = () => written.map((chunk) => JSON.parse(chunk))
+    const waitEnvelope = async (id) => {
+      await waitFor(() => envelopes().some((envelope) => envelope.id === id), { label: 'bridge response #' + id })
+      return envelopes().find((envelope) => envelope.id === id)
+    }
+    return { plugin, written, envelopes, waitEnvelope }
+  }
+
+  /** 成功 execute 结果（value + content text）。 */
+  function successResult(input, { value = { ok: true }, text = 'ok' } = {}) {
+    return {
+      results: [{ callId: input.calls[0].id, result: { content: [{ type: 'text', text }], value } }],
+      additionalContexts: [],
+      concluded: false,
+    }
+  }
+
+  test('resolveWorkerConfig：dshTools 默认值与归一化（含空 preset 语义）', () => {
+    const defaults = resolveWorkerConfig({}).dshTools
+    assert.deepEqual(defaults, {
+      enabled: false,
+      allow: ['read', 'glob', 'grep'],
+      deny: [],
+      cwd: '',
+      agentPreset: 'standard',
+      maxConcurrent: 1,
+      timeoutMs: 300000,
+      maxResponseBytes: 65536,
+    })
+    assert.deepEqual(defaults.allow, [...DSH_TOOLS_DEFAULTS.allow])
+    assert.deepEqual(defaults.deny, [])
+    assert.equal(resolveWorkerConfig({ dshTools: { enabled: true } }).dshTools.enabled, true)
+    assert.equal(resolveWorkerConfig({ dshTools: { enabled: 1 } }).dshTools.enabled, false, 'only literal true enables')
+    assert.deepEqual(resolveWorkerConfig({ dshTools: { allow: [' read ', '', 7, 'grep'] } }).dshTools.allow, ['read', 'grep'])
+    assert.deepEqual(resolveWorkerConfig({ dshTools: { allow: [] } }).dshTools.allow, [], 'explicit empty allow = allow nothing')
+    assert.deepEqual(resolveWorkerConfig({ dshTools: { allow: 'read' } }).dshTools.allow, ['read', 'glob', 'grep'], 'non-array falls back to default')
+    assert.deepEqual(resolveWorkerConfig({ dshTools: { deny: ['shell', ''] } }).dshTools.deny, ['shell'])
+    assert.equal(resolveWorkerConfig({ dshTools: { cwd: ' D:/proj ' } }).dshTools.cwd, 'D:/proj')
+    assert.equal(resolveWorkerConfig({ dshTools: { cwd: '  ' } }).dshTools.cwd, '')
+    assert.equal(resolveWorkerConfig({ dshTools: { agentPreset: '' } }).dshTools.agentPreset, '', 'explicit empty preset = no preset')
+    assert.equal(resolveWorkerConfig({ dshTools: { agentPreset: '  ' } }).dshTools.agentPreset, '')
+    assert.equal(resolveWorkerConfig({ dshTools: { maxConcurrent: 0 } }).dshTools.maxConcurrent, 1)
+    assert.equal(resolveWorkerConfig({ dshTools: { maxConcurrent: 99 } }).dshTools.maxConcurrent, 8)
+    assert.equal(resolveWorkerConfig({ dshTools: { maxConcurrent: 2.7 } }).dshTools.maxConcurrent, 2)
+    assert.equal(resolveWorkerConfig({ dshTools: { timeoutMs: 10 } }).dshTools.timeoutMs, 1000)
+    assert.equal(resolveWorkerConfig({ dshTools: { timeoutMs: 9999999 } }).dshTools.timeoutMs, 600000)
+    assert.equal(resolveWorkerConfig({ dshTools: { maxResponseBytes: 1 } }).dshTools.maxResponseBytes, 1024)
+    assert.equal(resolveWorkerConfig({ dshTools: { maxResponseBytes: 9999999 } }).dshTools.maxResponseBytes, 262144)
+    assert.deepEqual(resolveWorkerConfig({ dshTools: true }).dshTools, resolveWorkerConfig({}).dshTools)
+    // 其余键保持旧行为（回归）
+    assert.equal(resolveWorkerConfig({ dshTools: { enabled: true } }).autoConnect, true)
+  })
+
+  test('parseDshToolRequest：dsh_tool / dsh_tools / dsh_cancel 解析', () => {
+    assert.deepEqual(
+      parseDshToolRequest('{"id":7,"method":"dsh_tool","params":{"tool":"read","arguments":{"path":"a"},"timeout_ms":60000}}'),
+      { kind: 'tool', id: 7, tool: 'read', arguments: { path: 'a' }, timeoutMs: 60000 },
+    )
+    assert.deepEqual(
+      parseDshToolRequest('{"id":10,"method":"dsh_tool","params":{"tool":"read"}}'),
+      { kind: 'tool', id: 10, tool: 'read', arguments: {}, timeoutMs: null },
+    )
+    assert.deepEqual(parseDshToolRequest('  {"id":8,"method":"dsh_tools","params":{}}  '), { kind: 'tools', id: 8 })
+    assert.deepEqual(parseDshToolRequest('{"id":9,"method":"dsh_tools"}'), { kind: 'tools', id: 9 })
+    assert.deepEqual(parseDshToolRequest('{"method":"dsh_cancel","params":{"id":7}}'), { kind: 'cancel', id: null, targetId: 7 })
+    assert.deepEqual(parseDshToolRequest('{"id":11,"method":"dsh_cancel","params":{"id":7}}'), { kind: 'cancel', id: 11, targetId: 7 })
+    assert.equal(parseDshToolRequest('{"id":2,"method":"dsh_tool","params":{"tool":""}}').tool, '')
+    assert.equal(parseDshToolRequest('{"id":3,"method":"dsh_tool","params":{"tool":"read","timeout_ms":5}}').timeoutMs, 1000)
+    assert.equal(parseDshToolRequest('{"id":4,"method":"dsh_tool","params":{"tool":"read","timeout_ms":9e9}}').timeoutMs, 600000)
+    // 非桥行 / 无法回投的行一律 null（prompt 行不受影响）
+    assert.equal(parseDshToolRequest('not-json'), null)
+    assert.equal(parseDshToolRequest('{"id":1,"method":"prompt","params":{"text":"hi"}}'), null)
+    assert.equal(parseDshToolRequest('{"method":"dsh_tool","params":{"tool":"read"}}'), null)
+    assert.equal(parseDshToolRequest('{"id":1,"method":"dsh_cancel","params":{}}'), null)
+    assert.equal(parseDshToolRequest('{"id":1,"method":"dsh_cancel"}'), null)
+    assert.equal(parseDshToolRequest('{"id":1,"method":"other","params":{}}'), null)
+  })
+
+  test('worker 插件：dshTools.enabled 追加 --dsh-tools 且 status 暴露桥状态', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      dshTools: { enabled: true, allow: ['read'], maxConcurrent: 2 },
+    })
+    let seenArgs = null
+    plugin.workerSpawnTarget = (bin, args) => {
+      seenArgs = args
+      return {
+        command: process.execPath,
+        args: [workerPath, ...args],
+        env: { ...process.env, FAKE_WORKER_HOLD: '1', FAKE_WORKER_LIFETIME_MS: '600000' },
+      }
+    }
+    host.start()
+    try {
+      await waitFor(() => seenArgs !== null, { label: 'worker spawn with dshTools' })
+      assert.deepEqual(seenArgs, ['connect', '127.0.0.1:7421', '--worker-id', 'pc-worker', '--llm', 'dsh', '--dsh-tools'])
+      for (const def of host.tools.values()) assertToolDefinition(def)
+      const status = await host.tools.get('sekai_worker_status').execute({}, {})
+      assert.deepEqual(status.dshTools, { enabled: true, allow: ['read'], inFlight: 0 })
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('DSH 工具桥：dsh_tools 清单 + 成功 dsh_tool 信封（bridge agent 懒创建）', async () => {
+    const host = createFakeHost()
+    host.agents.listValue = [{ session: { header: { cwd: 'D:/work/main' } } }]
+    const executed = []
+    host.toolsService.executeImpl = async (input) => {
+      executed.push(input)
+      return successResult(input, { value: { lines: 3 }, text: 'file body' })
+    }
+    const { plugin, envelopes, waitEnvelope } = createBridgePlugin(host)
+    try {
+      plugin.handleWorkerStdoutLine('{"id":10,"method":"dsh_tools","params":{}}')
+      const listed = await waitEnvelope(10)
+      assert.equal(listed.ok, true)
+      assert.deepEqual(listed.result.tools.map((tool) => tool.name).sort(), ['glob', 'grep', 'read'])
+      assert.equal(listed.result.count, 3)
+      assert.equal(host.agents.created.length, 1)
+      assert.equal(host.agents.created[0].meta.cwd, 'D:/work/main', 'bridge agent cwd = main session cwd')
+      assert.equal(host.agents.created[0].meta.agentPreset, 'standard')
+      assert.ok(host.agents.created[0].sessionId.startsWith('sekai-dsh-tools-'))
+
+      plugin.handleWorkerStdoutLine('{"id":11,"method":"dsh_tool","params":{"tool":"read","arguments":{"path":"README.md"}}}')
+      const called = await waitEnvelope(11)
+      assert.equal(called.ok, true)
+      assert.deepEqual(called.result, { is_error: false, value: { lines: 3 }, text: 'file body', truncated: false })
+      assert.equal(executed.length, 1)
+      assert.equal(executed[0].agent.id, host.agents.created[0].sessionId)
+      assert.deepEqual(executed[0].calls, [{ id: 'dsh-11', name: 'read', arguments: '{"path":"README.md"}' }])
+      assert.equal(executed[0].maxParallelToolCalls, 1)
+      assert.ok(executed[0].signal instanceof AbortSignal)
+
+      plugin.handleWorkerStdoutLine('{"id":12,"method":"dsh_tool","params":{"tool":"glob"}}')
+      await waitEnvelope(12)
+      assert.equal(host.agents.created.length, 1, 'bridge agent 懒创建且复用')
+      assert.equal(envelopes().length, 3)
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：工具自身失败 → ok:true + is_error:true', async () => {
+    const host = createFakeHost()
+    let attempt = 0
+    host.toolsService.executeImpl = async (input) => {
+      attempt += 1
+      if (attempt === 1) {
+        return {
+          results: [{
+            callId: input.calls[0].id,
+            result: {
+              isError: true,
+              content: [{ type: 'text', text: 'boom: denied' }],
+              error: { message: 'boom: denied', info: { name: 'PermissionError', code: 'E_PERM' } },
+            },
+          }],
+        }
+      }
+      return { results: [{ callId: input.calls[0].id, result: { isError: true, content: [], error: { message: 'no text blocks' } } }] }
+    }
+    const { plugin, waitEnvelope } = createBridgePlugin(host)
+    try {
+      plugin.handleWorkerStdoutLine('{"id":13,"method":"dsh_tool","params":{"tool":"read"}}')
+      const failed = await waitEnvelope(13)
+      assert.equal(failed.ok, true, 'tool failure stays in a success envelope')
+      assert.deepEqual(failed.result, { is_error: true, error: { name: 'PermissionError', code: 'E_PERM' }, text: 'boom: denied', truncated: false })
+      plugin.handleWorkerStdoutLine('{"id":14,"method":"dsh_tool","params":{"tool":"read"}}')
+      const fallback = await waitEnvelope(14)
+      assert.equal(fallback.result.error.name, 'ToolError')
+      assert.equal(fallback.result.error.code, 'tool_error')
+      assert.equal(fallback.result.text, 'no text blocks')
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：allowlist / deny / 硬拒绝 / 空工具名', async () => {
+    const host = createFakeHost()
+    let executed = 0
+    host.toolsService.executeImpl = async (input) => { executed += 1; return successResult(input) }
+    const a = createBridgePlugin(host, {}, { allow: ['glob'] })
+    try {
+      a.plugin.handleWorkerStdoutLine('{"id":20,"method":"dsh_tool","params":{"tool":"read"}}')
+      const denied = await a.waitEnvelope(20)
+      assert.equal(denied.ok, false)
+      assert.equal(denied.error.code, 'policy_denied')
+      assert.match(denied.error.message, /dshTools[.]allow/)
+      assert.equal(executed, 0)
+    } finally {
+      a.plugin.stop()
+    }
+
+    const host2 = createFakeHost()
+    const b = createBridgePlugin(host2, {}, { allow: ['read', 'glob'], deny: ['glob'] })
+    try {
+      b.plugin.handleWorkerStdoutLine('{"id":21,"method":"dsh_tool","params":{"tool":"glob"}}')
+      const deniedByDeny = await b.waitEnvelope(21)
+      assert.equal(deniedByDeny.ok, false)
+      assert.equal(deniedByDeny.error.code, 'policy_denied')
+      assert.match(deniedByDeny.error.message, /dshTools[.]deny/)
+      b.plugin.handleWorkerStdoutLine('{"id":22,"method":"dsh_tools"}')
+      const listed = await b.waitEnvelope(22)
+      assert.deepEqual(listed.result.tools.map((tool) => tool.name), ['read'])
+    } finally {
+      b.plugin.stop()
+    }
+
+    const host3 = createFakeHost()
+    const c = createBridgePlugin(host3, {}, { allow: ['run_code', 'sekai_worker_status', 'read'] })
+    try {
+      for (const [id, tool] of [[23, 'run_code'], [24, 'sekai_worker_status']]) {
+        c.plugin.handleWorkerStdoutLine(JSON.stringify({ id, method: 'dsh_tool', params: { tool } }))
+        const hard = await c.waitEnvelope(id)
+        assert.equal(hard.ok, false)
+        assert.equal(hard.error.code, 'policy_denied')
+        assert.match(hard.error.message, /always denied/)
+      }
+      c.plugin.handleWorkerStdoutLine('{"id":25,"method":"dsh_tools"}')
+      const listed = await c.waitEnvelope(25)
+      assert.deepEqual(listed.result.tools.map((tool) => tool.name), ['read'])
+      c.plugin.handleWorkerStdoutLine('{"id":26,"method":"dsh_tool","params":{}}')
+      const invalid = await c.waitEnvelope(26)
+      assert.equal(invalid.ok, false)
+      assert.equal(invalid.error.code, 'invalid_arguments')
+    } finally {
+      c.plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：definitions 不可见 → unknown_tool', async () => {
+    const host = createFakeHost()
+    host.toolsService.definitionsImpl = () => [{ name: 'read', description: 'Read a file.' }]
+    let executed = 0
+    host.toolsService.executeImpl = async (input) => { executed += 1; return successResult(input) }
+    const { plugin, waitEnvelope } = createBridgePlugin(host, {}, { allow: ['read', 'grep'] })
+    try {
+      plugin.handleWorkerStdoutLine('{"id":30,"method":"dsh_tools"}')
+      const listed = await waitEnvelope(30)
+      assert.deepEqual(listed.result.tools.map((tool) => tool.name), ['read'])
+      plugin.handleWorkerStdoutLine('{"id":31,"method":"dsh_tool","params":{"tool":"grep"}}')
+      const missing = await waitEnvelope(31)
+      assert.equal(missing.ok, false)
+      assert.equal(missing.error.code, 'unknown_tool')
+      assert.equal(executed, 0)
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：disabled 拒答；llm=off 仍处理桥请求', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiWorkerPlugin(host.ctx, { workerBin: 'unused-sekai-worker', autoConnect: false })
+    const written = []
+    plugin.writeWorkerStdin = (chunk) => { written.push(String(chunk)); return true }
+    try {
+      plugin.handleWorkerStdoutLine('{"id":40,"method":"dsh_tools"}')
+      plugin.handleWorkerStdoutLine('{"id":41,"method":"dsh_tool","params":{"tool":"read"}}')
+      plugin.handleWorkerStdoutLine('{"method":"dsh_cancel","params":{"id":40}}')
+      assert.equal(written.length, 2, '无 id 的 cancel 通知不回包')
+      assert.deepEqual(written.map((chunk) => JSON.parse(chunk).error.code), ['disabled', 'disabled'])
+      assert.equal(host.agents.created.length, 0)
+      assert.equal(host.toolsService.lastExecute, null)
+    } finally {
+      plugin.stop()
+    }
+
+    const host2 = createFakeHost()
+    host2.toolsService.executeImpl = async (input) => successResult(input)
+    const off = createBridgePlugin(host2, { llm: 'off' })
+    try {
+      off.plugin.handleWorkerStdoutLine('{"id":42,"method":"dsh_tool","params":{"tool":"read"}}')
+      const ok = await off.waitEnvelope(42)
+      assert.equal(ok.ok, true)
+      assert.equal(ok.result.is_error, false)
+    } finally {
+      off.plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：超时 → timeout 信封并 abort signal', async () => {
+    const host = createFakeHost()
+    let signal = null
+    host.toolsService.executeImpl = (input) => {
+      signal = input.signal
+      return new Promise((resolve, reject) => {
+        input.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))
+      })
+    }
+    const { plugin, waitEnvelope } = createBridgePlugin(host, {}, { timeoutMs: 1000 })
+    try {
+      plugin.handleWorkerStdoutLine('{"id":50,"method":"dsh_tool","params":{"tool":"read"}}')
+      const envelope = await waitEnvelope(50)
+      assert.equal(envelope.ok, false)
+      assert.equal(envelope.error.code, 'timeout')
+      assert.match(envelope.error.message, /1000ms/)
+      assert.ok(signal.aborted, 'timeout aborts the tool signal')
+      assert.equal(plugin.pendingDshTools.size, 0)
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：dsh_cancel abort 在途请求；未知目标回 cancelled:false', async () => {
+    const host = createFakeHost()
+    let started = false
+    let signal = null
+    host.toolsService.executeImpl = (input) => {
+      started = true
+      signal = input.signal
+      return new Promise((resolve, reject) => {
+        input.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))
+      })
+    }
+    const { plugin, written, waitEnvelope } = createBridgePlugin(host)
+    try {
+      plugin.handleWorkerStdoutLine('{"id":60,"method":"dsh_tool","params":{"tool":"read"}}')
+      await waitFor(() => started, { label: 'execute started' })
+      plugin.handleWorkerStdoutLine('{"method":"dsh_cancel","params":{"id":60}}')
+      const cancelled = await waitEnvelope(60)
+      assert.equal(cancelled.ok, false)
+      assert.equal(cancelled.error.code, 'cancelled')
+      assert.ok(signal.aborted)
+      assert.equal(written.length, 1, '无顶层 id 的 cancel 通知不回包')
+      plugin.handleWorkerStdoutLine('{"id":61,"method":"dsh_cancel","params":{"id":60}}')
+      const ack = await waitEnvelope(61)
+      assert.deepEqual(ack, { id: 61, ok: true, result: { cancelled: false } })
+      assert.equal(plugin.pendingDshTools.size, 0)
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：bridge agent 创建失败 → 去 preset 重试 / no_agent', async () => {
+    const host = createFakeHost()
+    let attempts = 0
+    host.agents.createImpl = async (options) => {
+      attempts += 1
+      if (attempts === 1) throw new Error('unknown agent preset standard')
+      return { agent: { id: options.sessionId, session: { header: { ...(options.meta ?? {}) } } }, dispose: async () => {} }
+    }
+    host.toolsService.executeImpl = async (input) => successResult(input)
+    const { plugin, waitEnvelope } = createBridgePlugin(host)
+    try {
+      plugin.handleWorkerStdoutLine('{"id":70,"method":"dsh_tool","params":{"tool":"read"}}')
+      const ok = await waitEnvelope(70)
+      assert.equal(ok.ok, true)
+      assert.equal(attempts, 2)
+      assert.equal(host.agents.created[0].meta.agentPreset, 'standard')
+      assert.equal(host.agents.created[1].meta.agentPreset, undefined, 'retry drops the preset')
+    } finally {
+      plugin.stop()
+    }
+
+    const host2 = createFakeHost()
+    let attempts2 = 0
+    host2.agents.createImpl = async () => { attempts2 += 1; throw new Error('agent service boom') }
+    const failed = createBridgePlugin(host2)
+    try {
+      failed.plugin.handleWorkerStdoutLine('{"id":71,"method":"dsh_tool","params":{"tool":"read"}}')
+      const envelope = await failed.waitEnvelope(71)
+      assert.equal(envelope.ok, false)
+      assert.equal(envelope.error.code, 'no_agent')
+      assert.equal(attempts2, 2, 'preset 失败后不带 preset 重试一次')
+      assert.equal(host2.toolsService.lastExecute, null)
+    } finally {
+      failed.plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：maxConcurrent 串行化，stop/退出清理在途请求', async () => {
+    const host = createFakeHost()
+    const resolvers = []
+    host.toolsService.executeImpl = (input) => new Promise((resolve) => {
+      resolvers.push(() => resolve(successResult(input)))
+    })
+    const { plugin, waitEnvelope } = createBridgePlugin(host, {}, { maxConcurrent: 1 })
+    try {
+      plugin.handleWorkerStdoutLine('{"id":80,"method":"dsh_tool","params":{"tool":"read"}}')
+      plugin.handleWorkerStdoutLine('{"id":81,"method":"dsh_tool","params":{"tool":"grep"}}')
+      await waitFor(() => resolvers.length === 1, { label: 'first tool started' })
+      assert.equal(plugin.pendingDshTools.size, 2)
+      assert.equal(plugin.dshToolsRunning, 1)
+      resolvers[0]()
+      await waitEnvelope(80)
+      await waitFor(() => resolvers.length === 2, { label: 'second tool started after first finished' })
+      resolvers[1]()
+      await waitEnvelope(81)
+      assert.equal(plugin.pendingDshTools.size, 0)
+    } finally {
+      plugin.stop()
+    }
+
+    const host2 = createFakeHost()
+    host2.toolsService.executeImpl = (input) => new Promise((resolve, reject) => {
+      input.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))
+    })
+    const disposing = createBridgePlugin(host2)
+    disposing.plugin.handleWorkerStdoutLine('{"id":82,"method":"dsh_tool","params":{"tool":"read"}}')
+    await waitFor(() => disposing.plugin.dshToolsRunning === 1, { label: 'tool running before dispose' })
+    disposing.plugin.stop()
+    const cancelled = await disposing.waitEnvelope(82)
+    assert.equal(cancelled.error.code, 'cancelled')
+    assert.equal(disposing.plugin.pendingDshTools.size, 0)
+    assert.equal(host2.agents.disposed.length, 1, 'bridge agent disposed on stop')
+
+    const host3 = createFakeHost()
+    host3.toolsService.executeImpl = (input) => new Promise((resolve, reject) => {
+      input.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })))
+    })
+    const exited = createBridgePlugin(host3)
+    exited.plugin.handleWorkerStdoutLine('{"id":83,"method":"dsh_tool","params":{"tool":"read"}}')
+    await waitFor(() => exited.plugin.dshToolsRunning === 1, { label: 'tool running before exit' })
+    exited.plugin.stopped = true
+    exited.plugin.manualStopped = true
+    exited.plugin.handleChildExit(null, { code: 1, signal: null })
+    assert.equal(exited.plugin.pendingDshTools.size, 0)
+    assert.equal(exited.written.length, 0, 'worker 已亡不回投')
+    exited.plugin.disposeBridgeAgent()
+  })
+
+  test('DSH 工具桥：maxResponseBytes 截断超长结果', async () => {
+    const host = createFakeHost()
+    host.toolsService.executeImpl = async (input) => successResult(input, { value: { big: 'v'.repeat(20000) }, text: 'x'.repeat(20000) })
+    const { plugin, written, waitEnvelope } = createBridgePlugin(host, {}, { maxResponseBytes: 1024 })
+    try {
+      plugin.handleWorkerStdoutLine('{"id":90,"method":"dsh_tool","params":{"tool":"read"}}')
+      const envelope = await waitEnvelope(90)
+      assert.equal(envelope.ok, true)
+      assert.equal(envelope.result.is_error, false)
+      assert.equal(envelope.result.truncated, true)
+      assert.equal(envelope.result.value, undefined)
+      assert.ok(envelope.result.text.length < 20000)
+      assert.ok(Buffer.byteLength(written[0], 'utf8') <= 1025, 'single JSONL line stays within maxResponseBytes')
+    } finally {
+      plugin.stop()
+    }
+  })
+
+  test('DSH 工具桥：假 worker 端到端（--dsh-tools spawn → 回投 stdin）', async () => {
+    const host = createFakeHost()
+    host.toolsService.executeImpl = async (input) => successResult(input, { value: { ok: 1 }, text: 'e2e-ok' })
+    const plugin = new SekaiWorkerPlugin(host.ctx, {
+      workerBin: 'unused-sekai-worker',
+      dshTools: { enabled: true },
+    })
+    let seenArgs = null
+    plugin.workerSpawnTarget = (bin, args) => {
+      seenArgs = args
+      return {
+        command: process.execPath,
+        args: [workerDshPath, ...args],
+        env: {
+          ...process.env,
+          FAKE_DSH_LINES: JSON.stringify([
+            { id: 1, method: 'dsh_tools', params: {} },
+            { id: 2, method: 'dsh_tool', params: { tool: 'read', arguments: { path: 'a.txt' } } },
+          ]),
+        },
+      }
+    }
+    host.start()
+    try {
+      await waitFor(() => seenArgs !== null, { label: 'dsh worker spawn' })
+      assert.ok(seenArgs.includes('--dsh-tools'))
+      const echoed = () => plugin.lastStderr.toArray()
+        .filter((line) => line.startsWith(DSH_STDIN_PREFIX))
+        .map((line) => JSON.parse(line.slice(DSH_STDIN_PREFIX.length)))
+      await waitFor(() => echoed().length >= 2, { label: 'two bridge responses echoed' })
+      const byId = new Map(echoed().map((envelope) => [envelope.id, envelope]))
+      assert.equal(byId.get(1).result.count, 3)
+      assert.deepEqual(byId.get(2).result.value, { ok: 1 })
+      assert.equal(byId.get(2).result.text, 'e2e-ok')
+      assert.equal(byId.get(2).result.is_error, false)
+    } finally {
+      host.teardown()
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 
@@ -1481,15 +2063,18 @@ async function main() {
   const servePath = join(dir, 'fake-serve.mjs')
   const workerPath = join(dir, 'fake-worker.mjs')
   const workerPromptPath = join(dir, 'fake-prompt-worker.mjs')
+  const workerDshPath = join(dir, 'fake-dsh-worker.mjs')
   await writeFile(servePath, FAKE_SERVE, 'utf8')
   await writeFile(workerPath, FAKE_WORKER, 'utf8')
   await writeFile(workerPromptPath, FAKE_WORKER_PROMPT, 'utf8')
+  await writeFile(workerDshPath, FAKE_WORKER_DSH, 'utf8')
 
   defineJsonlProcessTests(servePath)
   defineRouterPluginTests(servePath)
   defineWorkerPluginTests(workerPath)
   defineAutoConnectTests(workerPath, dir)
   definePromptRelayTests(workerPath, workerPromptPath)
+  defineDshToolsBridgeTests(workerPath, workerDshPath)
 
   const failures = []
   for (const { name, fn } of tests) {

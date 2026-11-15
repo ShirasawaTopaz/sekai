@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sekai worker",
+    "description": "Manages the local sekai-worker PC agent: autoConnect to the remembered router, optional pc.ask prompt relay, and the worker status plus manual connect/disconnect tools."
+  }
+}

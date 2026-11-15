@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="300" viewBox="0 0 640 300" role="img" aria-label="Sekai bridge overview">
+  <defs>
+    <linearGradient id="sekai-preview-line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7de8ff"/>
+      <stop offset="1" stop-color="#3f8dff"/>
+    </linearGradient>
+    <marker id="sekai-preview-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
+      <path d="M0 1 L9 5 L0 9 Z" fill="#4a9bff"/>
+    </marker>
+  </defs>
+
+  <rect x="40" y="88" width="140" height="124" rx="18" fill="none" stroke="#4a9bff" stroke-width="3"/>
+  <path d="M74 172 V146 A18 18 0 0 1 110 146 V172" fill="none" stroke="url(#sekai-preview-line)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M92 128 L96 140 L108 144 L96 148 L92 160 L88 148 L76 144 L88 140 Z" fill="#ff5f9e"/>
+  <circle cx="148" cy="120" r="3.4" fill="#ffd166"/>
+  <circle cx="148" cy="140" r="3.4" fill="#8f7bff"/>
+  <circle cx="148" cy="160" r="3.4" fill="#7de8ff"/>
+
+  <path d="M196 150 H256" stroke="#4a9bff" stroke-width="3" stroke-linecap="round" marker-end="url(#sekai-preview-arrow)"/>
+  <path d="M324 150 H372" stroke="#4a9bff" stroke-width="3" stroke-linecap="round" marker-end="url(#sekai-preview-arrow)"/>
+  <circle cx="214" cy="150" r="3" fill="#7de8ff"/>
+  <circle cx="230" cy="150" r="3" fill="#7de8ff"/>
+  <circle cx="338" cy="150" r="3" fill="#7de8ff"/>
+  <circle cx="356" cy="150" r="3" fill="#7de8ff"/>
+
+  <circle cx="290" cy="150" r="26" fill="none" stroke="url(#sekai-preview-line)" stroke-width="4"/>
+  <g stroke="url(#sekai-preview-line)" stroke-width="4" stroke-linecap="round">
+    <path d="M272 132 L254 114"/>
+    <path d="M308 132 L326 114"/>
+    <path d="M290 178 V196"/>
+  </g>
+  <circle cx="250" cy="110" r="8" fill="#ffd166"/>
+  <circle cx="330" cy="110" r="8" fill="#8f7bff"/>
+  <circle cx="290" cy="200" r="8" fill="#7de8ff"/>
+
+  <rect x="380" y="94" width="220" height="112" rx="18" fill="none" stroke="#4a9bff" stroke-width="3"/>
+  <rect x="440" y="118" width="72" height="64" rx="10" fill="none" stroke="url(#sekai-preview-line)" stroke-width="4"/>
+  <g stroke="url(#sekai-preview-line)" stroke-width="3" stroke-linecap="round">
+    <path d="M458 108 V118 M476 108 V118 M494 108 V118"/>
+    <path d="M458 182 V192 M476 182 V192 M494 182 V192"/>
+    <path d="M430 134 H440 M430 150 H440 M430 166 H440"/>
+    <path d="M512 134 H522 M512 150 H522 M512 166 H522"/>
+  </g>
+  <path d="M450 150 H462 L468 138 L478 166 L486 150 H500" fill="none" stroke="#ff5f9e" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M548 132 H574 M548 150 H574 M548 168 H574" stroke="#7de8ff" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="582" cy="132" r="3.4" fill="#ffd166"/>
+  <circle cx="582" cy="150" r="3.4" fill="#8f7bff"/>
+  <circle cx="582" cy="168" r="3.4" fill="#7de8ff"/>
+</svg>

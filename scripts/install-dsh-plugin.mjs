@@ -708,7 +708,9 @@ export async function verifyInstallation(ctx, deploy) {
   if (bundleCount === 0) {
     throw new InstallError(
       `校验 b 失败：${profile} 的 dsh.profile.bundles 里没有 ${PLUGIN_PACKAGE}`,
-      `重新运行 dsh plugin --profile ${profile} add ${pluginInstallSpec(ctx)}（DSH 会自动补 bundles 条目）。`,
+      `装了依赖但 bundle 未被选中（例如在「插件」页关闭过）时，pnpm 不会重复登记：在 DSH 的「插件」页重新启用，` +
+        `或调用 plugin_manager set_bundle target="${PLUGIN_PACKAGE}" enabled=true；` +
+        `也可以先 dsh plugin --profile ${profile} remove ${PLUGIN_PACKAGE} 再重跑安装。`,
     )
   }
   if (bundleCount > 1) {
@@ -794,10 +796,15 @@ export async function verifyInstallation(ctx, deploy) {
     const reason = dump.error
       ? describeError(dump.error)
       : `退出码 ${dump.code}${dump.stderr ? `：${dump.stderr.trim().slice(0, 300)}` : ''}`
-    const message = `--dump-config 执行失败（${reason}）`
-    if (args.strict) throw new InstallError(`校验 d 失败：${message}`, strictHint)
-    io.out(`[warn] 校验 d：${message}（已忽略；--strict 时会失败）`)
-    warnings.push(message)
+    // desktop profile 由桌面端独占管理：CLI 的 --dump-config 会被拒绝，这不是插件问题。
+    if (profile === 'desktop' && /managed exclusively by the Electron application/i.test(`${dump.stderr ?? ''}${dump.stdout ?? ''}`)) {
+      io.out('[ok] 校验 d：desktop profile 由桌面端独占管理，跳过 --dump-config（组合校验由桌面端负责）')
+    } else {
+      const message = `--dump-config 执行失败（${reason}）`
+      if (args.strict) throw new InstallError(`校验 d 失败：${message}`, strictHint)
+      io.out(`[warn] 校验 d：${message}（已忽略；--strict 时会失败）`)
+      warnings.push(message)
+    }
   } else {
     const dumpText = `${dump.stdout}\n${dump.stderr}`
     const missingRows = BINARIES.filter((component) => !dumpText.includes(component.id)).map(

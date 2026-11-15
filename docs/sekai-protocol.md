@@ -23,6 +23,14 @@ Worker `pc.ask` 使用的 JSONL 信封是**带外传输层能力**——它只�
 Worker↔DSH 插件的 stdin/stdout 上，不新增帧类型、错误码或 `content_type`，V1
 Stdin/Stdout 帧一字不变。全量定义见 [sekai-pc-agent.md](sekai-pc-agent.md) §4。
 
+**DSH 工具桥（带外，不改变本协议）**：PC Worker 加 `--dsh-tools` 后新增两个 **Task**——
+`dsh.tools`（发现本机 DSH 工具）与 `dsh.call`（调用工具），请求/响应走 worker
+stdin/stdout 上与 prompt 通道并列的 JSONL（由 DSH worker 插件执行本机 DSH 工具），
+同样不新增帧类型、错误码或 `content_type`，V1 Stdin/Stdout 帧一字不变。两个名字都是
+普通 Task，Router 侧与其他 Task 一样由 `allow_tasks` 统一门控。全量定义见
+[sekai-pc-agent.md](sekai-pc-agent.md) §3.4/§4.2 与
+[sekai-dsh-plugin.md](sekai-dsh-plugin.md) §3.3。
+
 **飞书入口（带外，不改变本协议）**：`sekai-router --feishu` 从飞书开放平台长连接
 （WebSocket + pbbp2 帧）接收 IM 事件、经 REST 回复，事件最终进入同一
 `PromptCore::run_prompt`；同样不新增帧类型、错误码或 `content_type`，V1

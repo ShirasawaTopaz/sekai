@@ -9,10 +9,12 @@ Sekai **PC Worker**：宿主进程形态的 Worker，当前阶段的主力——
 sekai-worker connect 127.0.0.1:7421 --llm dsh
  ├─ 链路（connect/tcp 或 stdio 子进程）：V1 帧，与 Router 的命令面
  ├─ 工具（Tool）：pc.read / pc.write / pc.ls / pc.info（+ 内置 sekai.*）
- ├─ 任务（Task）：pc.exec / pc.job / pc.ask / echo / sleep
+ ├─ 任务（Task）：pc.exec / pc.job / pc.ask / echo / sleep（--dsh-tools 追加 dsh.tools / dsh.call）
  ├─ prompt 通道（--llm，带外 JSONL，不影响 V1 帧）：
  │   ├─ router：Worker 直连 Router prompt ingress（TCP，--prompt-addr）
  │   └─ dsh  ：Worker stdin/stdout JSONL → DSH worker 插件中转 → ingress
+ ├─ DSH 工具桥（--dsh-tools，带外 JSONL，不影响 V1 帧）：
+ │   └─ Worker stdin/stdout JSONL → DSH worker 插件 → 本机 DSH 工具
  └─ 可选：--gpio esp32|stm32f1|stm32f4 追加 gpio.*（虚拟 GPIO）
 ```
 
@@ -31,6 +33,8 @@ sekai-worker help                         显示帮助
                           router/dsh 需 connect 模式）
   --prompt-addr HOST:PORT router 模式的 ingress 目标（默认 connect 主机 + 7422；
                           仅 --llm router 时有效）
+  --dsh-tools            启用 DSH 工具桥（追加 Task dsh.tools / dsh.call；
+                          仅 connect/TCP 模式，stdio 模式拒绝）
   --gpio esp32|stm32f1|stm32f4
                           opt-in 虚拟 GPIO 引脚表家族（--family 为兼容别名；
                           默认不挂 GPIO）
@@ -39,6 +43,7 @@ sekai-worker help                         显示帮助
 环境变量：
   SEKAI_PC_EXEC_MS        pc.exec 内部超时（100..=300000，默认 10000）
   SEKAI_PC_ASK_MS         pc.ask 内部硬超时（1000..=300000，默认 300000）
+  SEKAI_DSH_TOOL_MS       dsh.call 桥等待上限（1000..=600000，默认 300000）
 ```
 
 兼容旧旗标 `--mode stdio|tcp`、`--router-addr HOST:PORT`（等价子命令）、`--family`
@@ -56,9 +61,11 @@ args 与输出都是原始 UTF-8 文本；输出统一截断（`[[truncated]]` /
 | `pc.read` | 工具 | 首行路径 | 文件内容（≤4000B） |
 | `pc.write` | 工具 | 首行路径 + 其余全部为内容 | `written=<字节数>`（覆盖写） |
 | `pc.ls` | 工具 | 路径 | `d <name>` / `f <name>` 行，≤200 行 |
-| `pc.info` | 工具 | 无 | `os=/host=/cwd=/pid=/llm=/gpio=` 多行 |
+| `pc.info` | 工具 | 无 | `os=/host=/cwd=/pid=/llm=/dsh_tools=/gpio=` 多行 |
 | `pc.job` | 任务 | 命令文本 | `exit=<code>` + 输出尾部 ≤4096B；DDL 到期 Failed(Timeout) |
 | `pc.ask` | 任务 | prompt 文本 | 经 prompt 通道取 LLM 回答（≤4096B；内部 300s 上限） |
+| `dsh.tools` | 任务（仅 `--dsh-tools`） | 无 | 每行 `<name> — <描述>`（发现本机 DSH 工具；整体截断） |
+| `dsh.call` | 任务（仅 `--dsh-tools`） | JSON `{"tool","arguments","timeout_ms"?}` | 工具结果文本（≤4096B；工具失败 `Failed(Internal)`） |
 | `echo` / `sleep` | 任务 | 原样 / 毫秒数 | 原样返回 / 到期空载荷 |
 
 ## prompt 通道两条路径
@@ -83,6 +90,33 @@ args 与输出都是原始 UTF-8 文本；输出统一截断（`[[truncated]]` /
 
 通道失败以错误码回投（`unreachable` / `timeout` / `llm_unavailable` 等）；
 通道未启用时 `pc.ask` 直接 `Failed(InvalidArgument)`（消息含 `--llm` 提示）。
+
+## DSH 工具桥（`--dsh-tools`）
+
+`--dsh-tools`（**仅 connect/TCP 模式**；stdio 模式拒绝）在默认任务之外追加
+`dsh.tools`（发现本机 DSH 工具）与 `dsh.call`（调用工具）两个 Task。它们和 prompt 通道
+一样使用**带外 JSONL**（worker stdin/stdout ↔ DSH worker 插件），V1 帧不变；插件侧执行、
+allowlist 与错误码见 [docs/sekai-dsh-plugin.md](../../docs/sekai-dsh-plugin.md) §3.3。
+
+- `dsh.call` args：`{"tool":"<DSH 工具名>","arguments":{...},"timeout_ms":300000}`；
+  `tool` 必填非空，`arguments` 缺省 `{}`，`timeout_ms` 缺省取 env `SEKAI_DSH_TOOL_MS`
+  （默认 300000，钳制 1000..=600000）。
+- `dsh.tools` args 为空，Done 每行 `<name> — <描述>`（描述取首行/前 200 字符）。
+- 结果：成功 `Done(工具文本)`（≤4096 字节，截断追加 `[[truncated]]`）；工具自身失败
+  `Failed(Internal, 文本)`；超时/取消（`timeout`/`cancelled`）`Failed(Timeout)`；参数非法
+  `Failed(InvalidArgument)`；桥未启用/不可用 `Failed(Unsupported)`；其余 `Failed(Internal)`。
+- 线上方法（stdin/stdout JSONL，与 prompt 并列）：`dsh_tool` 的 params
+  `{tool,arguments}`、`dsh_tools` 的 params `{}`、`dsh_cancel` 的 params `{id}`；
+  `dsh.call` args 的 `timeout_ms` 只约束 Worker 侧等待（超时发 `dsh_cancel`），插件侧另有
+  `dshTools.timeoutMs` 兜底。
+- 取消：Task DDL 到期、Router cancel、Drop 都会中止等待并回投 `dsh_cancel`；实际调用在
+  独立线程推进，不阻塞 V1 帧循环。
+- 插件队列错误码：`disabled` / `policy_denied` / `invalid_arguments` / `unknown_tool` /
+  `no_agent` / `unavailable` / `timeout` / `cancelled` / `bridge_error`。
+- 组合：`--llm router --dsh-tools` 可同时用——prompt 走 TCP ingress，工具桥仍走
+  stdin/stdout；`pc.info` 追加 `dsh_tools=on|off`。
+- Router 侧：两个名字都是 Task，与其他 Task 一样由 `--allow-tasks` 门控（见
+  [docs/sekai-pc-agent.md](../../docs/sekai-pc-agent.md) §5.1）。
 
 ## 典型闭环
 
@@ -110,6 +144,8 @@ sekai> 列一下当前目录有哪些文件          # → Router 派 pc.ls（�
 - `pc.write` 同样需 `--allow-write`；`pc.read`/`pc.ls`/`pc.info` 只读白名单默认放行。
 - 经 prompt 通道（ingress / serve `prompt`）发起的 LLM 运行内**禁止再派 `pc.ask`**
   （Router 侧防递归硬闸，`policy_denied`「嵌套 prompt（pc.ask）」）。
+- **`--dsh-tools` 的 DSH 工具桥**：插件侧默认关闭且默认只读 allowlist（硬拒绝
+  `run_code`/`sekai_worker_*`）；Router 侧仍需 `--allow-tasks`，两层都过才执行。
 
 策略分类全表见 [docs/sekai-pc-agent.md](../../docs/sekai-pc-agent.md) §5。
 
@@ -120,7 +156,8 @@ sekai> 列一下当前目录有哪些文件          # → Router 派 pc.ls（�
 | `link` | 直连链路传输层：`Link` trait、`StdioLink`/`TcpLink`、内存链路（测试）、`u32` 大端长度前缀帧读写、退避重连 |
 | `host` | `WorkerHost`：组装 Runtime、注册表与链路读循环 |
 | `capability` | 宿主能力声明：`agent_registries*()`（`pc.*` 工具/任务 + prompt 通道）、`host_registries()`（仅测试/路由用：4 个 gpio 工具 + `echo`/`sleep`）、`SystemClock` |
-| `llm_channel` | prompt 通道客户端（router 直连 / dsh stdin/stdout JSONL） |
+| `llm_channel` | prompt 通道与 DSH 工具桥共享的 JSONL 通道客户端（router 直连 / dsh stdin/stdout） |
+| `capability`（DSH 部分） | `--dsh-tools` 时追加 `dsh.tools`/`dsh.call` 两个 Task（不阻塞帧循环） |
 
 Router 与本 crate 共用 `link` 抽象（`crate/sekai-router` 依赖本 crate 的 lib）。
 协议见 [docs/sekai-protocol.md](../../docs/sekai-protocol.md)，PC agent 与 prompt

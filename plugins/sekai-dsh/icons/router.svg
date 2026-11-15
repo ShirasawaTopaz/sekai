@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" role="img" aria-label="Sekai router">
+  <defs>
+    <linearGradient id="sekai-router-node" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7de8ff"/>
+      <stop offset="1" stop-color="#3f8dff"/>
+    </linearGradient>
+  </defs>
+  <g stroke="url(#sekai-router-node)" stroke-width="2.4" stroke-linecap="round">
+    <path d="M14.6 13.8 L10.4 9.6"/>
+    <path d="M21.4 13.8 L25.6 9.6"/>
+    <path d="M18 21.6 V27.6"/>
+  </g>
+  <circle cx="18" cy="17" r="4.4" fill="none" stroke="url(#sekai-router-node)" stroke-width="2.4"/>
+  <circle cx="9.4" cy="8.6" r="2.1" fill="#ffd166"/>
+  <circle cx="26.6" cy="8.6" r="2.1" fill="#8f7bff"/>
+  <circle cx="18" cy="29.4" r="2.1" fill="#7de8ff"/>
+</svg>

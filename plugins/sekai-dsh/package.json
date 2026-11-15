@@ -10,12 +10,19 @@
     ".": "./lib/index.js",
     "./router": "./lib/router.js",
     "./worker": "./lib/worker.js",
+    "./router/locale/*.json": "./locale/router/*.json",
+    "./worker/locale/*.json": "./locale/worker/*.json",
     "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./router/icon": "./icons/router.svg",
+    "./worker/icon": "./icons/worker.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
     "locale",
+    "icons",
+    "docs",
     "scripts",
     "README.md",
     "cordis.patch.yml",
@@ -45,6 +52,9 @@
     }
   },
   "dependencies": {},
+  "engines": {
+    "dsh": ">=0.2.2-rc.3 <0.3.0"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

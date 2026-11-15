@@ -19,6 +19,18 @@
  * （router 模式加 `--prompt-addr <addr>`）；虚拟 GPIO 默认关闭，仅
  * `gpio`（兼容旧键 `family`）非空时加 `--gpio <family>`。
  *
+ * worker→DSH 工具桥（config 键 `dshTools`，默认关闭）：
+ * - `enabled: true` 时 spawn 追加 `--dsh-tools`，worker 的 `dsh.call` /
+ *   `dsh.tools` Task 变成 stdout JSONL 请求 `dsh_tool` / `dsh_tools`；
+ *   取消是 `dsh_cancel` 通知（`{"method":"dsh_cancel","params":{"id":N}}`）。
+ * - 插件按 `allow` / `deny` 白名单过滤（默认只读 read/glob/grep），硬拒绝
+ *   `sekai_worker_` 前缀（防递归回到本插件）与 `run_code`（任意代码）。
+ * - 工具经懒创建的 bridge agent（不是主 agent——ops-ptc 模式会拒绝直接
+ *   程序化调用）用 `ctx.tools.execute` 执行，并发由 maxConcurrent 串行化，
+ *   每条调用独立超时/AbortSignal。
+ * - 回包信封：`{"id":N,"ok":true,"result":{...}}` / `{"id":N,"ok":false,
+ *   "error":{"code":...}}`；工具自身失败是 ok:true + `result.is_error:true`。
+ *
  * 自动连接开关（config 键 `autoConnect`，默认 true）：
  * - `true`：插件加载（DSH 启动）且 `enabled` 时，立即 spawn worker 连接
  *   **上次成功连接的 Router**（持久化在 `$DSH_HOME/sekai/worker-state.json`，
@@ -42,6 +54,7 @@
  * @module @sekai/dsh-plugin/worker
  */
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import os from 'node:os'
@@ -72,6 +85,22 @@ function loadSchemastery() {
 }
 const z = loadSchemastery()
 
+/**
+ * worker→DSH 工具桥（config 键 `dshTools`）默认值：默认关闭，白名单默认
+ * 只读（read/glob/grep）。`cwd: ''` 表示用主会话 cwd；`agentPreset: ''`
+ * 表示创建 bridge agent 时不带 preset（默认 'standard'）。
+ */
+export const DSH_TOOLS_DEFAULTS = Object.freeze({
+  enabled: false,
+  allow: Object.freeze(['read', 'glob', 'grep']),
+  deny: Object.freeze([]),
+  cwd: '',
+  agentPreset: 'standard',
+  maxConcurrent: 1,
+  timeoutMs: 300000,
+  maxResponseBytes: 65536,
+})
+
 /** 内部默认值（static Config 的镜像，冒烟环境的权威来源）。 */
 export const WORKER_DEFAULTS = Object.freeze({
   enabled: true,
@@ -90,6 +119,8 @@ export const WORKER_DEFAULTS = Object.freeze({
   stateFile: '',
   restartBackoffMaxMs: 30000,
   publishStatusTool: true,
+  // worker→DSH 工具桥（默认关闭，白名单默认只读）。
+  dshTools: DSH_TOOLS_DEFAULTS,
 })
 
 /** LLM prompt 通道取值（与 worker `--llm` 旗标一致）。 */
@@ -103,6 +134,17 @@ const STDERR_RING_SIZE = 40
 
 /** 状态文件格式版本（未来做兼容迁移用）。 */
 const STATE_FILE_VERSION = 1
+
+/** dshTools 桥的数值范围（与 static Config 的 min/max 保持一致）。 */
+export const DSH_TOOLS_LIMITS = Object.freeze({
+  maxConcurrent: Object.freeze({ min: 1, max: 8 }),
+  timeoutMs: Object.freeze({ min: 1000, max: 600000 }),
+  maxResponseBytes: Object.freeze({ min: 1024, max: 262144 }),
+})
+
+/** 硬拒绝：`sekai_worker_` 前缀防递归回本插件，`run_code` 防任意代码。 */
+const DSH_TOOL_DENY_PREFIX = 'sekai_worker_'
+const DSH_TOOL_HARD_DENY = Object.freeze(['run_code'])
 
 /**
  * worker stderr 的「TCP 已连接 <addr>」行（`connected_line`，Rust 侧单测
@@ -195,6 +237,55 @@ export function parsePromptRequest(line) {
   if (msg.method !== 'prompt') return null
   if (msg.params === null || typeof msg.params !== 'object' || Array.isArray(msg.params)) return null
   return { id: msg.id, raw: text }
+}
+
+/**
+ * 识别 worker stdout 上的 DSH 工具桥请求行（与 Rust 侧冻结的 JSONL 一致）：
+ * - `{"id":N,"method":"dsh_tool","params":{"tool":"read","arguments":{...},"timeout_ms":300000}}`
+ * - `{"id":N,"method":"dsh_tools","params":{}}`
+ * - `{"method":"dsh_cancel","params":{"id":<目标请求 id>}}`（通知，可无顶层 id）
+ *
+ * 解析失败 / 非桥方法 / dsh_tool·dsh_tools 缺整数顶层 id（无法回投）返回
+ * null；`arguments` 缺省 {}，`timeout_ms` 归一化到 1000..=600000（非法为
+ * null，交给 config 默认值）。tool 为空字符串时仍返回对象，由执行器回
+ * invalid_arguments。
+ * @param {string} line
+ * @returns {{kind: 'tool', id: number, tool: string, arguments: unknown, timeoutMs: number | null}
+ *   | {kind: 'tools', id: number}
+ *   | {kind: 'cancel', id: number | null, targetId: number}
+ *   | null}
+ */
+export function parseDshToolRequest(line) {
+  const text = typeof line === 'string' ? line.trim() : ''
+  if (!text.startsWith('{')) return null
+  let message = null
+  try {
+    message = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) return null
+  const method = message.method
+  if (method !== 'dsh_tool' && method !== 'dsh_tools' && method !== 'dsh_cancel') return null
+  const params = isPlainObject(message.params) ? message.params : {}
+  const id = Number.isInteger(message.id) ? message.id : null
+  if (method === 'dsh_cancel') {
+    const targetId = params.id
+    if (!Number.isInteger(targetId) || targetId <= 0) return null
+    return { kind: 'cancel', id, targetId }
+  }
+  if (id === null) return null
+  if (method === 'dsh_tools') return { kind: 'tools', id }
+  const timeoutMs = Number.isFinite(params.timeout_ms)
+    ? Math.min(DSH_TOOLS_LIMITS.timeoutMs.max, Math.max(DSH_TOOLS_LIMITS.timeoutMs.min, Math.floor(params.timeout_ms)))
+    : null
+  return {
+    kind: 'tool',
+    id,
+    tool: typeof params.tool === 'string' ? params.tool.trim() : '',
+    arguments: 'arguments' in params ? params.arguments : {},
+    timeoutMs,
+  }
 }
 
 /** 是否普通对象（非 null / 非数组）。 */
@@ -296,25 +387,58 @@ export const WORKER_SPAWN_HINT = 'Run `node scripts/install-dsh-plugin.mjs` in t
 function makeWorkerConfig() {
   if (!z) return undefined
   return z.object({
-    enabled: z.boolean().default(true),
-    workerBin: z.string().default(WORKER_DEFAULTS.workerBin),
-    routerAddr: z.string().default(WORKER_DEFAULTS.routerAddr),
-    workerId: z.string().default(WORKER_DEFAULTS.workerId),
-    llm: z.union(LLM_CHANNELS).default(WORKER_DEFAULTS.llm),
-    promptAddr: z.string().default(WORKER_DEFAULTS.promptAddr),
-    promptTimeoutMs: z.number().step(1).min(1000).default(WORKER_DEFAULTS.promptTimeoutMs),
+    enabled: z.boolean().default(true)
+      .description('Spawn and manage the sekai-worker process. When off, no worker tools are published.'),
+    workerBin: z.string().default(WORKER_DEFAULTS.workerBin)
+      .description('Explicit path to the sekai-worker binary. Empty follows env, $DSH_HOME/sekai/bin, repo target, then PATH.'),
+    routerAddr: z.string().default(WORKER_DEFAULTS.routerAddr)
+      .description('Router HOST:PORT to connect to when no previous connection is remembered.'),
+    workerId: z.string().default(WORKER_DEFAULTS.workerId)
+      .description('Worker identity reported to the router; it also scopes the remembered router.'),
+    llm: z.union(LLM_CHANNELS).default(WORKER_DEFAULTS.llm)
+      .description('Prompt channel: dsh relays pc.ask prompts through this plugin, router lets the worker connect itself, off disables relaying.'),
+    promptAddr: z.string().default(WORKER_DEFAULTS.promptAddr)
+      .description('Router prompt ingress HOST:PORT used when llm is dsh.'),
+    promptTimeoutMs: z.number().step(1).min(1000).default(WORKER_DEFAULTS.promptTimeoutMs)
+      .description('How long a relayed prompt waits for the router answer, in milliseconds.'),
     // 虚拟 GPIO 家族（esp32|stm32f1|stm32f4）；省略/空 = 关闭（PC agent 默认）。
-    gpio: z.string(),
+    gpio: z.string()
+      .description('Virtual GPIO family (esp32, stm32f1, stm32f4). Empty runs the PC agent shape.'),
     // 旧键兼容：等价 gpio（已废弃，仅映射）。
-    family: z.string(),
+    family: z.string()
+      .description('Deprecated alias of gpio, kept only for old configuration.'),
     // 开启 DSH 且 worker 启用时，是否自动连接上次连接的 Router。
-    autoConnect: z.boolean().default(WORKER_DEFAULTS.autoConnect),
+    autoConnect: z.boolean().default(WORKER_DEFAULTS.autoConnect)
+      .description('Connect to the remembered router when DSH starts. Off keeps manual control through the sekai_worker_* tools.'),
     // 是否发布 sekai_worker_connect / sekai_worker_disconnect 工具。
-    publishControlTools: z.boolean().default(WORKER_DEFAULTS.publishControlTools),
+    publishControlTools: z.boolean().default(WORKER_DEFAULTS.publishControlTools)
+      .description('Publish the sekai_worker_connect and sekai_worker_disconnect tools.'),
     // 上次连接 Router 的持久化文件；空 = $DSH_HOME/sekai/worker-state.json。
-    stateFile: z.string(),
-    restartBackoffMaxMs: z.number().step(1).min(RESTART_BACKOFF_INITIAL_MS).default(WORKER_DEFAULTS.restartBackoffMaxMs),
-    publishStatusTool: z.boolean().default(true),
+    stateFile: z.string()
+      .description('Remembered-router state file. Empty uses $DSH_HOME/sekai/worker-state.json.'),
+    restartBackoffMaxMs: z.number().step(1).min(RESTART_BACKOFF_INITIAL_MS).default(WORKER_DEFAULTS.restartBackoffMaxMs)
+      .description('Upper bound of the unexpected-exit restart backoff, in milliseconds.'),
+    publishStatusTool: z.boolean().default(true)
+      .description('Publish the sekai_worker_status tool.'),
+    // worker→DSH 工具桥（默认关闭；allow 默认只读）。
+    dshTools: z.object({
+      enabled: z.boolean().default(DSH_TOOLS_DEFAULTS.enabled)
+        .description('Execute the worker dsh.tools and dsh.call requests through this DSH host (opt-in).'),
+      allow: z.array(z.string()).default([...DSH_TOOLS_DEFAULTS.allow])
+        .description('Tool names the worker may call through the bridge.'),
+      deny: z.array(z.string()).default([])
+        .description('Tool names removed from the allow list.'),
+      cwd: z.string().default('')
+        .description('Working directory for bridge tool calls. Empty uses the main session directory.'),
+      agentPreset: z.string().default(DSH_TOOLS_DEFAULTS.agentPreset)
+        .description('Agent preset for the bridge agent. Empty creates it without a preset.'),
+      maxConcurrent: z.number().step(1).min(DSH_TOOLS_LIMITS.maxConcurrent.min).max(DSH_TOOLS_LIMITS.maxConcurrent.max).default(DSH_TOOLS_DEFAULTS.maxConcurrent)
+        .description('Maximum concurrent bridge tool calls.'),
+      timeoutMs: z.number().step(1).min(DSH_TOOLS_LIMITS.timeoutMs.min).max(DSH_TOOLS_LIMITS.timeoutMs.max).default(DSH_TOOLS_DEFAULTS.timeoutMs)
+        .description('Per-call bridge timeout, in milliseconds.'),
+      maxResponseBytes: z.number().step(1).min(DSH_TOOLS_LIMITS.maxResponseBytes.min).max(DSH_TOOLS_LIMITS.maxResponseBytes.max).default(DSH_TOOLS_DEFAULTS.maxResponseBytes)
+        .description('Truncate bridge results larger than this many bytes.'),
+    }),
   })
 }
 
@@ -331,6 +455,20 @@ export function resolveWorkerConfig(raw = {}) {
     typeof value === 'string' && value.trim() !== '' ? value : fallback
   const nonEmpty = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : null)
   const gpio = nonEmpty(raw?.gpio) ?? nonEmpty(raw?.family)
+  // dshTools 归一化：数值钳制到范围内（非法回默认），数组只保留非空字符串，
+  // 显式空 allow 保持空（= 一个都不允许），非数组才回默认白名单。
+  const clampInt = (value, min, max, fallback) => {
+    if (!Number.isFinite(value)) return fallback
+    return Math.min(max, Math.max(min, Math.floor(value)))
+  }
+  const toolNameList = (value, fallback) => {
+    if (!Array.isArray(value)) return [...fallback]
+    return value
+      .filter((name) => typeof name === 'string')
+      .map((name) => name.trim())
+      .filter((name) => name !== '')
+  }
+  const dshToolsRaw = isPlainObject(raw?.dshTools) ? raw.dshTools : {}
   return {
     enabled: raw?.enabled !== false,
     workerBin: stringOrDefault(raw?.workerBin, WORKER_DEFAULTS.workerBin),
@@ -347,6 +485,18 @@ export function resolveWorkerConfig(raw = {}) {
     stateFile: nonEmpty(raw?.stateFile) ?? WORKER_DEFAULTS.stateFile,
     restartBackoffMaxMs: cap,
     publishStatusTool: raw?.publishStatusTool !== false,
+    dshTools: {
+      enabled: dshToolsRaw.enabled === true,
+      allow: toolNameList(dshToolsRaw.allow, DSH_TOOLS_DEFAULTS.allow),
+      deny: toolNameList(dshToolsRaw.deny, []),
+      cwd: nonEmpty(dshToolsRaw.cwd) ?? '',
+      agentPreset: typeof dshToolsRaw.agentPreset === 'string'
+        ? dshToolsRaw.agentPreset.trim()
+        : DSH_TOOLS_DEFAULTS.agentPreset,
+      maxConcurrent: clampInt(dshToolsRaw.maxConcurrent, DSH_TOOLS_LIMITS.maxConcurrent.min, DSH_TOOLS_LIMITS.maxConcurrent.max, DSH_TOOLS_DEFAULTS.maxConcurrent),
+      timeoutMs: clampInt(dshToolsRaw.timeoutMs, DSH_TOOLS_LIMITS.timeoutMs.min, DSH_TOOLS_LIMITS.timeoutMs.max, DSH_TOOLS_DEFAULTS.timeoutMs),
+      maxResponseBytes: clampInt(dshToolsRaw.maxResponseBytes, DSH_TOOLS_LIMITS.maxResponseBytes.min, DSH_TOOLS_LIMITS.maxResponseBytes.max, DSH_TOOLS_DEFAULTS.maxResponseBytes),
+    },
   }
 }
 
@@ -368,6 +518,16 @@ const STATUS_OUTPUT_SCHEMA = Object.freeze({
     autoConnect: { type: 'boolean', description: 'Whether the plugin auto-starts the worker connection when the plugin loads (config autoConnect).' },
     routerAddr: { type: 'string', description: 'Router address HOST:PORT the worker is connecting to / will connect to next (last connected router, else config routerAddr).' },
     lastRouterAddr: { type: 'string', description: 'Last successfully connected router address remembered in the state file; omitted when none is known.' },
+    dshTools: {
+      type: 'object',
+      additionalProperties: true,
+      description: 'worker→DSH tool bridge state: {enabled, allow, inFlight}.',
+      properties: {
+        enabled: { type: 'boolean', description: 'Whether the worker→DSH tool bridge is enabled (config dshTools.enabled).' },
+        allow: { type: 'array', items: { type: 'string' }, description: 'Tool-name allow-list exposed to the worker.' },
+        inFlight: { type: 'integer', description: 'Tool-bridge requests currently queued or executing.' },
+      },
+    },
   },
 })
 
@@ -396,6 +556,13 @@ export class SekaiWorkerPlugin {
     this.lastStderr = new RingBuffer(STDERR_RING_SIZE)
     // dsh 中转的挂起 prompt：id → {socket, timer, done}。
     this.pendingPrompts = new Map()
+    // worker→DSH 工具桥：在途请求（id → entry）、等待队列、运行中计数、
+    // 懒创建的 bridge agent（显式 agent，绝不复用主 agent）。
+    this.pendingDshTools = new Map()
+    this.dshToolQueue = []
+    this.dshToolsRunning = 0
+    this.bridgeAgentHandle = null
+    this.bridgeAgentPromise = null
     // 上次连接的 Router：状态文件（按 workerId 隔离）→ 本次连接目标。
     this.stateFile = this.config.stateFile !== '' ? this.config.stateFile : defaultWorkerStateFile()
     this.lastRouterAddr = lastRouterFromState(readWorkerState(this.stateFile), this.config.workerId)
@@ -407,7 +574,7 @@ export class SekaiWorkerPlugin {
         plugin.log('info', 'sekai-worker plugin is disabled (enabled:false); nothing spawned')
         return
       }
-      const stopTools = plugin.registerTools()
+      const stopTools = plugin.registerToolsWhenAvailable()
       if (plugin.config.autoConnect) {
         const remembered = plugin.lastRouterAddr !== null
         plugin.log(
@@ -462,6 +629,7 @@ export class SekaiWorkerPlugin {
     const argv = ['connect', target, '--worker-id', this.config.workerId, '--llm', this.config.llm]
     if (this.config.llm === 'router') argv.push('--prompt-addr', this.config.promptAddr)
     if (this.config.gpio) argv.push('--gpio', this.config.gpio)
+    if (this.config.dshTools.enabled) argv.push('--dsh-tools')
     const spawnTarget = this.workerSpawnTarget(bin, argv)
     let child
     try {
@@ -608,6 +776,7 @@ export class SekaiWorkerPlugin {
     this.child = null
     this.startedAt = null
     this.clearPendingPrompts('aborted', 'worker disconnected manually; pending prompt aborted', { write: false })
+    this.clearPendingDshTools('cancelled', { write: false })
     if (!child.killed) {
       try { child.kill() } catch { /* 已退出 */ }
     }
@@ -627,15 +796,22 @@ export class SekaiWorkerPlugin {
   }
 
   /**
-   * worker stdout 单行入口：prompt 请求行进入中转（仅 llm==='dsh'），
-   * 其他行（含非 prompt 的 JSON）维持现状记日志。
+   * worker stdout 单行入口：先按 prompt 请求中转（仅 llm==='dsh'），再按
+   * worker→DSH 工具桥请求处理（不看 llm），其余行记日志。
    * @param {string} line
    */
   handleWorkerStdoutLine(line) {
-    if (this.config.llm === 'dsh' && !this.stopped) {
-      const request = parsePromptRequest(line)
-      if (request) {
-        this.relayPrompt(request)
+    if (!this.stopped) {
+      if (this.config.llm === 'dsh') {
+        const request = parsePromptRequest(line)
+        if (request) {
+          this.relayPrompt(request)
+          return
+        }
+      }
+      const dshRequest = parseDshToolRequest(line)
+      if (dshRequest) {
+        this.handleDshToolRequest(dshRequest)
         return
       }
     }
@@ -751,6 +927,458 @@ export class SekaiWorkerPlugin {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // worker→DSH 工具桥（config.dshTools）
+  // -------------------------------------------------------------------------
+
+  /** dshTools 桥是否启用（config 在构造时归一化）。 */
+  get dshToolsEnabled() {
+    return this.config.dshTools.enabled === true
+  }
+
+  /**
+   * 处理一条 worker→DSH 工具桥请求。dsh_tool / dsh_tools 必须有顶层 id；
+   * dsh_cancel 是通知（无 id 只 abort、不回包）。所有路径恰好回投一次。
+   * @param {{kind: string, id: number|null}} request
+   */
+  handleDshToolRequest(request) {
+    if (request.kind === 'cancel') {
+      this.cancelDshTool(request)
+      return
+    }
+    if (!this.dshToolsEnabled) {
+      this.writeDshFailure(request.id, 'disabled', 'worker→DSH tool bridge is disabled (set dshTools.enabled:true to enable it)')
+      return
+    }
+    if (request.kind === 'tools') {
+      void this.listDshTools(request)
+      return
+    }
+    this.enqueueDshTool(request)
+  }
+
+  /**
+   * dsh_tools：返回 bridge agent 可见且未被 allow/deny 过滤掉的工具清单。
+   * 成功信封：{id, ok:true, result:{tools:[{name, description}], count}}。
+   * @param {{id: number}} request
+   */
+  async listDshTools(request) {
+    try {
+      const registry = this.ctx?.get?.('tools')
+      if (!registry || typeof registry.execute !== 'function') {
+        this.writeDshFailure(request.id, 'unavailable', 'DSH tool registry is unavailable')
+        return
+      }
+      const agent = await this.ensureBridgeAgent()
+      const definitions = typeof registry.definitions === 'function' ? await registry.definitions(agent) : []
+      const tools = (Array.isArray(definitions) ? definitions : [])
+        .filter((definition) => this.dshToolPolicy(definition?.name) === null)
+        .map((definition) => ({
+          name: String(definition.name),
+          description: this.firstLine(definition.description, 400),
+        }))
+      this.writeDshResponse({ id: request.id, ok: true, result: { tools, count: tools.length } })
+      this.log('info', `[dsh-tools] #${request.id} listed ${tools.length} tool(s)`)
+    } catch (error) {
+      const code = error?.code === 'no_agent' ? 'no_agent' : 'bridge_error'
+      this.writeDshFailure(request.id, code, describeError(error))
+      this.log('warn', `[dsh-tools] #${request.id} list failed: ${code}`)
+    }
+  }
+
+  /** 描述压成单行（Rust 侧展示只取首行/前 200 字符，这里先收敛体积）。 */
+  firstLine(value, max) {
+    const text = typeof value === 'string' ? value.trim().split('\n')[0].trim() : ''
+    return text.length > max ? `${text.slice(0, max)}…` : text
+  }
+
+  /**
+   * 工具名策略：硬拒绝（递归/任意代码）→ deny → allow（默认只读）。
+   * 允许返回 null，拒绝返回 error 信封。
+   */
+  dshToolPolicy(tool) {
+    if (typeof tool !== 'string' || tool.trim() === '') {
+      return { code: 'invalid_arguments', message: 'params.tool must be a non-empty string' }
+    }
+    if (tool.startsWith(DSH_TOOL_DENY_PREFIX) || DSH_TOOL_HARD_DENY.includes(tool)) {
+      return {
+        code: 'policy_denied',
+        message: `tool "${tool}" is always denied by the dshTools bridge (recursion / arbitrary-code guard)`,
+        hint: 'The bridge never exposes run_code or sekai_worker_* tools.',
+      }
+    }
+    if (this.config.dshTools.deny.includes(tool)) {
+      return {
+        code: 'policy_denied',
+        message: `tool "${tool}" is listed in dshTools.deny`,
+        hint: 'Remove it from dshTools.deny and add it to dshTools.allow to expose it.',
+      }
+    }
+    if (!this.config.dshTools.allow.includes(tool)) {
+      return {
+        code: 'policy_denied',
+        message: `tool "${tool}" is not in dshTools.allow`,
+        hint: 'Add the exact tool name to dshTools.allow (defaults to read, glob, grep).',
+      }
+    }
+    return null
+  }
+
+  /** 校验并排队一条 dsh_tool；超时从入队即开始计时。 */
+  enqueueDshTool(request) {
+    const { id, tool } = request
+    const denied = this.dshToolPolicy(tool)
+    if (denied !== null) {
+      this.writeDshFailure(id, denied.code, denied.message, denied.hint)
+      this.log('warn', `[dsh-tools] #${id} ${tool || '?'} denied: ${denied.code}`)
+      return
+    }
+    if (this.pendingDshTools.has(id)) {
+      this.writeDshFailure(id, 'invalid_arguments', `request id ${id} is already pending`)
+      return
+    }
+    const timeoutMs = Number.isFinite(request.timeoutMs) ? request.timeoutMs : this.config.dshTools.timeoutMs
+    const entry = {
+      id,
+      tool,
+      arguments: request.arguments,
+      timeoutMs,
+      controller: new AbortController(),
+      timer: null,
+      settled: false,
+      abortedReason: null,
+    }
+    this.pendingDshTools.set(id, entry)
+    entry.timer = setTimeout(() => this.abortDshTool(entry, 'timeout'), timeoutMs)
+    entry.timer.unref?.()
+    this.dshToolQueue.push(entry)
+    this.pumpDshToolQueue()
+  }
+
+  /** 简单 FIFO 队列：按 maxConcurrent 限流（默认 1 = 串行）。 */
+  pumpDshToolQueue() {
+    if (this.stopped) return
+    while (this.dshToolsRunning < this.config.dshTools.maxConcurrent && this.dshToolQueue.length > 0) {
+      const entry = this.dshToolQueue.shift()
+      if (entry === undefined || entry.settled) continue
+      this.dshToolsRunning += 1
+      void this.executeDshTool(entry).finally(() => {
+        this.dshToolsRunning = Math.max(0, this.dshToolsRunning - 1)
+        this.pumpDshToolQueue()
+      })
+    }
+  }
+
+  /**
+   * 执行一条 dsh_tool：懒创建 bridge agent → 可见性校验 → ctx.tools.execute
+   * （maxParallelToolCalls:1、每条独立的 AbortSignal）。
+   */
+  async executeDshTool(entry) {
+    const { id, tool } = entry
+    try {
+      const registry = this.ctx?.get?.('tools')
+      if (!registry || typeof registry.execute !== 'function') {
+        this.finishDshTool(entry, this.dshFailureEnvelope(id, 'unavailable', 'DSH tool registry is unavailable'))
+        return
+      }
+      const agent = await this.ensureBridgeAgent()
+      if (entry.settled) return
+      if (typeof registry.definitions === 'function') {
+        const definitions = await registry.definitions(agent)
+        const visible = Array.isArray(definitions) && definitions.some((definition) => definition?.name === tool)
+        if (!visible) {
+          this.finishDshTool(entry, this.dshFailureEnvelope(id, 'unknown_tool', `tool "${tool}" is not visible to the bridge agent`))
+          this.log('warn', `[dsh-tools] #${id} ${tool} failed: unknown_tool`)
+          return
+        }
+      }
+      if (entry.settled) return
+      const batch = await registry.execute({
+        agent,
+        calls: [{ id: `dsh-${id}`, name: tool, arguments: JSON.stringify(entry.arguments ?? {}) }],
+        maxParallelToolCalls: 1,
+        signal: entry.controller.signal,
+      })
+      if (entry.settled) return
+      const result = Array.isArray(batch?.results) ? batch.results[0]?.result : undefined
+      if (result === undefined || result === null) {
+        this.finishDshTool(entry, this.dshFailureEnvelope(id, 'bridge_error', 'tool executor returned no result'))
+        return
+      }
+      this.finishDshTool(entry, this.dshToolResultEnvelope(id, result))
+      this.log('info', `[dsh-tools] #${id} ${tool} ${result.isError === true ? 'failed' : 'ok'}`)
+    } catch (error) {
+      if (entry.settled) return
+      const code = this.mapDshExecuteError(error)
+      this.finishDshTool(entry, this.dshFailureEnvelope(id, code, describeError(error)))
+      this.log('warn', `[dsh-tools] #${id} ${tool} failed: ${code}`)
+    }
+  }
+
+  /**
+   * 把 tools.execute 的结果转成回投信封：成功 {is_error:false, value, text,
+   * truncated}；工具自身失败 {is_error:true, error:{name,code}, text}。
+   */
+  dshToolResultEnvelope(id, result) {
+    const text = this.dshContentText(result?.content)
+    if (result?.isError === true) {
+      const error = isPlainObject(result.error) ? result.error : {}
+      const info = isPlainObject(error.info) ? error.info : {}
+      const name = typeof info.name === 'string' && info.name !== '' ? info.name : 'ToolError'
+      const code = typeof info.code === 'string' && info.code !== '' ? info.code : 'tool_error'
+      const body = text !== '' ? text : (typeof error.message === 'string' && error.message !== '' ? error.message : 'tool call failed')
+      return { id, ok: true, result: { is_error: true, error: { name, code }, text: body, truncated: false } }
+    }
+    const value = result?.value === undefined ? null : result.value
+    return { id, ok: true, result: { is_error: false, value, text: text !== '' ? text : JSON.stringify(value), truncated: false } }
+  }
+
+  /** content 里的 text 块拼接（native/PTC 结果都带 content）。 */
+  dshContentText(content) {
+    if (!Array.isArray(content)) return ''
+    return content
+      .filter((part) => isPlainObject(part) && part.type === 'text' && typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
+  }
+
+  /** tools.execute reject → 稳定错误码。 */
+  mapDshExecuteError(error) {
+    const code = typeof error?.code === 'string' ? error.code : ''
+    if (code === 'no_agent' || code === 'cancelled' || code === 'timeout') return code
+    if (code === 'TOOL_EXECUTOR_UNAVAILABLE' || code === 'TOOL_ACTIVATION_FAILED') return 'unavailable'
+    if (code === 'TOOL_NOT_FOUND' || error?.name === 'ToolNotFoundError') return 'unknown_tool'
+    if (error?.name === 'AbortError' || code === 'ABORT_ERR') return 'cancelled'
+    return 'bridge_error'
+  }
+
+  /**
+   * 懒创建 bridge agent（显式 agent，绝不复用主 agent——ops-ptc 模式会拒绝
+   * 程序化直接调用）。meta.cwd 取 config → 主会话 cwd → 进程 cwd；
+   * agentPreset 创建失败时去掉 preset 重试一次，再失败回 no_agent。
+   * @returns {Promise<object>} Agent
+   */
+  async ensureBridgeAgent() {
+    if (this.bridgeAgentHandle !== null && this.bridgeAgentHandle.agent) return this.bridgeAgentHandle.agent
+    if (this.bridgeAgentPromise === null) {
+      this.bridgeAgentPromise = this.createBridgeAgent().catch((error) => {
+        this.bridgeAgentPromise = null
+        throw error
+      })
+    }
+    return this.bridgeAgentPromise
+  }
+
+  async createBridgeAgent() {
+    if (this.stopped) throw this.dshBridgeError('cancelled', 'plugin disposed while creating the bridge agent')
+    const agents = this.ctx?.get?.('agents')
+    if (!agents || typeof agents.create !== 'function') {
+      throw this.dshBridgeError('no_agent', 'DSH agent service (ctx.agents) is unavailable; cannot create the bridge agent')
+    }
+    const meta = {}
+    const cwd = this.resolveDshToolsCwd(agents)
+    if (cwd !== '') meta.cwd = cwd
+    const preset = this.config.dshTools.agentPreset
+    if (preset !== '') meta.agentPreset = preset
+    let handle = null
+    try {
+      handle = await agents.create({ sessionId: `sekai-dsh-tools-${randomUUID()}`, meta: { ...meta } })
+    } catch (error) {
+      if (!('agentPreset' in meta)) {
+        throw this.dshBridgeError('no_agent', `failed to create the bridge agent: ${describeError(error)}`)
+      }
+      this.log('warn', `[dsh-tools] bridge agent creation failed (${describeError(error)}); retrying without agentPreset`)
+      const retryMeta = { ...meta }
+      delete retryMeta.agentPreset
+      try {
+        handle = await agents.create({ sessionId: `sekai-dsh-tools-${randomUUID()}`, meta: retryMeta })
+      } catch (retryError) {
+        throw this.dshBridgeError(
+          'no_agent',
+          `failed to create the bridge agent: ${describeError(error)}; retry without agentPreset failed: ${describeError(retryError)}`,
+        )
+      }
+    }
+    if (!handle || typeof handle !== 'object' || !handle.agent) {
+      throw this.dshBridgeError('no_agent', 'DSH agent service returned no agent handle')
+    }
+    if (this.stopped) {
+      this.disposeBridgeAgentHandle(handle)
+      throw this.dshBridgeError('cancelled', 'plugin disposed while creating the bridge agent')
+    }
+    this.bridgeAgentHandle = handle
+    this.log('info', `[dsh-tools] bridge agent ready (cwd ${cwd === '' ? 'process cwd' : cwd}, preset ${preset === '' ? 'none' : preset})`)
+    return handle.agent
+  }
+
+  /** bridge agent 的 cwd：config.dshTools.cwd → 主会话（roots/list）cwd → 进程 cwd。 */
+  resolveDshToolsCwd(agents) {
+    const configured = typeof this.config.dshTools.cwd === 'string' ? this.config.dshTools.cwd.trim() : ''
+    if (configured !== '') return path.isAbsolute(configured) ? configured : path.resolve(configured)
+    const cwdOf = (list) => {
+      if (!Array.isArray(list)) return ''
+      for (const agent of list) {
+        const cwd = agent?.session?.header?.cwd
+        if (typeof cwd === 'string' && cwd.trim() !== '') return cwd
+      }
+      return ''
+    }
+    try {
+      if (typeof agents.roots === 'function') {
+        const cwd = cwdOf(agents.roots())
+        if (cwd !== '') return cwd
+      }
+      if (typeof agents.list === 'function') {
+        const cwd = cwdOf(agents.list())
+        if (cwd !== '') return cwd
+      }
+    } catch {
+      // agent 服务异常：回退进程 cwd，探测失败不拖垮桥。
+    }
+    return process.cwd()
+  }
+
+  /** 桥层稳定错误（带 code，供 executeDshTool 映射）。 */
+  dshBridgeError(code, message) {
+    const error = new Error(message)
+    error.code = code
+    return error
+  }
+
+  /** dsh_cancel：abort 目标请求；有顶层 id 时回 cancelled 布尔值（防御 Rust 不发 id 之外的情况）。 */
+  cancelDshTool(request) {
+    const entry = this.pendingDshTools.get(request.targetId)
+    const cancelled = entry !== undefined && !entry.settled
+    if (cancelled) this.abortDshTool(entry, 'cancelled')
+    this.log('info', `[dsh-tools] cancel #${request.targetId}: ${cancelled ? 'aborted' : 'not found'}`)
+    if (request.id !== null) {
+      this.writeDshResponse({ id: request.id, ok: true, result: { cancelled } })
+    }
+  }
+
+  /** abort 一条在途/排队请求并回投一次（timeout / cancelled）。 */
+  abortDshTool(entry, reason, { write = true } = {}) {
+    if (!entry || entry.settled) return
+    const index = this.dshToolQueue.indexOf(entry)
+    if (index !== -1) this.dshToolQueue.splice(index, 1)
+    entry.abortedReason = reason
+    try {
+      entry.controller.abort(new Error(reason))
+    } catch {
+      // AbortController.abort 不抛；防御宿主实现差异。
+    }
+    const message = reason === 'timeout'
+      ? `tool "${entry.tool}" timed out after ${entry.timeoutMs}ms`
+      : `tool "${entry.tool}" was cancelled`
+    this.finishDshTool(entry, this.dshFailureEnvelope(entry.id, reason, message), write)
+  }
+
+  /** 结束一条请求：清定时器、摘 pending、恰好回投一次。 */
+  finishDshTool(entry, envelope, write = true) {
+    if (!entry || entry.settled) return
+    entry.settled = true
+    if (entry.timer !== null) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+    this.pendingDshTools.delete(entry.id)
+    const index = this.dshToolQueue.indexOf(entry)
+    if (index !== -1) this.dshToolQueue.splice(index, 1)
+    if (write) this.writeDshResponse(envelope)
+  }
+
+  /** 清理全部在途请求（dispose / 手动断开 / 进程退出）。 */
+  clearPendingDshTools(reason = 'cancelled', { write = true } = {}) {
+    const entries = [...this.pendingDshTools.values()]
+    this.dshToolQueue.length = 0
+    for (const entry of entries) this.abortDshTool(entry, reason, { write })
+  }
+
+  /** dispose bridge agent（插件停止时调用；幂等）。 */
+  disposeBridgeAgent() {
+    const handle = this.bridgeAgentHandle
+    this.bridgeAgentHandle = null
+    this.bridgeAgentPromise = null
+    if (handle) this.disposeBridgeAgentHandle(handle)
+  }
+
+  disposeBridgeAgentHandle(handle) {
+    if (!handle || typeof handle.dispose !== 'function') return
+    try {
+      void Promise.resolve(handle.dispose()).catch((error) => {
+        this.log('warn', `[dsh-tools] bridge agent dispose failed: ${describeError(error)}`)
+      })
+    } catch (error) {
+      this.log('warn', `[dsh-tools] bridge agent dispose failed: ${describeError(error)}`)
+    }
+  }
+
+  /** 桥层失败信封 {id, ok:false, error:{code, message, hint?}}。 */
+  dshFailureEnvelope(id, code, message, hint = null) {
+    const error = { code, message }
+    if (typeof hint === 'string' && hint !== '') error.hint = hint
+    return { id, ok: false, error }
+  }
+
+  writeDshFailure(id, code, message, hint = null) {
+    this.writeDshResponse(this.dshFailureEnvelope(id, code, message, hint))
+  }
+
+  /** 写回一条响应（先按 maxResponseBytes 收敛，保证单行合法 JSON）。 */
+  writeDshResponse(envelope) {
+    this.writeWorkerStdin(`${this.fitDshEnvelope(envelope, this.config.dshTools.maxResponseBytes)}\n`)
+  }
+
+  /**
+   * 信封体积收敛：正常时原样序列化；超 maxResponseBytes 时保留骨架、
+   * 截断 text/message 并置 `truncated:true`（必要时丢弃 value）。
+   */
+  fitDshEnvelope(envelope, maxBytes) {
+    const max = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 65536
+    const serialize = (value) => JSON.stringify(value)
+    const text = serialize(envelope)
+    if (Buffer.byteLength(text, 'utf8') <= max) return text
+    const shrunk = JSON.parse(text)
+    const isSuccess = shrunk.ok === true && isPlainObject(shrunk.result)
+    const isFailure = shrunk.ok === false && isPlainObject(shrunk.error)
+    if (isSuccess) {
+      delete shrunk.result.value
+      shrunk.result.truncated = true
+    } else if (isFailure) {
+      shrunk.error.truncated = true
+    }
+    const field = isSuccess ? shrunk.result : (isFailure ? shrunk.error : null)
+    const key = isSuccess ? 'text' : 'message'
+    const rawOriginal = isSuccess
+      ? (typeof envelope?.result?.text === 'string' ? envelope.result.text : '')
+      : (typeof envelope?.error?.message === 'string' ? envelope.error.message : '')
+    // 最终行 ≤ max 字节，text 保留超过 max 个字符没有意义，先粗切。
+    const original = rawOriginal.length > max ? rawOriginal.slice(0, max) : rawOriginal
+    if (field !== null) {
+      let low = 0
+      let high = original.length
+      let best = ''
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2)
+        field[key] = original.slice(0, mid)
+        if (Buffer.byteLength(serialize(shrunk), 'utf8') <= max) {
+          best = field[key]
+          low = mid + 1
+        } else {
+          high = mid - 1
+        }
+      }
+      field[key] = best
+      const candidate = serialize(shrunk)
+      if (Buffer.byteLength(candidate, 'utf8') <= max) return candidate
+    }
+    // 极端兜底：只留最小合法信封（maxResponseBytes 下限 1024，必然放得下）。
+    const minimal = isSuccess
+      ? { id: shrunk.id, ok: true, result: { is_error: false, truncated: true } }
+      : { id: shrunk.id, ok: false, error: { code: 'bridge_error', message: 'response exceeded dshTools.maxResponseBytes' } }
+    return serialize(minimal)
+  }
+
   /**
    * best-effort 写 worker stdin（prompt 响应回投）。进程不在或管道已坏时
    * 静默返回 false。
@@ -780,6 +1408,8 @@ export class SekaiWorkerPlugin {
     this.startedAt = null
     // 进程已亡：挂起 prompt 只断开，不再回投。
     this.clearPendingPrompts('aborted', 'worker process exited; pending prompt aborted', { write: false })
+    // 工具桥同理：进程已亡，abort 在途请求但不再回投。
+    this.clearPendingDshTools('cancelled', { write: false })
     if (this.stopped) return
     if (this.manualStopped) {
       // 手动 disconnect 期间的退出：不计重启、不排定时器。
@@ -819,12 +1449,14 @@ export class SekaiWorkerPlugin {
       this.restartTimer = null
     }
     this.clearPendingPrompts('aborted', 'plugin disposed; pending prompt aborted')
+    this.clearPendingDshTools('cancelled')
     const child = this.child
     this.child = null
     this.startedAt = null
     if (child && !child.killed) {
       try { child.kill() } catch { /* 已退出 */ }
     }
+    this.disposeBridgeAgent()
   }
 
   /** 状态工具的值。 */
@@ -839,6 +1471,11 @@ export class SekaiWorkerPlugin {
       routerAddr: this.routerAddr,
     }
     if (this.lastRouterAddr !== null) value.lastRouterAddr = this.lastRouterAddr
+    value.dshTools = {
+      enabled: this.config.dshTools.enabled === true,
+      allow: [...this.config.dshTools.allow],
+      inFlight: this.pendingDshTools.size,
+    }
     const pid = this.child?.pid
     if (typeof pid === 'number') value.pid = pid
     return value
@@ -860,6 +1497,25 @@ export class SekaiWorkerPlugin {
         try { dispose() } catch { /* 注销失败忽略 */ }
       }
     }
+  }
+
+  /**
+   * 等 `tools` 服务可用后再注册工具，返回统一 dispose。
+   *
+   * DSH 0.2.2 起 profile 条目不再保证按 bundle 顺序「挂载完成」，本插件激活时
+   * 宿主可能还没建好工具注册表：直接 `ctx.get('tools')` 拿到 `undefined`，
+   * `sekai_worker_*` 就被静默跳过（router 插件靠 `static inject` 躲过这一拍）。
+   * 这里用 `ctx.inject(['tools'])` 在服务出现后注册——宿主没有工具注册表时
+   * 回调不会运行，插件的 spawn/prompt 中转照常工作；没有 `inject` 的宿主
+   * （冒烟用的假 ctx）退回一次性注册。
+   * @returns {() => void} 清理函数；inject 路径随 fiber 卸载自动注销。
+   */
+  registerToolsWhenAvailable() {
+    if (typeof this.ctx?.inject === 'function') {
+      this.ctx.inject(['tools'], () => this.registerTools())
+      return () => {}
+    }
+    return this.registerTools()
   }
 
   /** 状态工具注册（防御式：registry 缺失只 warn）。 */

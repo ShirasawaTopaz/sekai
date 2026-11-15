@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sekai router",
+    "description": "Runs `sekai-router --serve` and publishes the four sekai_* forwarding tools. Writes, Tasks, and admin operations follow the policy settings and default to denied."
+  }
+}

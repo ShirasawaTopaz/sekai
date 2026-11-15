@@ -1,4 +1,8 @@
 //! 集成测试共享设施：手动时钟 + 内存链路上的 Worker 驱动辅助。
+//!
+//! 共享模块会在每个测试目标里各编译一次，同一套辅助总有一部分在该目标里
+//! 未被用到（dead_code 警告），故整体放行。
+#![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,9 +14,12 @@ use sekai::sekai_runtime::RuntimeConfig;
 use sekai::sekai_task::TaskRegistry;
 use sekai::sekai_tool::ToolRegistry;
 use sekai_gpio::ChipFamily;
-use sekai_worker::capability::{LlmMode, agent_registries, agent_registries_for};
+use sekai_worker::capability::{
+    LlmMode, agent_registries, agent_registries_for, agent_registries_for_inputs_with_dsh_tools,
+};
 use sekai_worker::host::WorkerHost;
 use sekai_worker::link::{Link, MemoryLink, memory_pair};
+use sekai_worker::llm_channel::DshToolTransport;
 
 /// 可共享推进的手动时钟。
 #[derive(Clone, Default)]
@@ -80,6 +87,23 @@ pub fn test_host_with_gpio(
     build_host(worker_id, boot_id, clock, true)
 }
 
+/// 构造带 DSH 工具桥（等价 CLI `--dsh-tools`）的 WorkerHost：
+/// agent 能力之上追加 `dsh.call` / `dsh.tools` 两个 Task。
+#[allow(dead_code)]
+pub fn test_host_with_dsh_tools(
+    worker_id: &str,
+    boot_id: u64,
+    clock: ManualClock,
+    dsh_tools: Arc<dyn DshToolTransport>,
+) -> WorkerHost<ManualClock> {
+    let (tasks, tools) =
+        agent_registries_for_inputs_with_dsh_tools(None, LlmMode::Off, None, &[], Some(dsh_tools))
+            .expect("DSH 工具桥能力注册失败");
+    let mut config = RuntimeConfig::new(worker_id, boot_id);
+    config.firmware = String::from("0.1.0-test");
+    WorkerHost::new(config, clock, DeviceList::new(), tasks, tools).expect("WorkerHost 构造失败")
+}
+
 fn build_host(
     worker_id: &str,
     boot_id: u64,
@@ -115,6 +139,31 @@ impl Loop {
     /// gpio opt-in（`--gpio` 等价）的链路与宿主。
     pub fn new_with_gpio(worker_id: &str, boot_id: u64) -> Self {
         Self::build(worker_id, boot_id, true)
+    }
+
+    /// DSH 工具桥（`--dsh-tools` 等价）的链路与宿主；桥由测试注入。
+    #[allow(dead_code)]
+    pub fn new_with_dsh_tools(
+        worker_id: &str,
+        boot_id: u64,
+        dsh_tools: Arc<dyn DshToolTransport>,
+    ) -> Self {
+        let clock = ManualClock::new(1_000, BASE_UNIX_MS);
+        let (router, mut worker_link) = memory_pair();
+        let mut host = test_host_with_dsh_tools(worker_id, boot_id, clock.clone(), dsh_tools);
+        let frames = host
+            .on_link_up(sekai::sekai_device_list::Endpoint::new("router", 7421).unwrap())
+            .expect("link_up 失败");
+        assert_eq!(frames.len(), 1, "link_up 应恰好产出一帧 Hello");
+        for frame in frames {
+            worker_link.write_frame(&frame).expect("写入链路失败");
+        }
+        Self {
+            router,
+            worker_link,
+            host,
+            clock,
+        }
     }
 
     /// 建立链路并完成 link_up；Hello 首帧由 [`WorkerHost::on_link_up`] 产出，

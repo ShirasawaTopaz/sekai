@@ -24,6 +24,20 @@ pub fn system_prompt(workers: &[WorkerInfo], policy: &Policy) -> String {
     out.push_str("- ddl_ms 可选，范围 1..=300000；不写时使用默认 10000ms。长命令必须显式给 ddl_ms，否则会被默认预算判超时：pc.exec 建议 >=30000，pc.ask / pc.job 建议 60000（上限 300000）。\n");
     out.push_str("- 同一 Worker 最多 4 条命令并行；一个长时间 Task 在途时，仍可用同一 Worker 的只读工具（prompt 内层可以调用工具），不要因为 active_tasks 非空就放弃查询。\n");
     out.push_str("- 多个工具调用会按顺序执行；不要把互不依赖的写操作并行发起。\n\n");
+    if dsh_bridge_available(workers) {
+        out.push_str("## DSH 工具桥（Worker 通告 dsh.tools / dsh.call 时可用）\n");
+        out.push_str("- 本机 DSH 工具经 Worker 的两个 Task 带外调用：dsh.tools 列工具、dsh.call 调工具；V1 帧不变。两者都是 Task，需要 allow_tasks 授权。\n");
+        out.push_str(
+            "- 先调用 dsh.tools（args 留空）发现工具名与描述；工具名必须来自该结果，禁止臆造。\n",
+        );
+        out.push_str(
+            r#"- dsh.call 的 args 是一个 JSON 对象：{"tool":"read","arguments":{"path":"README.md"},"timeout_ms":300000}。tool 必填非空；arguments 可省略（缺省 {}）；timeout_ms 可省略（缺省取 Worker env SEKAI_DSH_TOOL_MS=300000，范围 1000..=600000）。"#,
+        );
+        out.push('\n');
+        out.push_str("- 长调用必须显式给 ddl_ms（建议 >=60000，上限 300000）：ddl_ms 管 V1 Task 预算，timeout_ms 管工具桥等待，是两层预算。\n");
+        out.push_str("- 桥失败以 Failed 文本回投（policy_denied / unknown_tool / disabled / no_agent / unavailable / timeout / cancelled / bridge_error）；如实报告，写操作不要自动重试。\n");
+        out.push_str("- 只有 list_workers 返回的 tasks 列表含 dsh.call / dsh.tools 时才可用；否则说明需要 DSH 插件开启 dshTools 并托管 Worker。\n\n");
+    }
     out.push_str("## GPIO 标准流程\n");
     out.push_str("1. 需要语法说明或首次操作：调用 gpio.info help。\n");
     out.push_str(
@@ -52,6 +66,20 @@ pub fn system_prompt(workers: &[WorkerInfo], policy: &Policy) -> String {
     out.push_str("- 使用用户的语言，简短（通常 1-3 句），列出关键证据（工具返回的 payload）。\n");
     out.push_str("- 失败时给出错误码与原因，不要编造已成功的结论。\n");
     out
+}
+
+/// Worker 是否通告了 DSH 工具桥任务（`--dsh-tools`）。
+///
+/// 只在 Worker 在线且 tasks 列表真的含 `dsh.tools`/`dsh.call` 时才提示；
+/// 离线 Worker 不提示（无法调用），避免模型对着不可用能力规划。
+fn dsh_bridge_available(workers: &[WorkerInfo]) -> bool {
+    workers.iter().any(|worker| {
+        worker.online
+            && worker
+                .tasks
+                .iter()
+                .any(|task| task == "dsh.call" || task == "dsh.tools")
+    })
 }
 
 /// 渲染带外前端的会话上下文段（追加到 system prompt 末尾）。
@@ -295,5 +323,44 @@ mod tests {
             ..worker("c", true)
         };
         assert!(worker_summary(&[worker]).contains("active_tasks=1"));
+    }
+
+    #[test]
+    fn prompt_mentions_dsh_bridge_when_worker_advertises_it() {
+        let worker = WorkerInfo {
+            tasks: vec![
+                String::from("echo"),
+                String::from("dsh.tools"),
+                String::from("dsh.call"),
+            ],
+            ..worker("host-dsh", true)
+        };
+        let prompt = system_prompt(&[worker], &Policy::default());
+        for needle in [
+            "DSH 工具桥",
+            "dsh.tools",
+            "dsh.call",
+            r#"{"tool":"read","arguments":{"path":"README.md"},"timeout_ms":300000}"#,
+            "allow_tasks",
+            "SEKAI_DSH_TOOL_MS",
+            "1000..=600000",
+            "建议 >=60000",
+        ] {
+            assert!(prompt.contains(needle), "prompt 缺少 {needle}：{prompt}");
+        }
+    }
+
+    #[test]
+    fn prompt_omits_dsh_bridge_without_advertisement() {
+        let prompt = system_prompt(&[worker("host-gpio", true)], &Policy::default());
+        assert!(!prompt.contains("DSH 工具桥"), "{prompt}");
+
+        // 离线 Worker 即便通告了 dsh.* 任务也不提示（无法调用）。
+        let offline = WorkerInfo {
+            tasks: vec![String::from("dsh.call")],
+            ..worker("host-dsh", false)
+        };
+        let prompt = system_prompt(&[offline], &Policy::default());
+        assert!(!prompt.contains("DSH 工具桥"), "{prompt}");
     }
 }

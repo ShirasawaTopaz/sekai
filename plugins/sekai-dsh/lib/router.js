@@ -85,20 +85,31 @@ export const MAX_DDL_MS = 300000
 function makeRouterConfig() {
   if (!z) return undefined
   return z.object({
-    enabled: z.boolean().default(true),
-    link: z.union(['tcp', 'stdio', 'mqtt']).default('tcp'),
-    listenAddr: z.string().default(ROUTER_DEFAULTS.listenAddr),
-    routerBin: z.string().default(ROUTER_DEFAULTS.routerBin),
-    extraArgs: z.array(z.string()).default([]),
-    autoLink: z.boolean().default(true),
+    enabled: z.boolean().default(true)
+      .description('Spawn and manage the sekai-router serve process. When off, no sekai_* tools are published.'),
+    link: z.union(['tcp', 'stdio', 'mqtt']).default('tcp')
+      .description('Link mode passed to `sekai-router --serve --link`.'),
+    listenAddr: z.string().default(ROUTER_DEFAULTS.listenAddr)
+      .description('Address the router listens on for workers, as HOST:PORT.'),
+    routerBin: z.string().default(ROUTER_DEFAULTS.routerBin)
+      .description('Explicit path to the sekai-router binary. Empty follows env, $DSH_HOME/sekai/bin, repo target, then PATH.'),
+    extraArgs: z.array(z.string()).default([])
+      .description('Extra arguments appended to `sekai-router --serve`.'),
+    autoLink: z.boolean().default(true)
+      .description('Re-send link and policy after the router restarts.'),
     policy: z.object({
-      allowWrite: z.boolean().default(false),
-      allowTasks: z.boolean().default(false),
-      allowAdmin: z.boolean().default(false),
+      allowWrite: z.boolean().default(false)
+        .description('Allow write-class worker tools such as gpio.write.'),
+      allowTasks: z.boolean().default(false)
+        .description('Allow starting worker Tasks such as blink or pc.job.'),
+      allowAdmin: z.boolean().default(false)
+        .description('Allow admin operations such as set_time, workers.set, and jump.'),
       // '' 或省略 = 不限制 Worker。
-      workerFilter: z.string(),
+      workerFilter: z.string()
+        .description('Only forward to this worker id. Empty means every connected worker.'),
     }),
-    requestTimeoutMs: z.number().step(1).min(1000).default(ROUTER_DEFAULTS.requestTimeoutMs),
+    requestTimeoutMs: z.number().step(1).min(1000).default(ROUTER_DEFAULTS.requestTimeoutMs)
+      .description('Per-request timeout for forwarded tool calls, in milliseconds.'),
   })
 }
 

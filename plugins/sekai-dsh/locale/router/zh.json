@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sekai Router",
+    "description": "运行 `sekai-router --serve` 并发布 4 个 sekai_* 转发工具。写操作、Task 与 admin 操作按策略开关放行，默认全部拒绝。"
+  }
+}

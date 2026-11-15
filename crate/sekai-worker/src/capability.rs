@@ -48,7 +48,10 @@ use sekai::sekai_tool::{ToolContext, ToolHandler, ToolRegistry};
 use sekai::sekai_wire::{CommandError, ErrorCode, MAX_PAYLOAD};
 use sekai_gpio::{ChipFamily, Level, PinId, VirtualGpio, register_tools};
 
-use crate::llm_channel::{PromptError, PromptTransport, ask_timeout_ms, env_clamped_ms};
+use crate::llm_channel::{
+    DshToolTransport, PromptError, PromptTransport, ask_timeout_ms, env_clamped_ms,
+};
+use crate::mini_json::Json;
 
 // ---------------------------------------------------------------------------
 // 系统时钟（原样保留）
@@ -183,6 +186,33 @@ pub fn agent_registries_for_inputs(
     gpio: Option<ChipFamily>,
     gpio_inputs: &[(PinId, Level)],
 ) -> Result<(TaskRegistry, ToolRegistry), String> {
+    agent_registries_for_inputs_with_dsh_tools(llm, mode, gpio, gpio_inputs, None)
+}
+
+/// 组装完整能力注册表，并可选追加 **DSH 工具桥**（`dsh.call` / `dsh.tools`）。
+///
+/// 与 [`agent_registries_for_inputs`] 相同，additive 多一个 `dsh_tools`：
+/// 仅当 `Some` 时注册两个 **Task**（不阻塞帧循环：阻塞调用放独立线程 + mpsc，
+/// 任务 DDL 到期/Drop 时置取消标志）：
+///
+/// - `dsh.call`：参数为 JSON `{"tool":"<name>","arguments":<任意 JSON，缺省 {}>,
+///   "timeout_ms":<可选>}`；`tool` 必填非空；`timeout_ms` 缺省取
+///   [`dsh_tool_timeout_ms`]（env `SEKAI_DSH_TOOL_MS`，默认 300000，钳制
+///   1000..=600000）；
+/// - `dsh.tools`：参数忽略；输出每行 `name — 描述`（描述取首行、最多 200
+///   字符），结果统一 ≤ [`MAX_PAYLOAD`] 并按字符边界截断 + `[[truncated]]`；
+/// - `pc.info` 的 `dsh_tools=` 行报告 `on`/`off`。
+///
+/// DSH 侧错误码映射：`timeout`/`cancelled` → Timeout，`invalid_arguments` →
+/// InvalidArgument，`disabled`/`no_agent`/`unavailable` → Unsupported，其余
+///（含 `policy_denied`/`unknown_tool`/`bridge_error`）→ Internal。
+pub fn agent_registries_for_inputs_with_dsh_tools(
+    llm: Option<Arc<dyn PromptTransport>>,
+    mode: LlmMode,
+    gpio: Option<ChipFamily>,
+    gpio_inputs: &[(PinId, Level)],
+    dsh_tools: Option<Arc<dyn DshToolTransport>>,
+) -> Result<(TaskRegistry, ToolRegistry), String> {
     let mut tools = ToolRegistry::new();
     tools
         .register("pc.read", PcReadTool)
@@ -199,6 +229,7 @@ pub fn agent_registries_for_inputs(
             PcInfoTool {
                 llm: mode.as_str(),
                 gpio: gpio_label(gpio),
+                dsh_tools: if dsh_tools.is_some() { "on" } else { "off" },
             },
         )
         .map_err(|error| format!("注册 pc.info 失败：{error}"))?;
@@ -327,6 +358,52 @@ pub fn agent_registries_for_inputs(
             }) as Box<dyn TaskHandler>)
         })
         .map_err(|error| format!("注册 pc.ask 任务失败：{error}"))?;
+
+    // DSH 工具桥：仅显式注入传输时注册（`--dsh-tools`）。两个都是 Task，
+    // 阻塞调用在独立线程，poll 只做非阻塞收结果（与 pc.ask 同构）。
+    if let Some(transport) = dsh_tools {
+        let call_transport = transport.clone();
+        tasks
+            .register("dsh.call", move |args: &[u8]| {
+                let (tool, arguments, timeout_ms) = parse_dsh_call_args(args)?;
+                let transport = call_transport.clone();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let thread_cancelled = cancelled.clone();
+                let (sender, receiver) = mpsc::channel();
+                thread::spawn(move || {
+                    let result =
+                        transport.call_tool(&tool, &arguments, timeout_ms, &thread_cancelled);
+                    let _ = sender.send(result);
+                });
+                Ok(Box::new(DshCallTask {
+                    receiver,
+                    started: Instant::now(),
+                    timeout_ms,
+                    cancelled,
+                }) as Box<dyn TaskHandler>)
+            })
+            .map_err(|error| format!("注册 dsh.call 任务失败：{error}"))?;
+
+        let list_timeout_ms = DSH_TOOLS_LIST_TIMEOUT_MS;
+        tasks
+            .register("dsh.tools", move |_args: &[u8]| {
+                let transport = transport.clone();
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let thread_cancelled = cancelled.clone();
+                let (sender, receiver) = mpsc::channel();
+                thread::spawn(move || {
+                    let result = transport.list_tools(list_timeout_ms, &thread_cancelled);
+                    let _ = sender.send(result);
+                });
+                Ok(Box::new(DshToolsTask {
+                    receiver,
+                    started: Instant::now(),
+                    timeout_ms: list_timeout_ms,
+                    cancelled,
+                }) as Box<dyn TaskHandler>)
+            })
+            .map_err(|error| format!("注册 dsh.tools 任务失败：{error}"))?;
+    }
     Ok((tasks, tools))
 }
 
@@ -831,6 +908,7 @@ impl ToolHandler for PcLsTool {
 struct PcInfoTool {
     llm: &'static str,
     gpio: &'static str,
+    dsh_tools: &'static str,
 }
 
 impl ToolHandler for PcInfoTool {
@@ -842,12 +920,13 @@ impl ToolHandler for PcInfoTool {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_else(|_| String::from("unknown"));
         let text = format!(
-            "os={}\nhost={}\ncwd={}\npid={}\nllm={}\ngpio={}\n",
+            "os={}\nhost={}\ncwd={}\npid={}\nllm={}\ndsh_tools={}\ngpio={}\n",
             std::env::consts::OS,
             host,
             cwd,
             std::process::id(),
             self.llm,
+            self.dsh_tools,
             self.gpio,
         );
         Ok(text.into_bytes())
@@ -1115,6 +1194,300 @@ fn prompt_error_to_command(error: PromptError) -> CommandError {
                 error.code, error.message
             ),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DSH 工具桥（dsh.call / dsh.tools）
+// ---------------------------------------------------------------------------
+
+/// `dsh.tools` 清单的等待上限：首次调用可能触发 bridge agent 创建，给 15s；
+/// 不复用 `dsh.call` 的 300s，避免挂起的清单长期占用在途 Task。
+const DSH_TOOLS_LIST_TIMEOUT_MS: u64 = 15_000;
+
+/// `dsh.call` 的单次调用预算（env `SEKAI_DSH_TOOL_MS`，1000..=600000，
+/// 默认 300000）。
+fn dsh_tool_timeout_ms() -> u64 {
+    env_clamped_ms("SEKAI_DSH_TOOL_MS", 300_000, 1_000, 600_000)
+}
+
+/// 解析 `dsh.call` 的 JSON 参数：工具名、arguments（缺省 `{}`）与预算。
+///
+/// 线上形状：`{"tool":"<name>","arguments":<任意 JSON>,"timeout_ms":<可选>}`。
+/// `timeout_ms` 显式给出时钳制到 1000..=600000；缺省取 [`dsh_tool_timeout_ms`]。
+fn parse_dsh_call_args(args: &[u8]) -> Result<(String, Json, u64), CommandError> {
+    let text = core::str::from_utf8(args).map_err(|_| {
+        CommandError::new(ErrorCode::InvalidArgument, "dsh.call 参数必须是 UTF-8 文本")
+    })?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(CommandError::new(
+            ErrorCode::InvalidArgument,
+            "dsh.call 参数为空：应提供 JSON 对象（tool 必填，arguments 可选）",
+        ));
+    }
+    let value = Json::parse(text).map_err(|error| {
+        CommandError::new(
+            ErrorCode::InvalidArgument,
+            format!("dsh.call 参数不是合法 JSON：{error}"),
+        )
+    })?;
+    if value.as_object().is_none() {
+        return Err(CommandError::new(
+            ErrorCode::InvalidArgument,
+            "dsh.call 参数必须是 JSON 对象（形如 tool + arguments）",
+        ));
+    }
+    let tool = value
+        .get("tool")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            CommandError::new(
+                ErrorCode::InvalidArgument,
+                "dsh.call 缺少 tool：应为非空字符串（如 read）",
+            )
+        })?;
+    let arguments = value
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| Json::Object(Vec::new()));
+    let timeout_ms = match value.get("timeout_ms") {
+        Some(raw) => raw
+            .as_u64()
+            .ok_or_else(|| {
+                CommandError::new(
+                    ErrorCode::InvalidArgument,
+                    "dsh.call 的 timeout_ms 必须是非负整数（毫秒）",
+                )
+            })?
+            .clamp(1_000, 600_000),
+        None => dsh_tool_timeout_ms(),
+    };
+    Ok((String::from(tool), arguments, timeout_ms))
+}
+
+/// 从 `dsh_tool` 成功结果取展示文本：优先 `result.text`，其次
+/// `result.value` 的紧凑 JSON，最后整个 `result`。
+fn dsh_result_text(result: &Json) -> String {
+    if let Some(text) = result.get("text").and_then(Json::as_str) {
+        return String::from(text);
+    }
+    if let Some(value) = result.get("value") {
+        return value.to_compact_string();
+    }
+    result.to_compact_string()
+}
+
+/// 成功结果 → 有界输出（≤ [`MAX_PAYLOAD`]，按字符边界截断并追加
+/// `[[truncated]]`）。对端已标 `truncated=true` 时同样补标记。
+fn dsh_result_bytes(result: &Json) -> Vec<u8> {
+    let truncated = result
+        .get("truncated")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    assemble_bounded(
+        "",
+        dsh_result_text(result).as_bytes(),
+        truncated,
+        None,
+        MAX_PAYLOAD,
+    )
+}
+
+/// `dsh.tools` 成功结果 → 每行 `name — 描述` 的清单文本。
+///
+/// DSH 插件契约是 `result.tools: [{name, description}]`（另带 `count`）；
+/// 这里宽松兼容对象映射形态（`{"read":"读文件"}`）与字符串项，便于对端演进。
+fn format_tools_listing(result: &Json) -> String {
+    let tools = result.get("tools");
+    if let Some(items) = tools.and_then(Json::as_array) {
+        let lines: Vec<String> = items.iter().map(format_tool_item).collect();
+        return lines.join("\n");
+    }
+    if let Some(entries) = tools.and_then(Json::as_object) {
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|(name, value)| {
+                let description = value
+                    .as_str()
+                    .or_else(|| value.get("description").and_then(Json::as_str))
+                    .unwrap_or("");
+                tool_line(name, description)
+            })
+            .collect();
+        return lines.join("\n");
+    }
+    // 未知形态：原样紧凑 JSON，便于排障（不丢信息）。
+    result.to_compact_string()
+}
+
+/// 清单里的一项：对象取 `name`/`description`，字符串项按工具名处理。
+fn format_tool_item(item: &Json) -> String {
+    let (name, description) = match item {
+        Json::String(name) => (name.as_str(), ""),
+        _ => (
+            item.get("name").and_then(Json::as_str).unwrap_or(""),
+            item.get("description").and_then(Json::as_str).unwrap_or(""),
+        ),
+    };
+    tool_line(name, description)
+}
+
+/// 一行清单：`name — 描述`（描述取首行、最多 200 字符；空描述只留名字）。
+fn tool_line(name: &str, description: &str) -> String {
+    let summary: String = description
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    if summary.is_empty() {
+        String::from(name)
+    } else {
+        format!("{name} — {summary}")
+    }
+}
+
+/// DSH 错误码 → 命令错误码（映射见 [`agent_registries_for_inputs_with_dsh_tools`]）。
+fn dsh_error_to_command(task: &str, error: PromptError) -> CommandError {
+    let code = match error.code.as_str() {
+        "timeout" | "cancelled" => ErrorCode::Timeout,
+        "invalid_arguments" => ErrorCode::InvalidArgument,
+        "disabled" | "no_agent" | "unavailable" => ErrorCode::Unsupported,
+        _ => ErrorCode::Internal,
+    };
+    CommandError::new(
+        code,
+        format!("{task} 失败（{}）：{}", error.code, error.message),
+    )
+}
+
+/// `dsh.call` 任务：阻塞的工具调用在工作线程，poll 非阻塞收结果。
+///
+/// 与 [`AskTask`] 同构：任务 DDL 到期/Drop 时置取消标志，让工作线程尽快退出
+/// （只丢弃接收端不足以结束阻塞中的 JSONL 等待），并由通道发 `dsh_cancel`。
+struct DshCallTask {
+    receiver: mpsc::Receiver<Result<Json, PromptError>>,
+    started: Instant,
+    timeout_ms: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DshCallTask {
+    /// 通知工作线程放弃等待（幂等）。
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DshCallTask {
+    fn drop(&mut self) {
+        // 运行时因 DDL/取消丢弃任务时（不会再 poll）也要唤醒工作线程。
+        self.cancel();
+    }
+}
+
+impl TaskHandler for DshCallTask {
+    fn poll(&mut self, ctx: &mut TaskContext<'_>) -> TaskPoll {
+        if ctx.is_expired() {
+            self.cancel();
+            return TaskPoll::Failed(CommandError::from(ErrorCode::Timeout));
+        }
+        if self.started.elapsed() >= Duration::from_millis(self.timeout_ms) {
+            self.cancel();
+            return TaskPoll::Failed(CommandError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "dsh.call 等待 DSH 工具结果超过内部上限（{}ms）",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        match self.receiver.try_recv() {
+            Ok(Ok(result)) => {
+                if result
+                    .get("is_error")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false)
+                {
+                    TaskPoll::Failed(CommandError::new(
+                        ErrorCode::Internal,
+                        format!("dsh.call 工具执行失败：{}", dsh_result_text(&result)),
+                    ))
+                } else {
+                    TaskPoll::Done(dsh_result_bytes(&result))
+                }
+            }
+            Ok(Err(error)) => TaskPoll::Failed(dsh_error_to_command("dsh.call", error)),
+            Err(mpsc::TryRecvError::Empty) => TaskPoll::Pending {
+                wake_after_ms: ASK_POLL_MS,
+            },
+            Err(mpsc::TryRecvError::Disconnected) => TaskPoll::Failed(CommandError::new(
+                ErrorCode::Internal,
+                "dsh.call 内部通道异常关闭（工作线程未返回结果）",
+            )),
+        }
+    }
+}
+
+/// `dsh.tools` 任务：列出 DSH 工具面，poll 非阻塞（与 [`DshCallTask`] 同构）。
+struct DshToolsTask {
+    receiver: mpsc::Receiver<Result<Json, PromptError>>,
+    started: Instant,
+    timeout_ms: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl DshToolsTask {
+    /// 通知工作线程放弃等待（幂等）。
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for DshToolsTask {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+impl TaskHandler for DshToolsTask {
+    fn poll(&mut self, ctx: &mut TaskContext<'_>) -> TaskPoll {
+        if ctx.is_expired() {
+            self.cancel();
+            return TaskPoll::Failed(CommandError::from(ErrorCode::Timeout));
+        }
+        if self.started.elapsed() >= Duration::from_millis(self.timeout_ms) {
+            self.cancel();
+            return TaskPoll::Failed(CommandError::new(
+                ErrorCode::Timeout,
+                format!(
+                    "dsh.tools 等待 DSH 工具清单超过内部上限（{}ms）",
+                    self.timeout_ms
+                ),
+            ));
+        }
+        match self.receiver.try_recv() {
+            Ok(Ok(result)) => TaskPoll::Done(assemble_bounded(
+                "",
+                format_tools_listing(&result).as_bytes(),
+                false,
+                None,
+                MAX_PAYLOAD,
+            )),
+            Ok(Err(error)) => TaskPoll::Failed(dsh_error_to_command("dsh.tools", error)),
+            Err(mpsc::TryRecvError::Empty) => TaskPoll::Pending {
+                wake_after_ms: ASK_POLL_MS,
+            },
+            Err(mpsc::TryRecvError::Disconnected) => TaskPoll::Failed(CommandError::new(
+                ErrorCode::Internal,
+                "dsh.tools 内部通道异常关闭（工作线程未返回结果）",
+            )),
+        }
     }
 }
 
@@ -2281,6 +2654,491 @@ mod tests {
         assert!(
             cancelled_seen.load(Ordering::Relaxed),
             "Drop 未设置取消标志，工作线程只能等满整个 ask 预算"
+        );
+    }
+
+    // ---- DSH 工具桥（dsh.call / dsh.tools） ----
+
+    /// 假 DSH 工具桥：记录每次调用（method/tool/arguments/timeout_ms），
+    /// 响应由测试闭包决定。
+    #[allow(clippy::type_complexity)]
+    struct FakeDshBridge {
+        calls: Mutex<Vec<Json>>,
+        tool_response: Box<dyn Fn(&str, &Json) -> Result<Json, PromptError> + Send + Sync>,
+        list_response: Box<dyn Fn() -> Result<Json, PromptError> + Send + Sync>,
+    }
+
+    impl FakeDshBridge {
+        fn new(
+            tool_response: impl Fn(&str, &Json) -> Result<Json, PromptError> + Send + Sync + 'static,
+            list_response: impl Fn() -> Result<Json, PromptError> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                tool_response: Box::new(tool_response),
+                list_response: Box::new(list_response),
+            }
+        }
+
+        fn recorded(&self) -> Vec<Json> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl DshToolTransport for FakeDshBridge {
+        fn call_tool(
+            &self,
+            name: &str,
+            arguments: &Json,
+            timeout_ms: u64,
+            _cancelled: &AtomicBool,
+        ) -> Result<Json, PromptError> {
+            self.calls.lock().unwrap().push(Json::object(vec![
+                ("method", Json::from("dsh_tool")),
+                ("tool", Json::from(name)),
+                ("arguments", arguments.clone()),
+                ("timeout_ms", Json::from(timeout_ms)),
+            ]));
+            (self.tool_response)(name, arguments)
+        }
+
+        fn list_tools(
+            &self,
+            timeout_ms: u64,
+            _cancelled: &AtomicBool,
+        ) -> Result<Json, PromptError> {
+            self.calls.lock().unwrap().push(Json::object(vec![
+                ("method", Json::from("dsh_tools")),
+                ("timeout_ms", Json::from(timeout_ms)),
+            ]));
+            (self.list_response)()
+        }
+    }
+
+    /// 可取消的假桥：模拟最长 30s 的阻塞调用，记录是否观察到取消/线程已退出。
+    struct CancellableDshBridge {
+        started: Arc<AtomicBool>,
+        cancelled_seen: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    impl DshToolTransport for CancellableDshBridge {
+        fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: &Json,
+            _timeout_ms: u64,
+            cancelled: &AtomicBool,
+        ) -> Result<Json, PromptError> {
+            self.started.store(true, Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !cancelled.load(Ordering::Relaxed) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let seen = cancelled.load(Ordering::Relaxed);
+            self.cancelled_seen.store(seen, Ordering::Relaxed);
+            self.finished.store(true, Ordering::Relaxed);
+            Err(PromptError::new(
+                if seen { "cancelled" } else { "timeout" },
+                "测试桥",
+            ))
+        }
+
+        fn list_tools(&self, timeout_ms: u64, cancelled: &AtomicBool) -> Result<Json, PromptError> {
+            self.call_tool("", &Json::Null, timeout_ms, cancelled)
+        }
+    }
+
+    fn dsh_host_with(bridge: Arc<dyn DshToolTransport>) -> (TaskRegistry, ToolRegistry) {
+        agent_registries_for_inputs_with_dsh_tools(None, LlmMode::Off, None, &[], Some(bridge))
+            .unwrap()
+    }
+
+    #[test]
+    fn dsh_tools_registration_is_gated_by_transport() {
+        // 旧入口 / 未注入传输：不注册 dsh.*。
+        let (tasks, tools) = agent_registries(None).unwrap();
+        for name in ["dsh.call", "dsh.tools"] {
+            assert!(!tasks.contains(name), "默认不应注册 {name}");
+            assert!(!tools.contains(name), "{name} 不应是 Tool");
+        }
+        let (tasks, _) = agent_registries_for_inputs(None, LlmMode::Off, None, &[]).unwrap();
+        assert!(!tasks.contains("dsh.call"));
+        assert!(!tasks.contains("dsh.tools"));
+
+        // 注入传输后才注册，且必须是 Task（非阻塞帧循环）。
+        let bridge: Arc<dyn DshToolTransport> =
+            Arc::new(FakeDshBridge::new(|_, _| Ok(Json::Null), || Ok(Json::Null)));
+        let (tasks, tools) = dsh_host_with(bridge);
+        for name in ["dsh.call", "dsh.tools"] {
+            assert!(tasks.contains(name), "缺少任务 {name}");
+            assert!(!tools.contains(name), "{name} 不应是 Tool");
+        }
+    }
+
+    #[test]
+    fn pc_info_reports_dsh_tools_state() {
+        let (_, mut tools) = agent_registries(None).unwrap();
+        let text = String::from_utf8(call_tool(&mut tools, "pc.info", b"").unwrap()).unwrap();
+        assert!(text.contains("dsh_tools=off\n"), "{text}");
+
+        let bridge: Arc<dyn DshToolTransport> =
+            Arc::new(FakeDshBridge::new(|_, _| Ok(Json::Null), || Ok(Json::Null)));
+        let (_, mut tools) = dsh_host_with(bridge);
+        let text = String::from_utf8(call_tool(&mut tools, "pc.info", b"").unwrap()).unwrap();
+        assert!(text.contains("dsh_tools=on\n"), "{text}");
+    }
+
+    #[test]
+    fn dsh_call_returns_text_and_records_arguments() {
+        let bridge = Arc::new(FakeDshBridge::new(
+            |name, arguments| {
+                Ok(Json::object(vec![
+                    ("is_error", Json::Bool(false)),
+                    ("value", Json::Null),
+                    (
+                        "text",
+                        Json::from(format!(
+                            "tool:{name}:{}",
+                            arguments.get("path").and_then(Json::as_str).unwrap_or("")
+                        )),
+                    ),
+                    ("truncated", Json::Bool(false)),
+                ]))
+            },
+            || Ok(Json::object(vec![("tools", Json::Array(Vec::new()))])),
+        ));
+        let bridge_trait: Arc<dyn DshToolTransport> = bridge.clone();
+        let (tasks, _) = dsh_host_with(bridge_trait);
+        let factory = tasks.get("dsh.call").unwrap();
+        let mut handler = factory(br#"{"tool":"read","arguments":{"path":"a.txt"}}"#).unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Done(payload) => assert_eq!(payload, b"tool:read:a.txt"),
+            other => panic!("dsh.call 应完成：{other:?}"),
+        }
+        let calls = bridge.recorded();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(
+            calls[0].get("method").and_then(Json::as_str),
+            Some("dsh_tool")
+        );
+        assert_eq!(calls[0].get("tool").and_then(Json::as_str), Some("read"));
+        assert_eq!(
+            calls[0]
+                .get_path(&["arguments", "path"])
+                .and_then(Json::as_str),
+            Some("a.txt")
+        );
+        // 缺省 timeout：环境变量未显式设置时取默认 300000，且始终在钳制区间。
+        let timeout = calls[0].get("timeout_ms").and_then(Json::as_u64).unwrap();
+        assert!((1_000..=600_000).contains(&timeout), "{timeout}");
+        // arguments 缺省为 {}。
+        assert!(calls[0].get("arguments").is_some());
+    }
+
+    #[test]
+    fn dsh_call_timeout_is_clamped_and_args_are_validated() {
+        let bridge = Arc::new(FakeDshBridge::new(
+            |_, _| Ok(Json::object(vec![("text", Json::from("ok"))])),
+            || Ok(Json::Null),
+        ));
+        let bridge_trait: Arc<dyn DshToolTransport> = bridge.clone();
+        let (tasks, _) = dsh_host_with(bridge_trait);
+        let factory = tasks.get("dsh.call").unwrap();
+
+        for (raw, expected) in [
+            (br#"{"tool":"read","timeout_ms":1}"#.as_slice(), 1_000u64),
+            (
+                br#"{"tool":"read","timeout_ms":9999999}"#.as_slice(),
+                600_000u64,
+            ),
+            (br#"{"tool":"read"}"#.as_slice(), 0u64),
+        ] {
+            let mut handler = factory(raw).unwrap();
+            match drive_task(handler.as_mut(), 5_000) {
+                TaskPoll::Done(_) => {}
+                other => panic!("dsh.call 应完成：{other:?}"),
+            }
+            let calls = bridge.recorded();
+            let recorded = calls
+                .last()
+                .unwrap()
+                .get("timeout_ms")
+                .and_then(Json::as_u64)
+                .unwrap();
+            if expected == 0 {
+                assert!((1_000..=600_000).contains(&recorded), "{recorded}");
+            } else {
+                assert_eq!(recorded, expected);
+            }
+        }
+
+        // 非法参数在工厂阶段即拒绝（InvalidArgument）。
+        for bad in [
+            b"".as_slice(),
+            b"  ".as_slice(),
+            b"not-json".as_slice(),
+            br#"[]"#.as_slice(),
+            br#"{}"#.as_slice(),
+            br#"{"tool":"   "}"#.as_slice(),
+            br#"{"tool":"read","timeout_ms":"soon"}"#.as_slice(),
+        ] {
+            let error = expect_factory_err(factory(bad));
+            assert_eq!(error.code, ErrorCode::InvalidArgument, "{bad:?}: {error}");
+            assert!(error.message.contains("dsh.call"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn dsh_call_tool_self_error_is_internal() {
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| {
+                Ok(Json::object(vec![
+                    ("is_error", Json::Bool(true)),
+                    (
+                        "error",
+                        Json::object(vec![
+                            ("name", Json::from("read")),
+                            ("code", Json::from("EACCES")),
+                        ]),
+                    ),
+                    ("text", Json::from("工具内部失败")),
+                ]))
+            },
+            || Ok(Json::Null),
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.call").unwrap();
+        let mut handler = factory(br#"{"tool":"read"}"#).unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Failed(error) => {
+                assert_eq!(error.code, ErrorCode::Internal);
+                assert!(error.message.contains("工具内部失败"), "{}", error.message);
+            }
+            other => panic!("工具自身失败应 Failed(Internal)：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsh_call_maps_bridge_error_codes() {
+        for (code, expected) in [
+            ("timeout", ErrorCode::Timeout),
+            ("cancelled", ErrorCode::Timeout),
+            ("invalid_arguments", ErrorCode::InvalidArgument),
+            ("disabled", ErrorCode::Unsupported),
+            ("no_agent", ErrorCode::Unsupported),
+            ("unavailable", ErrorCode::Unsupported),
+            ("policy_denied", ErrorCode::Internal),
+            ("unknown_tool", ErrorCode::Internal),
+            ("bridge_error", ErrorCode::Internal),
+        ] {
+            let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+                move |_, _| Err(PromptError::new(code, "桥层失败")),
+                || Ok(Json::Null),
+            ));
+            let (tasks, _) = dsh_host_with(bridge);
+            let factory = tasks.get("dsh.call").unwrap();
+            let mut handler = factory(br#"{"tool":"read"}"#).unwrap();
+            match drive_task(handler.as_mut(), 5_000) {
+                TaskPoll::Failed(error) => {
+                    assert_eq!(error.code, expected, "{code}: {}", error.message);
+                    assert!(error.message.contains("桥层失败"), "{}", error.message);
+                }
+                other => panic!("{code} 应 Failed：{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dsh_call_output_is_bounded_and_marks_truncation() {
+        // 超长 text：按字符边界截断到 MAX_PAYLOAD 并追加 [[truncated]]。
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| {
+                Ok(Json::object(vec![
+                    ("text", Json::from("答".repeat(9_999))),
+                    ("truncated", Json::Bool(false)),
+                ]))
+            },
+            || Ok(Json::Null),
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.call").unwrap();
+        let mut handler = factory(br#"{"tool":"read"}"#).unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Done(payload) => {
+                assert!(payload.len() <= MAX_PAYLOAD, "{}", payload.len());
+                let text = String::from_utf8(payload).expect("结果必须是合法 UTF-8");
+                assert!(text.ends_with(MARKER_TRUNCATED), "{text}");
+            }
+            other => panic!("dsh.call 应完成：{other:?}"),
+        }
+
+        // 对端标了 truncated=true（短文本）：也要补 [[truncated]] 标记。
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| {
+                Ok(Json::object(vec![
+                    ("text", Json::from("短")),
+                    ("truncated", Json::Bool(true)),
+                ]))
+            },
+            || Ok(Json::Null),
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.call").unwrap();
+        let mut handler = factory(br#"{"tool":"read"}"#).unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Done(payload) => {
+                let text = String::from_utf8(payload).unwrap();
+                assert!(text.contains("短"), "{text}");
+                assert!(text.ends_with(MARKER_TRUNCATED), "{text}");
+            }
+            other => panic!("dsh.call 应完成：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsh_tools_formats_listing_with_first_line_and_200_chars() {
+        let long = format!("首行{}", "x".repeat(300));
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| Ok(Json::Null),
+            move || {
+                Ok(Json::object(vec![
+                    (
+                        "tools",
+                        Json::Array(vec![
+                            Json::object(vec![
+                                ("name", Json::from("read")),
+                                ("description", Json::from("读文件\n第二行")),
+                            ]),
+                            Json::object(vec![
+                                ("name", Json::from("glob")),
+                                ("description", Json::from(long.clone())),
+                            ]),
+                            Json::from("grep"),
+                        ]),
+                    ),
+                    ("count", Json::num(3)),
+                ]))
+            },
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.tools").unwrap();
+        let mut handler = factory(b"").unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Done(payload) => {
+                let text = String::from_utf8(payload).expect("清单必须是 UTF-8");
+                let lines: Vec<&str> = text.lines().collect();
+                assert_eq!(lines[0], "read — 读文件", "{text}");
+                assert_eq!(lines[2], "grep", "{text}");
+                assert!(!text.contains("第二行"), "描述应只取首行：{text}");
+                let description = lines[1]
+                    .strip_prefix("glob — ")
+                    .expect("第二行应是 glob 描述");
+                assert_eq!(description.chars().count(), 200, "{description}");
+            }
+            other => panic!("dsh.tools 应完成：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn dsh_tools_listing_is_bounded_and_errors_map() {
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| Ok(Json::Null),
+            || {
+                let items: Vec<Json> = (0..200)
+                    .map(|index| {
+                        Json::object(vec![
+                            ("name", Json::from(format!("tool-{index}"))),
+                            ("description", Json::from("描述".repeat(80))),
+                        ])
+                    })
+                    .collect();
+                Ok(Json::object(vec![("tools", Json::Array(items))]))
+            },
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.tools").unwrap();
+        let mut handler = factory(b"").unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Done(payload) => {
+                assert!(payload.len() <= MAX_PAYLOAD, "{}", payload.len());
+                let text = String::from_utf8(payload).expect("清单必须是 UTF-8");
+                assert!(text.ends_with(MARKER_TRUNCATED), "{text}");
+            }
+            other => panic!("dsh.tools 应完成：{other:?}"),
+        }
+
+        // 桥层错误同样按错误码映射（这里 disabled → Unsupported）。
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(FakeDshBridge::new(
+            |_, _| Ok(Json::Null),
+            || Err(PromptError::new("disabled", "dshTools 未启用")),
+        ));
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.tools").unwrap();
+        let mut handler = factory(b"").unwrap();
+        match drive_task(handler.as_mut(), 5_000) {
+            TaskPoll::Failed(error) => {
+                assert_eq!(error.code, ErrorCode::Unsupported);
+                assert!(
+                    error.message.contains("dshTools 未启用"),
+                    "{}",
+                    error.message
+                );
+            }
+            other => panic!("dsh.tools 应失败：{other:?}"),
+        }
+    }
+
+    /// 组装可取消的 dsh.call 任务，并等其工作线程真正开始阻塞。
+    fn cancellable_dsh_call_task() -> (Box<dyn TaskHandler>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let started = Arc::new(AtomicBool::new(false));
+        let cancelled_seen = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let bridge: Arc<dyn DshToolTransport> = Arc::new(CancellableDshBridge {
+            started: started.clone(),
+            cancelled_seen: cancelled_seen.clone(),
+            finished: finished.clone(),
+        });
+        let (tasks, _) = dsh_host_with(bridge);
+        let factory = tasks.get("dsh.call").unwrap();
+        let handler = factory(br#"{"tool":"slow"}"#).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "dsh.call 工作线程未启动");
+            thread::sleep(Duration::from_millis(5));
+        }
+        (handler, cancelled_seen, finished)
+    }
+
+    #[test]
+    fn dsh_call_task_ddl_expiry_cancels_worker_thread() {
+        let (mut handler, cancelled_seen, finished) = cancellable_dsh_call_task();
+        let workers = sekai::sekai_device_list::DeviceList::new();
+        let mut context = TaskContext {
+            now_mono_ms: 0,
+            deadline_mono_ms: 0,
+            now_unix_ms: None,
+            workers: &workers,
+        };
+        match handler.poll(&mut context) {
+            TaskPoll::Failed(error) => assert_eq!(error.code, ErrorCode::Timeout),
+            other => panic!("DDL 到期应 Failed(Timeout)：{other:?}"),
+        }
+        wait_thread_finished(&finished);
+        assert!(
+            cancelled_seen.load(Ordering::Relaxed),
+            "工作线程未观察到取消标志（丢弃接收端不足以结束阻塞 JSONL 等待）"
+        );
+    }
+
+    #[test]
+    fn dsh_call_task_drop_cancels_worker_thread() {
+        let (handler, cancelled_seen, finished) = cancellable_dsh_call_task();
+        drop(handler);
+        wait_thread_finished(&finished);
+        assert!(
+            cancelled_seen.load(Ordering::Relaxed),
+            "Drop 未设置取消标志，工作线程只能等满整个工具预算"
         );
     }
 }

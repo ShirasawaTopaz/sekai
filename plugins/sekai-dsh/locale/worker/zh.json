@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Sekai Worker",
+    "description": "管理本机 sekai-worker PC agent：按 autoConnect 连回上次的 Router、可选中转 pc.ask prompt，并提供状态与手动 connect/disconnect 工具。"
+  }
+}

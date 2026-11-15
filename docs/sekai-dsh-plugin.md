@@ -3,7 +3,11 @@
 > 状态：v1 已实现并安装验证（2026-11）；v1.1 追加 serve `prompt` 方法与 worker 插件
 > 的 prompt 中转（PC agent 形态）；v1.3 追加 worker 插件 `autoConnect` 自动连接开关
 > （恢复上次连接的 Router，状态文件按 `workerId` 持久化）与 `sekai_worker_connect` /
-> `sekai_worker_disconnect` 手动控制工具。把 Sekai 的 **Router** 与 **PC Worker** 分别接入
+> `sekai_worker_disconnect` 手动控制工具；本轮追加 worker 插件可选的 **DSH 工具桥**
+> （`dshTools`：Worker 的 `dsh.tools`/`dsh.call` → 本机 DSH 工具，默认关闭、默认只读）；
+> 2026-11 适配 **DSH 0.2.2-rc.3**（`engines.dsh` 声明、工具注册等待 `tools` 服务，
+> 见 §1「DSH 版本兼容」）。
+> 把 Sekai 的 **Router** 与 **PC Worker** 分别接入
 > DeepSeek Harness（DSH）插件体系：DSH 主会话取代 Router 内置 LLM 回路成为「大脑」，
 > Router 退化为「链路管理 + Worker 注册表 + 派工网关」，PC Worker 由独立插件托管进程
 > 生命周期（并可中转其 `pc.ask` prompt）。
@@ -21,13 +25,18 @@
 | 角色 | DSH 侧 | Rust 侧 | 通信 |
 | --- | --- | --- | --- |
 | Router 插件（`@sekai/dsh-plugin/router`，行 id `sekai-router`） | Host 插件：spawn 子进程、注册 4 个 `sekai_*` 工具 | `sekai-router --serve`（无头 JSONL 模式，见 §2） | stdin/stdout JSONL（协议 v1，v1.1 追加 `prompt`） |
-| Worker 插件（`@sekai/dsh-plugin/worker`，行 id `sekai-worker`） | Host 插件：spawn 子进程、退避重启、注册 `sekai_worker_status` 工具、（`llm:'dsh'` 时）中转 prompt | `sekai-worker connect 127.0.0.1:7421 --llm dsh`（PC agent） | stderr 进度行 + stdin/stdout prompt JSONL（中转通道） |
+| Worker 插件（`@sekai/dsh-plugin/worker`，行 id `sekai-worker`） | Host 插件：spawn 子进程、退避重启、注册 `sekai_worker_status` 工具、（`llm:'dsh'` 时）中转 prompt、（可选 `dshTools`）执行 Worker 的 DSH 工具调用 | `sekai-worker connect 127.0.0.1:7421 --llm dsh`（PC agent；`dshTools.enabled` 时追加 `--dsh-tools`） | stderr 进度行 + stdin/stdout prompt JSONL（中转通道）+（可选）stdin/stdout `dsh_tool`/`dsh_tools`/`dsh_cancel` JSONL（DSH 工具桥） |
 | 两插件协作 | 只约定地址：router 插件 `listenAddr` = worker 插件 `routerAddr`（默认 `127.0.0.1:7421`） | Router 监听、Worker 自带 500ms→30s 指数退避重连 | 直连 V1 帧（长度前缀，非 MQTT） |
 
 **LLM 职责划分**：DSH 主会话负责自然语言→工具调用的评估；Router 的
 `agent.rs`/`llm.rs` 回路仅供独立 CLI 与 prompt 通道（`pc.ask` / serve `prompt` /
 ingress）使用。安全策略（`allow_write`/`allow_tasks`/`allow_admin`/`worker_filter`）
 在 serve 侧**发布 Stdin 之前**强制执行——DSH 侧无法绕过。
+
+**DSH 工具桥（可选，`dshTools`）**：worker 插件可代 Worker 调用本机 DSH 工具——Worker
+在 `--dsh-tools` 时把 `dsh.tools`/`dsh.call` 两个 Task 的请求写成 stdin/stdout JSONL，
+插件在**独立 bridge agent** 上执行宿主工具并回投结果。默认关闭，默认只读 allowlist
+（`[read, glob, grep]`）；Router 侧仍按 Task 通道由 `allow_tasks` 门控。V1 帧不变。
 
 ## 1. 安装与配置
 
@@ -83,6 +92,51 @@ worker `autoConnect` 自动连接。
 > （`spawn EPERM`）；若确实要在 DSH 会话里执行，需要给该命令申请更宽的沙箱权限
 > （会放弃该次命令的会话隔离），否则请到终端跑。升级插件 = `git pull` 后重跑同一条
 > 命令；重启 DSH 才会加载新 bundle（运行中的会话不热加载）。
+
+### DSH 版本兼容（0.2.2-rc.3）
+
+`plugins/sekai-dsh/package.json` 的 `engines.dsh` 声明为
+`>=0.2.2-rc.3 <0.3.0`：插件按 DSH **0.2.2-rc.3** 的 Host 插件契约验证并适配，
+`dsh plugin` / Plugin Manager 会按这个范围做兼容性校验。
+
+- **已核对的面**：bundle 的 `dsh.bundle.patch` / `insert` 行；默认导出类插件 +
+  `static Config`（schemastery 3.19）；`ctx.effect` 生命周期；工具
+  `output.schema` 必须落在宿主 JSON Schema 子集内（只认
+  `type`/`oneOf`/`properties`/`required`/`additionalProperties`/`items`/`enum`/`const`
+  与注释键；`anyOf`、`type` 数组、`minimum`/`maximum` 之类会被拒绝）；工具入参
+  `parameters`（模型侧原样透传）；`ctx.tools.register/definitions/execute` 与
+  `ctx.agents.create` 的现有形状。
+- **0.2.2 起的挂载顺序**：profile 条目不再保证按 bundle 顺序「挂载完成」，插件
+  激活时宿主可能还没建好工具注册表（`ctx.get('tools') === undefined`）。router
+  插件靠 `static inject = ['tools']` 等待；worker 插件用
+  `ctx.inject(['tools'])` 等工具服务出现后再注册（此前会静默跳过
+  `sekai_worker_*`）。宿主没有工具注册表的嵌入形态下，worker 只跳过注册，
+  spawn 与 prompt 中转照常工作。
+- **本机验证（rc.3）**：临时 profile 挂载 patch 两行后，`tools.definitions()`
+  可见 4 个 router 工具与 3 个 worker 工具；`sekai_status` 走完整执行管线返回
+  `is_error:false`；`node scripts/smoke.mjs` 47/47 通过。
+
+### 插件页显示（rc.3）
+
+DSH 的「插件」页会分别读取 **bundle** 与**每一行**的本地化元数据和图标（不执行插件代码）：
+
+| 对象 | 标题 / 简介 | 图标 | 详情 |
+| --- | --- | --- | --- |
+| bundle `@sekai/dsh-plugin` | `locale/{en,zh}.json` 的 `meta.title` / `meta.description` | `package.json` 顶层 `icon`（`icon.svg`） | `meta.detail` → `docs/DETAIL.md` / `DETAIL.zh.md`（各一张图 `preview.svg`） |
+| 行 `sekai-router` | `locale/router/{en,zh}.json` | `./router/icon`（`icons/router.svg`） | — |
+| 行 `sekai-worker` | `locale/worker/{en,zh}.json` | `./worker/icon`（`icons/worker.svg`） | — |
+
+- 子路径插件（`@sekai/dsh-plugin/router`）**不会**读 `package.json`，所以行的标题/简介必须
+  用 `<包>/<子路径>/locale/<语言>.json` 导出（`./router/locale/*.json`），图标用
+  `./router/icon` 导出；只给 bundle 配 `locale/` 时行会退回显示模块名、没有图标。
+- 行详情页的**设置表单**来自插件的 `static Config`（schemastery）：给字段加
+  `.description()` 后，表单会显示说明与默认值；保存写 profile 的 `cordis.patch.yml`
+  覆盖层，bundle 补丁里的默认值不变。
+- 图标限制：SVG/PNG/JPEG/WebP、≤256 KiB、必须留在包内；bundle 图标不要画背景磁贴
+  （面板自带磁贴）。详情图 ≤5 MiB，文档必须是**恰好一行图片**。
+- 本机 rc.3 已验证：`@sekai/dsh-plugin` 出现在插件页且启用；两行分别显示
+  「Sekai Router」「Sekai Worker」及各自图标；行设置表单字段带说明；
+  `--dump-config` 对 desktop profile 由桌面端独占管理（CLI 拒绝），属预期。
 
 ### 二进制解析顺序（零配置）
 
@@ -156,6 +210,15 @@ bundle 默认值）：
                          # sekai_worker_connect / sekai_worker_disconnect 手动控制
     publishControlTools: true    # 是否发布上述两个手动控制工具
     stateFile: ''        # 「上次连接的 Router」状态文件；空 = $DSH_HOME/sekai/worker-state.json
+    dshTools:            # Worker → DSH 工具桥（默认关闭；开启后 spawn 追加 --dsh-tools）
+      enabled: false     # true = 允许 Worker 的 dsh.tools/dsh.call 调用本机 DSH 工具
+      allow: [read, glob, grep]  # 工具名白名单（默认只读）
+      deny: []           # 显式拒绝，优先于 allow
+      cwd: ''            # bridge agent 工作目录；空 = 主会话 cwd
+      agentPreset: standard        # bridge agent 的 preset
+      maxConcurrent: 1   # 1..=8，超出排队
+      timeoutMs: 300000  # 1000..=600000
+      maxResponseBytes: 65536      # 1024..=262144
 ```
 
 > **自动连接与「上次连接的 Router」**：worker 插件在 `autoConnect:true`（默认）时于 DSH
@@ -164,6 +227,28 @@ bundle 默认值）：
 > 进度行，按 `workerId` 持久化到状态文件；没有记录时回退 `routerAddr`。`autoConnect:false`
 > 时启动不 spawn，改由 `sekai_worker_connect`（省略地址同样优先上次连接）/
 > `sekai_worker_disconnect` 控制；手动断开后不再自动退避重启，直到再次 connect。
+
+#### Desktop profile：启用 DSH 工具桥（示例）
+
+不改插件默认值，只在 profile 的 `cordis.patch.yml` 里按行覆盖（未写的键沿用默认）：
+
+```yaml
+# <DSH_HOME>/profiles/desktop/cordis.patch.yml（示例；不要提交本机绝对路径/密钥）
+- id: sekai-worker
+  config:
+    dshTools:
+      enabled: true
+      allow: [read, glob, grep]   # 默认只读；按需追加（工具名以 dsh.tools 结果为准）
+      # deny: [write]              # 显式拒绝，优先于 allow
+      # cwd: D:\\work              # bridge agent 工作目录，默认主会话 cwd
+      # maxConcurrent: 1
+      # timeoutMs: 300000
+      # maxResponseBytes: 65536
+```
+
+改完重启 DSH 会话生效（运行中的会话不热加载 bundle/config）。`enabled: true` 只影响
+**新 spawn** 的 worker：插件给它追加 `--dsh-tools`，Worker 的 `tasks` 列表随后出现
+`dsh.tools`/`dsh.call`（`sekai_list_workers`/`sekai_worker_status` 可确认）。
 
 ## 2. serve 模式与 JSONL 协议 v1（冻结；v1.1 `prompt`、v1.2 异步/取消/管理）
 
@@ -215,7 +300,7 @@ bundle 默认值）：
 | `sekai_list_workers` | — | serve `workers` 响应原样（`{count, workers[]}`，含 tools/tasks/boot_id） |
 | `sekai_worker_tool` | `worker_id, tool, args, ddl_ms?` | serve `tool_call` 结果原样（结构化 error：`policy_denied` 等） |
 | `sekai_worker_task` | `worker_id, task, args, ddl_ms?` | serve `task` 结果原样 |
-| `sekai_worker_status` | — | worker 插件本地状态：`{running, pid?, restarts, uptimeMs, lastStderr[], llm, autoConnect, routerAddr, lastRouterAddr?}` |
+| `sekai_worker_status` | — | worker 插件本地状态：`{running, pid?, restarts, uptimeMs, lastStderr[], llm, autoConnect, routerAddr, lastRouterAddr?, dshTools:{enabled,allow,inFlight}}` |
 | `sekai_worker_connect` | `router_addr?` | 启动/切换本机 worker 连接：`{started, running, disconnected:false, routerAddr, lastRouterAddr?}`；省略地址 = 上次连接 / `routerAddr` |
 | `sekai_worker_disconnect` | — | 断开并停止本机 worker：`{disconnected, running:false}`；手动断开后抑制自动重启直到再次 connect |
 
@@ -281,12 +366,82 @@ DSH 启动 + worker 插件 enabled
 - **错误面**：`sekai_worker_connect` 的 `router_addr` 非法 → `invalid_arguments` 信封；
   插件已 dispose → `not_running` 信封；其余成功值见 §3 工具表。
 
+## 3.3 worker 插件的 DSH 工具桥（`dshTools`）
+
+Worker 以 `--dsh-tools` 启动时，把两个 Task 的请求写成与 prompt 通道并列的 stdin/stdout
+JSONL；worker 插件识别后在本机 DSH 上执行工具并回投。**不经过 Router、不改变 V1 帧**。
+
+```text
+worker stdout ──▶ 插件识别 {"id":N,"method":"dsh_tool","params":{tool,arguments}}
+                     │              {"id":N,"method":"dsh_tools","params":{}}
+                     │              {"method":"dsh_cancel","params":{"id":N}}
+                     ▼
+              allow/deny + 硬拒绝（run_code、sekai_worker_*）
+                     ▼
+              bridge agent（独立 session：sekai-dsh-tools-<uuid>）
+                     │ ctx.tools.execute（受 maxConcurrent 串行/排队）
+                     ▼
+              本机 DSH 工具（以 tools.definitions(agent) 可见性为准）
+                     ▼
+worker stdin ◀── dsh_tool：{"id":N,"ok":true,"result":{text,value?,is_error,truncated,error?}}
+                 dsh_tools：{"id":N,"ok":true,"result":{tools:[{name,description}],count}}
+                 桥层失败：{"id":N,"ok":false,"error":{"code","message"}}
+```
+
+- **spawn 行为**：`dshTools.enabled: true` 时给 worker 追加 `--dsh-tools`（Worker 侧仅
+  `connect`/TCP 模式支持；插件本来只 spawn connect 形态）。默认 `false` 不追加，Worker
+  的 tasks 列表不出现 `dsh.*`。
+- **解析顺序**：插件逐行处理 worker stdout——先 prompt（`llm:'dsh'` 时），再 `dsh_*`
+  请求（**与 `llm` 无关**，`llm:'off'` 也可用桥），其余行只记宿主日志。
+- **执行面**：懒创建独立 bridge agent（`agents.create({sessionId:'sekai-dsh-tools-<uuid>',
+  meta:{cwd, agentPreset}})`，`cwd` 缺省为主会话 cwd）；创建失败先不带 preset 重试一次，
+  仍失败回 `no_agent`。**不用主会话 agent**（宿主会拒绝在 ops-ptc 上直接调用工具）。
+- **allowlist 与硬拒绝**：只执行 `allow` 中且不在 `deny` 中的工具；`run_code` 与
+  `sekai_worker_*` **无论 allow 如何都拒绝**（防任意代码/递归）；工具名不在
+  `tools.definitions(agent)` 可见范围 → `unknown_tool`。
+- **清单过滤**：`dsh_tools` 只返回 bridge agent 可见、且通过 allow/deny/硬拒绝的名字
+  （被过滤的工具不出现，调用它们回 `policy_denied`）。
+- **超时/取消/并发**：插件从**入队即开始**计 `timeoutMs`（默认 300000）并挂
+  `AbortController`；`dsh_cancel`、插件 dispose、worker 退出都会 abort 并清理；
+  `maxConcurrent`（默认 1）之外的调用排队；所有路径恰好回投一次。日志只记 id/工具名/
+  错误码，不记参数与结果正文。
+- **响应语义**：工具自身失败仍是 `ok:true` + `result.is_error:true` +
+  `result.error{name,code}` + `text`；只有桥层错误（allowlist/超时/执行器）用
+  `ok:false` + `error.code`。`maxResponseBytes`（默认 65536）限制回投大小。
+
+错误码（回投 worker stdin，冻结）：
+
+| code | 来源 | 含义 |
+| --- | --- | --- |
+| `disabled` | 插件本地 | `dshTools.enabled=false` |
+| `policy_denied` | 插件本地 | allow/deny 拒绝，或硬拒绝 `run_code`/`sekai_worker_*` |
+| `invalid_arguments` | 插件本地 | `params.tool` 缺失、空串或非字符串 |
+| `unknown_tool` | 插件本地 | bridge agent 看不到该工具 |
+| `no_agent` | 插件本地 | bridge agent 创建失败 |
+| `unavailable` | 插件本地 | 宿主 tools 服务不可用 |
+| `timeout` | 插件本地 | 超过 `timeoutMs` |
+| `cancelled` | 插件本地 | 收到 `dsh_cancel` / dispose / worker 退出 |
+| `bridge_error` | 插件本地 | 执行器异常或 `ctx.tools.execute` reject |
+
+- **Router 版本**：远端 Router 需升级到包含本桥提示的版本（Worker 通告 `dsh.*` 时
+  `prompt.rs` 会追加 args 用法）；旧 Router 仍能把这两个名字当普通 Task 路由，但模型
+  不知道 args 形状，需要人工提示或升级 Router。
+
+完整配置键、spawn 参数与安全默认值见
+[plugins/sekai-dsh/README.md](../plugins/sekai-dsh/README.md)；Worker 侧任务语义见
+[sekai-pc-agent.md](sekai-pc-agent.md) §3.4 与 §4.2。
+
 ## 4. 关键实现事实（排障必读）
 
 - **Cordis 类插件必须默认导出**：`export default SekaiRouterPlugin`（对齐 dsh-dcp）。
   仅命名导出会报误导性的「failed to import」（fiber 从未创建，导入本身成功）。
 - **未经 `static inject` 声明的服务只能用 `ctx.get('tools')` 访问**；`ctx.tools`
   直接访问会抛 "cannot get property without inject"（worker 插件曾因此崩溃，已改防御式）。
+- **激活时的 `ctx.get('tools')` 可能是 `undefined`**（DSH 0.2.2 起条目不保证按
+  bundle 顺序挂载完成）：router 插件用 `static inject = ['tools']` 等待；worker 插件
+  用 `ctx.inject(['tools'], cb)` 等服务出现后再注册工具，宿主没有工具注册表时回调
+  不运行、spawn 与 prompt 中转照常。**不要**在激活时一次性 `ctx.get('tools')` 注册
+  ——那会让 `sekai_worker_*` 静默消失（0.2.2-rc.3 实测踩到）。
 - 工具 `output.schema` 有意放宽（透传协议响应，容忍 serve v1 加字段）；输入
   `parameters` 保持严格（`additionalProperties:false`、禁 type 数组）。
 - schemastery 以 `createRequire` 守卫式加载：宿主内正常生效，无 node_modules
@@ -304,6 +459,16 @@ DSH 启动 + worker 插件 enabled
   中转 socket 上的 readline 必须挂 `error` 监听，否则 ingress 不可达时未处理错误
   事件会把宿主进程抛崩。
 - serve `link_state.ready` = 链路建立（tcp 已监听），Worker 上线以 `worker_online` 为准。
+- **DSH 工具桥不走 Router**：`dsh_*` JSONL 只在 worker stdin/stdout 与插件内存中流动；
+  Router 只看到普通 Task（`dsh.tools`/`dsh.call`）。排障顺序：
+  `sekai_worker_status.dshTools.enabled` → worker `tasks` 是否含 `dsh.*` → `dsh.tools`
+  能否列出目标工具 → allowlist/deny。
+- **bridge agent 是独立会话**：`sekai-dsh-tools-<uuid>`，不是主会话；主会话可见工具不等于
+  bridge agent 可见，以 `tools.definitions(agent)` 为准（不可见即 `unknown_tool`）。
+- **硬拒绝先于 allowlist**：即使把 `run_code` 写进 `allow` 也拒绝；`sekai_worker_*` 同理
+  （防止 Worker → DSH → Sekai 的递归/任意代码路径）。
+- **桥的日志很少**：只记 id/工具名/错误码，不记 arguments 与结果正文；结果大小受
+  `maxResponseBytes` 限制。
 
 ## 5. 端到端验收记录（本机，2026-11-04）
 
@@ -325,3 +490,6 @@ DSH 启动 + worker 插件 enabled
   DSH 主会话仍是唯一的控制大脑。
 - 已核实的插件/serve 缺口（link 地址、断开通知、长任务 DDL 提示等）见
   [sekai-gap-audit.md](sekai-gap-audit.md) B11。
+- **DSH 工具桥不是「把所有 DSH 能力开放给 Worker」**：只按 allowlist 调用宿主工具，
+  默认只读、默认关闭；`run_code` 与 `sekai_worker_*` 永久拒绝；不新增 V1 帧、不把
+  Router 变成 DSH 工具网关。

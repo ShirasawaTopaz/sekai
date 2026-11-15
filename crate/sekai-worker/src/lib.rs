@@ -33,8 +33,8 @@ pub use link::{
     memory_pair, memory_pair_with_timeout,
 };
 pub use llm_channel::{
-    DshPromptChannel, LineIo, PromptError, PromptTransport, RouterPromptChannel, StdioLineIo,
-    ask_timeout_ms,
+    DshPromptChannel, DshToolTransport, LineIo, PromptError, PromptTransport, RouterPromptChannel,
+    StdioLineIo, ask_timeout_ms, parse_envelope_line,
 };
 
 /// crate 版本。
