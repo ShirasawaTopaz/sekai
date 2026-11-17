@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sekai_router::agent::AgentConfig;
+use sekai_router::agent::{AgentConfig, ContextPolicy};
 use sekai_router::config::LinkMode;
 use sekai_router::control::CommandRequest;
 use sekai_router::feishu::{self, FeishuOptions};
@@ -169,6 +169,7 @@ fn agent_config() -> AgentConfig {
         timeout_ms: Some(3_000),
         temperature: 0.0,
         max_tokens: 256,
+        context: ContextPolicy::default(),
     }
 }
 

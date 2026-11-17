@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use sekai_router::agent::AgentConfig;
+use sekai_router::agent::{AgentConfig, ContextPolicy};
 use sekai_router::control::CommandRequest;
 use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
 use sekai_router::llm::{ChatClient, ChatRequest, ChatResponse, LlmError, Usage};
@@ -121,6 +121,7 @@ fn session(chat: ScriptedChat) -> Session<ScriptedChat> {
         timeout_ms: Some(30_000),
         temperature: 0.0,
         max_tokens: 4_096,
+        context: ContextPolicy::default(),
     };
     Session::new(
         chat,
@@ -305,6 +306,7 @@ fn session_syncs_policy_and_gateway_into_prompt_hub() {
             timeout_ms: None,
             temperature: 0.0,
             max_tokens: 4_096,
+            context: ContextPolicy::default(),
         },
         TraceWriter::disabled(),
     ));

@@ -19,6 +19,7 @@
 //! | SEKAI_PROMPT_ADDR | - | prompt ingress 监听地址（HOST:PORT 或 off） |
 //! | SEKAI_FEISHU_* | - | 飞书入口配置（`--feishu`；见 docs/sekai-feishu.md §8） |
 //! | SEKAI_MAX_STEPS / SEKAI_DDL_MS / SEKAI_TIMEOUT_MS / SEKAI_WAIT_WORKER_MS / SEKAI_HTTP_TIMEOUT_MS | - | 调参（MAX_STEPS 缺省：直连 PC Worker 不设上限、MQTT 为 12） |
+//! | SEKAI_CONTEXT_RETAIN_STEPS / SEKAI_CONTEXT_BUDGET_BYTES | - | 上下文治理：保留工具结果轮数 / 估算字节预算 |
 
 use std::collections::HashMap;
 use std::fmt;
@@ -27,6 +28,7 @@ use std::path::PathBuf;
 use sekai::sekai_device_list::Endpoint;
 use sekai::sekai_wire::{MAX_DDL_MS, validate_worker_id};
 
+use crate::agent::{ContextPolicy, DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_CONTEXT_RETAIN_STEPS};
 use crate::topic::{DEFAULT_TOPIC_ROOT, TopicError, TopicRoot};
 
 /// 默认模型。
@@ -99,6 +101,16 @@ pub const ENV_TOPIC_ROOT: &str = "SEKAI_TOPIC_ROOT";
 pub const ENV_TRACE: &str = "SEKAI_ROUTER_TRACE";
 /// 环境变量名：最大步数。
 pub const ENV_MAX_STEPS: &str = "SEKAI_MAX_STEPS";
+/// 环境变量名：保留最近 N 轮工具结果原文（0 = 关闭滚动压缩）。
+pub const ENV_CONTEXT_RETAIN_STEPS: &str = "SEKAI_CONTEXT_RETAIN_STEPS";
+/// 环境变量名：上下文估算字节预算。
+pub const ENV_CONTEXT_BUDGET_BYTES: &str = "SEKAI_CONTEXT_BUDGET_BYTES";
+/// 上下文估算字节预算的取值下界（8 KiB）。
+pub const MIN_CONTEXT_BUDGET_BYTES: usize = 8 * 1024;
+/// 上下文估算字节预算的取值上界（1 MiB）。
+pub const MAX_CONTEXT_BUDGET_BYTES: usize = 1024 * 1024;
+/// 保留工具结果轮数的取值上界。
+pub const MAX_CONTEXT_RETAIN_STEPS: u64 = 16;
 /// 环境变量名：DDL。
 pub const ENV_DDL_MS: &str = "SEKAI_DDL_MS";
 /// 环境变量名：命令超时覆盖。
@@ -272,6 +284,10 @@ pub struct Config {
     /// 未给出时按链路区分——直连 PC Worker（stdio/tcp）为 `None`（不设上限），
     /// 非 PC Worker（MQTT/嵌入式）保留 [`DEFAULT_MAX_STEPS`]。
     pub max_steps: Option<u32>,
+    /// 保留最近 N 轮工具结果原文；更早的压缩为紧凑占位（`0` = 关闭）。
+    pub context_retain_steps: u32,
+    /// 上下文估算字节预算；超过即结束本轮（见 `agent::AgentStatus::ContextBudget`）。
+    pub context_budget_bytes: usize,
     /// 默认 DDL。
     pub ddl_ms: u32,
     /// 命令超时覆盖（毫秒）。
@@ -342,6 +358,8 @@ impl fmt::Debug for Config {
             .field("listen_addr", &self.listen_addr)
             .field("topic_root", &self.topic_root)
             .field("max_steps", &self.max_steps)
+            .field("context_retain_steps", &self.context_retain_steps)
+            .field("context_budget_bytes", &self.context_budget_bytes)
             .field("ddl_ms", &self.ddl_ms)
             .field("timeout_ms", &self.timeout_ms)
             .field("http_timeout_ms", &self.http_timeout_ms)
@@ -440,6 +458,29 @@ impl Config {
             }
             None => default_max_steps_for(link),
         };
+        let context_retain_steps = match env_u64(env, ENV_CONTEXT_RETAIN_STEPS)? {
+            Some(value) => {
+                if value > MAX_CONTEXT_RETAIN_STEPS {
+                    return Err(ConfigError::InvalidEnv {
+                        name: ENV_CONTEXT_RETAIN_STEPS,
+                        message: format!("必须在 0..={MAX_CONTEXT_RETAIN_STEPS}"),
+                    });
+                }
+                value as u32
+            }
+            None => DEFAULT_CONTEXT_RETAIN_STEPS,
+        };
+        let context_budget_bytes =
+            env_u64(env, ENV_CONTEXT_BUDGET_BYTES)?.unwrap_or(DEFAULT_CONTEXT_BUDGET_BYTES as u64);
+        if !(MIN_CONTEXT_BUDGET_BYTES as u64..=MAX_CONTEXT_BUDGET_BYTES as u64)
+            .contains(&context_budget_bytes)
+        {
+            return Err(ConfigError::InvalidEnv {
+                name: ENV_CONTEXT_BUDGET_BYTES,
+                message: format!("必须在 {MIN_CONTEXT_BUDGET_BYTES}..={MAX_CONTEXT_BUDGET_BYTES}"),
+            });
+        }
+        let context_budget_bytes = context_budget_bytes as usize;
         let ddl_ms = env_u64(env, ENV_DDL_MS)?.unwrap_or(u64::from(DEFAULT_DDL_MS));
         if ddl_ms > u64::from(MAX_DDL_MS) {
             return Err(ConfigError::InvalidEnv {
@@ -480,6 +521,8 @@ impl Config {
             listen_addr,
             topic_root,
             max_steps,
+            context_retain_steps,
+            context_budget_bytes,
             ddl_ms: ddl_ms as u32,
             timeout_ms,
             http_timeout_ms,
@@ -765,6 +808,14 @@ impl Config {
     pub fn goal_text(&self) -> &str {
         self.goal.as_deref().unwrap_or_default()
     }
+
+    /// 本次运行要用的上下文治理策略（各前端构造 `AgentConfig` 时复用）。
+    pub fn context_policy(&self) -> ContextPolicy {
+        ContextPolicy {
+            retain_steps: self.context_retain_steps,
+            budget_bytes: self.context_budget_bytes,
+        }
+    }
 }
 
 /// 飞书入口配置（`SEKAI_FEISHU_*`，docs/sekai-feishu.md §8）。
@@ -960,6 +1011,12 @@ pub fn usage() -> String {
                         _CONTEXT_TURNS 可选（docs/sekai-feishu.md §8）
   {ENV_MAX_STEPS}        agent 最大步数（1..=64）；缺省按链路：直连 PC Worker
                         （stdio/tcp）不设上限，MQTT/嵌入式保留 {DEFAULT_MAX_STEPS}
+  {ENV_CONTEXT_RETAIN_STEPS}
+                        保留最近 N 轮工具结果原文（0..=16；0 = 关闭滚动压缩），
+                        默认 {DEFAULT_CONTEXT_RETAIN_STEPS}
+  {ENV_CONTEXT_BUDGET_BYTES}
+                        上下文估算字节预算（{MIN_CONTEXT_BUDGET_BYTES}..={MAX_CONTEXT_BUDGET_BYTES}），
+                        超过即结束本轮并以 context_budget 状态返回，默认 {DEFAULT_CONTEXT_BUDGET_BYTES}
   {ENV_DDL_MS} / {ENV_TIMEOUT_MS} / {ENV_WAIT_WORKER_MS} / {ENV_HTTP_TIMEOUT_MS}
                         执行预算 / 命令超时 / 等待上线 / HTTP 超时
 
@@ -1005,7 +1062,7 @@ pub fn usage() -> String {
 交互会话（/link tcp 后，另一终端运行 sekai-worker connect <地址> 即可接入）：
   /help /link /workers /wait /policy /exit；非 / 开头输入即自然语言目标。
 
-退出码：0 成功；2 配置错误；3 Worker不可用；4 LLM/API 错误；5 达到最大步数；6 Worker命令最终失败。
+退出码：0 成功；2 配置错误；3 Worker不可用；4 LLM/API 错误；5 达到最大步数或上下文预算；6 Worker命令最终失败。
 "
     )
 }
@@ -1121,6 +1178,45 @@ mod tests {
         assert!(!config.allow_write);
         assert!(!config.dry_run);
         assert!(!config.interactive);
+    }
+
+    #[test]
+    fn context_policy_defaults_and_env_overrides() {
+        let config = Config::from_env_map(&env()).unwrap();
+        assert_eq!(config.context_policy(), ContextPolicy::default());
+        assert_eq!(config.context_retain_steps, DEFAULT_CONTEXT_RETAIN_STEPS);
+        assert_eq!(config.context_budget_bytes, DEFAULT_CONTEXT_BUDGET_BYTES);
+
+        let mut map = env();
+        map.insert(String::from(ENV_CONTEXT_RETAIN_STEPS), String::from("0"));
+        map.insert(
+            String::from(ENV_CONTEXT_BUDGET_BYTES),
+            String::from("32768"),
+        );
+        let config = Config::from_env_map(&map).unwrap();
+        assert_eq!(config.context_policy().retain_steps, 0);
+        assert_eq!(config.context_policy().budget_bytes, 32_768);
+    }
+
+    #[test]
+    fn context_env_values_are_validated() {
+        for (name, value) in [
+            (ENV_CONTEXT_RETAIN_STEPS, "17"),
+            (ENV_CONTEXT_RETAIN_STEPS, "x"),
+            (ENV_CONTEXT_BUDGET_BYTES, "1024"),
+            (ENV_CONTEXT_BUDGET_BYTES, "1048577"),
+            (ENV_CONTEXT_BUDGET_BYTES, "abc"),
+        ] {
+            let mut map = env();
+            map.insert(String::from(name), String::from(value));
+            assert!(
+                matches!(
+                    Config::from_env_map(&map).unwrap_err(),
+                    ConfigError::InvalidEnv { name: actual, .. } if actual == name
+                ),
+                "{name}={value} 必须被拒绝"
+            );
+        }
     }
 
     #[test]

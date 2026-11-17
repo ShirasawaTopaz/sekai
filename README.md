@@ -122,6 +122,9 @@ sekai> 帮我问一下 LLM：Rust 的 Deref 是什么   # → pc.ask（需 allow
 REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/workers`
 （观察注册表）、`/wait`（等 Worker 上线）、`/policy`（查看/调整策略）、`/exit`。
 非 `/` 开头的输入一律作为自然语言目标；同一会话可连续下发多个目标（不保留跨目标上下文）。
+单个目标内部会做上下文治理：只保留最近 `SEKAI_CONTEXT_RETAIN_STEPS` 轮工具结果
+原文、更早的压缩为摘要占位，累计估算字节超过 `SEKAI_CONTEXT_BUDGET_BYTES` 时以
+`context_budget` 状态停止（见 [docs/sekai-ai.md](docs/sekai-ai.md) §4）。
 
 ### 其他运行形态
 
@@ -157,6 +160,8 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | `SEKAI_WORKER_BIN` | stdio 链路拉起的 Worker 程序 | `sekai-worker` |
 | `SEKAI_TOPIC_ROOT` | MQTT 主题根 | `sekai/v1` |
 | `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` | agent 步数 / 执行预算 / 命令超时 / 等待上线（步数缺省：直连 PC Worker 不设上限，MQTT/嵌入式 `12`） | 见左 / 10000ms / — / 5000ms |
+| `SEKAI_CONTEXT_RETAIN_STEPS` | 保留最近 N 轮工具结果原文（`0..=16`；`0` = 关闭滚动压缩） | `4` |
+| `SEKAI_CONTEXT_BUDGET_BYTES` | 上下文估算字节预算（`8192..=1048576`）；超限以 `context_budget` 状态结束本轮 | `65536` |
 | `SEKAI_ROUTER_TRACE` | 脱敏 JSONL trace 路径 | 关闭 |
 
 完整清单见 `sekai-router --help`。

@@ -7,6 +7,16 @@
 
 ### 新增
 
+- **上下文治理（工具结果滚动压缩 + 上下文预算）**：agent 循环只保留最近
+  `SEKAI_CONTEXT_RETAIN_STEPS`（默认 4，`0` 关闭）轮工具结果原文，更早的 `tool`
+  消息替换为带成功/失败、命令名与 160 字符摘要头的紧凑占位（`{"compacted":true,...}`）；
+  只改内容、不删消息，调用/结果配对与 `reasoning_content` 不受影响。估算字节超过
+  `SEKAI_CONTEXT_BUDGET_BYTES`（默认 65536，`8192..=1048576`）时不再发起下一次 LLM
+  请求，以 `context_budget` 结束。`llm_request` trace 追加 `message_bytes`，新增
+  `context_prune` / `context_budget_exceeded` 事件。system prompt 的 GPIO 段只在在线
+  Worker 通告 `gpio.*` 时输出（纯 PC Worker 每步少约 1.5 KiB）。见
+  [docs/sekai-ai.md](docs/sekai-ai.md) §4.4 与
+  [crate/sekai-router/README.md](crate/sekai-router/README.md)「上下文治理」。
 - **插件页显示（DSH 插件管理界面）**：bundle 与两行插件各自带本地化标题/简介/图标——
   `locale/{en,zh}.json` 的 `meta.title`/`meta.description`/`meta.detail`、顶层
   `icon`（`icon.svg`）、详情文档 `docs/DETAIL.md` / `docs/DETAIL.zh.md`（各一张
@@ -74,6 +84,10 @@
 
 ### 变更
 
+- **`context_budget` 状态**：`AgentStatus` 新增 `ContextBudget`；serve/ingress 的
+  `prompt` 结果 `status` 增加 `context_budget`，飞书回复「（上下文预算用尽，已停止）」，
+  CLI `--json` 同名字段；退出码 5 的含义扩为「达到步数上限或上下文预算」。状态为
+  additive（旧消费方仍可只认 `completed`/`max_steps`）。
 - **agent 步数上限按 Worker 形态区分**：直连 PC Worker（`--link stdio/tcp`，含 DSH
   插件 `--serve --link tcp` 与飞书默认 tcp 形态）默认**不设上限**，只由模型完成、
   取消（REPL `/cancel`、TUI Ctrl-C、serve `cancel`、飞书 `/cancel`）或 LLM 错误

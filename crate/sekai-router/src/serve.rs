@@ -60,6 +60,7 @@ use sekai::sekai_device_list::{Device, DeviceList, Endpoint};
 use sekai::sekai_wire::validate_worker_id;
 
 use crate::agent::AgentConfig;
+use crate::agent::ContextPolicy;
 use crate::agent::retryable_gateway_code;
 use crate::config;
 use crate::control::{
@@ -135,6 +136,8 @@ pub struct ServeConfig {
     pub temperature: f64,
     /// 最大输出 token（prompt 方法用）。
     pub max_tokens: u32,
+    /// 上下文治理策略（`SEKAI_CONTEXT_*`；prompt 方法用）。
+    pub context: ContextPolicy,
     /// prompt ingress 监听地址（`--prompt-addr`；None = 不起 ingress，
     /// serve 的 `prompt` 方法仍可用）。
     pub prompt_addr: Option<String>,
@@ -163,6 +166,7 @@ impl ServeConfig {
             max_steps_auto: !config.max_steps_explicit(),
             temperature: 0.0,
             max_tokens: 4_096,
+            context: config.context_policy(),
             prompt_addr: config.prompt_addr.clone(),
             trace_path: config.trace_path.clone(),
         }
@@ -191,6 +195,7 @@ impl ServeConfig {
             max_steps_auto: false,
             temperature: 0.0,
             max_tokens: 4_096,
+            context: ContextPolicy::default(),
             prompt_addr: None,
             trace_path: None,
         }
@@ -1668,6 +1673,7 @@ fn build_prompt_hub(config: &ServeConfig, policy: Policy) -> Arc<PromptCore<LlmC
         timeout_ms: config.tool_timeout_ms,
         temperature: config.temperature,
         max_tokens: config.max_tokens,
+        context: config.context,
     };
     let trace = match TraceWriter::new(config.trace_path.as_deref()) {
         Ok(trace) => trace,

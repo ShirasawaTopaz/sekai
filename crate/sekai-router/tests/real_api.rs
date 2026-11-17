@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use sekai_gpio::pin::PinId;
 use sekai_gpio::{ChipFamily, Level, Port};
-use sekai_router::agent::{Agent, AgentConfig, AgentOutcome, AgentStatus};
+use sekai_router::agent::{Agent, AgentConfig, AgentOutcome, AgentStatus, ContextPolicy};
 use sekai_router::control::{CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
 use sekai_router::http::StdHttpClient;
@@ -273,6 +273,7 @@ fn run_agent(
         timeout_ms: Some(30_000),
         temperature: 0.0,
         max_tokens: 4_096,
+        context: ContextPolicy::default(),
     };
     let mut agent = Agent::new(
         chat,

@@ -229,6 +229,7 @@ ack 后丢弃。
 | --- | --- |
 | `Ok{status: Completed, answer}` | `answer`（无 final_text 时回「（无输出）」） |
 | `Ok{status: MaxSteps, answer?}` | `（已达最大步数 n）` + answer（如有） |
+| `Ok{status: ContextBudget, answer?}` | `（上下文预算用尽，已停止）` + answer（如有） |
 | `Err llm_unavailable` | `LLM 未配置：需要 DEEPSEEK_API_KEY` |
 | `Err not_linked` | `Worker 链路未建立` |
 | `Err no_workers` | `暂无 Worker 在线，请稍后再试` |
@@ -284,6 +285,9 @@ V1 帧协议）。
 - **仅内存**：WebSocket 重连不丢；进程重启清空；不落盘；不写 stderr 审计、
   不写 trace（trace 只记录上下文轮数）。
 - `SEKAI_FEISHU_CONTEXT_TURNS=0` 关闭历史（元数据仍注入）。
+- 每次运行内部还有工具结果滚动压缩与上下文预算（Router 全局
+  `SEKAI_CONTEXT_RETAIN_STEPS` / `SEKAI_CONTEXT_BUDGET_BYTES`）：长任务只保留最近
+  几轮工具结果原文，估算字节超预算时回「上下文预算用尽」；多轮历史本身不受影响。
 
 ## 6. 安全模型
 
@@ -335,7 +339,7 @@ V1 帧协议）。
 
 ```text
 sekai-router: feishu chat=<chat_id> sender=<open_id> cmd=<cancel|status|-> \
-len=<prompt 字节数> outcome=<ok|max_steps|error:<code>|busy|denied|rate_limited|\
+len=<prompt 字节数> outcome=<ok|max_steps|context_budget|error:<code>|busy|denied|rate_limited|\
 non_text|empty|too_long|reply_failed> ms=<处理毫秒>
 ```
 

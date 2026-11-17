@@ -12,7 +12,8 @@ use sekai::sekai_stdout::Phase;
 use sekai::sekai_wire::ErrorCode;
 
 use sekai_router::agent::{
-    Agent, AgentConfig, AgentError, AgentStatus, CancelToken, ConversationContext, ConversationTurn,
+    Agent, AgentConfig, AgentError, AgentStatus, CancelToken, ContextPolicy, ConversationContext,
+    ConversationTurn,
 };
 use sekai_router::control::{CommandFailure, CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, WorkerGateway};
@@ -135,6 +136,7 @@ fn agent_config(max_steps: u32) -> AgentConfig {
         timeout_ms: Some(30_000),
         temperature: 0.0,
         max_tokens: 4_096,
+        context: ContextPolicy::default(),
     }
 }
 
@@ -523,6 +525,124 @@ fn unlimited_max_steps_runs_past_the_old_default_cap() {
     assert_eq!(outcome.final_text.as_deref(), Some("列完了。"));
     assert_eq!(outcome.tool_calls.len(), TOOL_STEPS);
     assert_eq!(requests.lock().unwrap().len(), TOOL_STEPS + 1);
+}
+
+#[test]
+fn long_run_compacts_old_tool_results() {
+    // 12 步、每步 1500 字节工具结果：只保留最近 4 轮原文，更早的换成占位。
+    const TOOL_STEPS: usize = 12;
+    let requests = new_requests();
+    let calls = new_calls();
+    let payload = "x".repeat(1_500);
+    let mut scripted: Vec<Result<ChatResponse, LlmError>> = (0..TOOL_STEPS)
+        .map(|index| {
+            Ok(tool_response(
+                vec![tool_call(
+                    &format!("call_{index}"),
+                    "worker_tool",
+                    r#"{"worker_id":"pc-worker","tool":"gpio.info","args":""}"#,
+                )],
+                usage(1, 1, 2),
+            ))
+        })
+        .collect();
+    scripted.push(Ok(text_response("列完了。", usage(1, 1, 2))));
+    let responses: Vec<Result<CommandResult, GatewayError>> = (0..TOOL_STEPS)
+        .map(|_| {
+            Ok(ok_result(
+                "pc-worker",
+                CommandKind::Tool,
+                "gpio.info",
+                payload.as_bytes(),
+            ))
+        })
+        .collect();
+    let chat = ScriptedChat::new(scripted, requests.clone());
+    let gateway = FakeGateway::new(vec![worker("pc-worker", true)], responses, calls);
+    let mut config = agent_config(1);
+    config.max_steps = None;
+    config.context = ContextPolicy {
+        retain_steps: 4,
+        budget_bytes: 64 * 1024,
+    };
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        config,
+        TraceWriter::disabled(),
+    );
+    let outcome = agent.run("反复读同一引脚").unwrap();
+    assert_eq!(outcome.status, AgentStatus::Completed);
+    assert_eq!(outcome.steps, TOOL_STEPS + 1);
+
+    let requests = requests.lock().unwrap();
+    let last = requests.last().expect("至少一次请求");
+    let tool_messages: Vec<&Message> = last
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .collect();
+    assert_eq!(tool_messages.len(), TOOL_STEPS, "tool 消息不得删除");
+    let compacted = tool_messages
+        .iter()
+        .filter(|message| {
+            message
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("{\"compacted\":true")
+        })
+        .count();
+    assert_eq!(compacted, TOOL_STEPS - 4, "应只保留最近 4 轮原文");
+    // 配对完整：每个 tool_calls 都有同 id 的 tool 消息。
+    for message in last.messages.iter().filter(|m| !m.tool_calls.is_empty()) {
+        let expected = message.tool_calls[0].id.as_str();
+        assert!(
+            last.messages.iter().any(|candidate| {
+                candidate.role == Role::Tool && candidate.tool_call_id.as_deref() == Some(expected)
+            }),
+            "缺少 {expected} 的 tool 结果"
+        );
+    }
+    // 未压缩时约 24 KiB（12×1500 + system + 参数），压缩后应明显更小。
+    let bytes: usize = last
+        .messages
+        .iter()
+        .map(|message| message.content.as_deref().map_or(0, str::len))
+        .sum();
+    assert!(bytes < 18 * 1024, "最终请求内容估算 {bytes} 字节");
+}
+
+#[test]
+fn context_budget_stops_before_llm_call() {
+    let requests = new_requests();
+    let calls = new_calls();
+    let chat = ScriptedChat::new(Vec::new(), requests.clone());
+    let gateway = FakeGateway::new(vec![worker("host-gpio", true)], Vec::new(), calls);
+    let mut config = agent_config(4);
+    // 预算小于 system prompt：首轮即停，不发起任何 LLM 请求。
+    config.context = ContextPolicy {
+        retain_steps: 4,
+        budget_bytes: 1_024,
+    };
+    let mut agent = Agent::new(
+        chat,
+        gateway,
+        Policy::default(),
+        config,
+        TraceWriter::disabled(),
+    );
+    let outcome = agent.run("看看Worker").unwrap();
+    assert_eq!(outcome.status, AgentStatus::ContextBudget);
+    assert_eq!(outcome.steps, 0);
+    assert!(outcome.final_text.is_none());
+    assert_eq!(outcome.usage, Usage::default());
+    assert!(outcome.tool_calls.is_empty());
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "预算耗尽时不得发起 LLM 请求"
+    );
 }
 
 #[test]

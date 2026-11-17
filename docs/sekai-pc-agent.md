@@ -203,6 +203,12 @@ agent 步数上限。
 > 未传 `params.max_steps` 时用 Router 的全局步数设置：**直连 PC Worker（stdio/tcp）
 > 默认不设上限**（只由模型完成 / 取消 / LLM 错误终止），非 PC Worker（MQTT/嵌入式）
 > 默认 12；`SEKAI_MAX_STEPS` / `--max-steps`（1..=64）可显式收敛两类链路。
+>
+> 不设上限时，Router 仍有两道上下文护栏（对 prompt 通道、serve `prompt`、REPL、
+> 批处理、飞书一致）：只保留最近 `SEKAI_CONTEXT_RETAIN_STEPS`（默认 4）轮工具结果
+> 原文、更早的压缩为摘要占位；估算字节超过 `SEKAI_CONTEXT_BUDGET_BYTES`
+> （默认 65536）时以 `context_budget` 状态提前结束。详见
+> [docs/sekai-ai.md](sekai-ai.md) §4.4 与 [crate/sekai-router/README.md](../crate/sekai-router/README.md)。
 
 > **注意**：8192 字节是 ingress / HTTP 类客户端的协议上限。经 Worker `pc.ask` 发出的
 > prompt 会作为 V1 Task 载荷传输，受 `MAX_PAYLOAD = 4096` 字节限制（见
@@ -214,8 +220,8 @@ agent 步数上限。
 {"id":42,"ok":true,"result":{"answer":"...","status":"completed","steps":3,"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}
 ```
 
-`status` ∈ `completed` | `max_steps`；`steps` 为该次评估的 agent 步数；
-`usage` 为 token 用量计数。
+`status` ∈ `completed` | `max_steps` | `context_budget`；`steps` 为该次评估的
+agent 步数；`usage` 为 token 用量计数（`context_budget` 时可能为 0，且 `answer` 可为空串）。
 
 - 失败响应：
 

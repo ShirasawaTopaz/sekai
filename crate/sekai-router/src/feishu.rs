@@ -1784,6 +1784,13 @@ fn reply_for(result: Result<PromptRunResult, PromptRunError>) -> (String, String
                     text.push_str(&result.answer);
                 }
                 (text, String::from("max_steps"))
+            } else if result.status == "context_budget" {
+                let mut text = String::from("（上下文预算用尽，已停止）");
+                if !result.answer.trim().is_empty() {
+                    text.push_str("\n\n");
+                    text.push_str(&result.answer);
+                }
+                (text, String::from("context_budget"))
             } else {
                 let answer = if result.answer.trim().is_empty() {
                     String::from("（无输出）")
@@ -2224,6 +2231,17 @@ mod tests {
         let (text, outcome) = reply_for(Ok(max));
         assert_eq!(outcome, "max_steps");
         assert!(text.contains("已达最大步数 8"), "{text}");
+        assert!(text.contains("部分结果"), "{text}");
+
+        let budget = PromptRunResult {
+            answer: String::from("部分结果"),
+            status: "context_budget",
+            steps: 5,
+            usage: crate::llm::Usage::default(),
+        };
+        let (text, outcome) = reply_for(Ok(budget));
+        assert_eq!(outcome, "context_budget");
+        assert!(text.contains("上下文预算用尽"), "{text}");
         assert!(text.contains("部分结果"), "{text}");
 
         let busy = PromptRunError::new(CODE_BUSY, "已有 4 个 prompt 在运行");

@@ -1243,6 +1243,11 @@ fn render_outcome(outcome: &AgentOutcome) -> Vec<SessionMessage> {
             outcome.steps
         )));
     }
+    if outcome.status == AgentStatus::ContextBudget {
+        lines.push(SessionMessage::Line(String::from(
+            "（达到上下文预算，已停止；可调大 SEKAI_CONTEXT_BUDGET_BYTES，或置 SEKAI_CONTEXT_RETAIN_STEPS=0 关闭压缩）",
+        )));
+    }
     lines.push(SessionMessage::Line(format!(
         "〔步数={} 工具调用={} tokens={}〕",
         outcome.steps,
@@ -1266,6 +1271,7 @@ fn render_agent_error(error: &AgentError) -> Vec<SessionMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ContextPolicy;
     use crate::control::CommandRequest;
     use crate::gateway::{CommandReceipt, GatewayError};
     use crate::llm::{ChatRequest, ChatResponse, LlmError};
@@ -1349,6 +1355,7 @@ mod tests {
                 timeout_ms: None,
                 temperature: 0.0,
                 max_tokens: 16,
+                context: ContextPolicy::default(),
             },
             TraceWriter::disabled(),
             test_config(),
@@ -1738,6 +1745,7 @@ mod tests {
                 timeout_ms: None,
                 temperature: 0.0,
                 max_tokens: 16,
+                context: ContextPolicy::default(),
             },
             TraceWriter::disabled(),
         ));

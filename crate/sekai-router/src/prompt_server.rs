@@ -12,8 +12,8 @@
 //!
 //! - 请求：`{"id":<int>,"method":"prompt","params":{"text":"..","max_steps"?:1..=32}}`
 //! - 成功：`{"id":..,"ok":true,"result":{"answer":"..","status":"completed"|
-//!   "max_steps","steps":<int>,"usage":{"prompt_tokens":n,"completion_tokens":n,
-//!   "total_tokens":n}}}`
+//!   "max_steps"|"context_budget","steps":<int>,"usage":{"prompt_tokens":n,
+//!   "completion_tokens":n,"total_tokens":n}}}`
 //! - 失败：`{"id":..,"ok":false,"error":{"code":"..","message":".."}}`，错误码：
 //!   `llm_unavailable`（无 API key/LLM 配置）、`not_linked`（无链路网关）、
 //!   `no_workers`（无已发现 Worker）、`invalid_arguments`（text 空/超
@@ -327,6 +327,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
                 status: match outcome.status {
                     AgentStatus::Completed => "completed",
                     AgentStatus::MaxSteps => "max_steps",
+                    AgentStatus::ContextBudget => "context_budget",
                 },
                 steps: outcome.steps,
                 usage: outcome.usage,
@@ -543,9 +544,9 @@ impl Drop for ConnGuard {
 /// prompt 成功执行结果（result 对象的四字段来源）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptRunResult {
-    /// 最终回答（max_steps 时可为空串）。
+    /// 最终回答（max_steps / context_budget 时可为空串）。
     pub answer: String,
-    /// `"completed"` / `"max_steps"`。
+    /// `"completed"` / `"max_steps"` / `"context_budget"`。
     pub status: &'static str,
     /// Agent 步数（LLM 调用次数）。
     pub steps: usize,
@@ -1090,6 +1091,7 @@ fn write_line<W: Write>(writer: &mut W, value: &Json) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ContextPolicy;
     use crate::control::{CommandRequest, CommandResult};
     use crate::gateway::GatewayError;
     use crate::llm::{ChatRequest, ChatResponse, LlmError, ToolCall};
@@ -1239,6 +1241,7 @@ mod tests {
             timeout_ms: None,
             temperature: 0.0,
             max_tokens: 4_096,
+            context: ContextPolicy::default(),
         }
     }
 
@@ -1280,6 +1283,33 @@ mod tests {
             json.get_path(&["usage", "total_tokens"])
                 .and_then(Json::as_u64),
             Some(15)
+        );
+    }
+
+    #[test]
+    fn run_prompt_reports_context_budget() {
+        // 预算小于 system prompt（约 3–4 KiB）：首轮即停，不发起 LLM 请求。
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut config = agent_config();
+        config.context = ContextPolicy {
+            retain_steps: 4,
+            budget_bytes: 1_024,
+        };
+        let core = PromptCore::new(
+            ScriptedChat::responses(Vec::new()),
+            Policy::default(),
+            config,
+            TraceWriter::disabled(),
+        );
+        core.set_gateway(Some(gateway_handle(vec![worker("pc-1")], calls)));
+        let result = core.run_prompt("看看状态", None).expect("预算停止不是错误");
+        assert_eq!(result.status, "context_budget");
+        assert_eq!(result.steps, 0);
+        assert!(result.answer.is_empty());
+        assert_eq!(result.usage.total_tokens, 0);
+        assert_eq!(
+            result.to_result_json().get("status").and_then(Json::as_str),
+            Some("context_budget")
         );
     }
 

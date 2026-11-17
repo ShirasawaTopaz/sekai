@@ -429,6 +429,11 @@ return MaxSteps（不伪造成功）
 - `max_steps` 缺省按链路：**直连 PC Worker（stdio/tcp）不设上限**（只由模型完成 / 取消 /
   LLM 错误终止）；**非 PC Worker（MQTT/嵌入式）默认 12**。显式 `--max-steps`/环境变量
   （1..=64）对两类链路都生效；达到上限时返回 `MaxSteps`，CLI 退出码 5。
+- （现状补充）单个目标内部有上下文治理：只保留最近 `SEKAI_CONTEXT_RETAIN_STEPS`
+  （默认 4）轮工具结果原文，更早的 `tool` 消息替换为带摘要头的紧凑占位（不删消息、
+  调用/结果配对不变、`reasoning_content` 不动）；估算字节超过
+  `SEKAI_CONTEXT_BUDGET_BYTES`（默认 65536）时返回 `ContextBudget`，CLI 退出码 5。
+  实现与入口文档见 [crate/sekai-router/README.md](../crate/sekai-router/README.md)。
 - `AgentOutcome`：`status`（`Completed`/`MaxSteps`）、`final_text`、`steps`（LLM 调用次数）、
   `usage`（累加）、`tool_calls` 摘要、`had_device_failure`/`last_tool_failed`。
 
@@ -455,9 +460,11 @@ return MaxSteps（不伪造成功）
   追加写（`create + append`），字段顺序稳定。
 - 写入失败只打印 warning，不影响 agent 主流程；父目录不存在等打开失败由 CLI 报错（退出码 2）。
 - 事件名（`event` 字段）：CLI 写 `devices_discovered`；agent 写 `agent_start`（设备数/goal 长度/策略摘要）、
-  `llm_request`（step/model/消息数/工具数）、`usage`（本步与累计 token）、`llm_response`（model/content 长度/
+  `llm_request`（step/model/消息数/工具数/`message_bytes`）、`usage`（本步与累计 token）、`llm_response`（model/content 长度/
   tool_call 数/finish_reason）、`tool_call`（函数名/参数摘要）、`tool_result`（ok/结果摘要/error_code）、
-  `llm_error`、`empty_response`、`completed`、`max_steps`。
+  `llm_error`、`empty_response`、`completed`、`max_steps`，以及上下文治理事件
+  `context_prune`（retained_steps/pruned/bytes_before/bytes_after）与
+  `context_budget_exceeded`（message_bytes/budget_bytes）。
   trace 中工具参数最多展示 2048 字节、结果最多 4096 字节，均为摘要而非完整请求体；
   trace 不记录 Authorization、API key、MQTT 密码或请求头。
 
@@ -507,6 +514,8 @@ sekai-agent --dry-run [选项]
 | `SEKAI_TOPIC_ROOT` | `sekai/v1` | 主题根（允许命名空间）。 |
 | `SEKAI_AI_TRACE` | 空 | trace 路径；`--trace` 优先。 |
 | `SEKAI_MAX_STEPS` | 见说明 | 1..=64；缺省按链路：直连 PC Worker 不设上限，MQTT/嵌入式 `12`。 |
+| `SEKAI_CONTEXT_RETAIN_STEPS` | `4` | `0..=16`；保留最近 N 轮工具结果原文，`0` 关闭滚动压缩。 |
+| `SEKAI_CONTEXT_BUDGET_BYTES` | `65536` | `8192..=1048576`；上下文估算字节预算，超限以 `context_budget` 结束本轮。 |
 | `SEKAI_DDL_MS` | `1000` | ≤ 300000。 |
 | `SEKAI_TIMEOUT_MS` | 空 | 命令超时覆盖。 |
 | `SEKAI_WAIT_DEVICE_MS` | `5000` | 等待设备时间。 |
@@ -525,7 +534,7 @@ sekai-agent --dry-run [选项]
 | 2 | 配置错误（缺 key/地址、非法参数、goal 缺失/冲突、trace 打不开）。 |
 | 3 | 设备不可用（broker 连接失败、MQTT 未就绪、未发现设备、`--device` 不匹配）。 |
 | 4 | LLM/API 错误（没有 HTTPS helper、认证/限流耗尽、响应非法、空响应）。 |
-| 5 | 达到最大步数（`MaxSteps`）。 |
+| 5 | 达到最大步数或上下文预算（`MaxSteps` / `ContextBudget`）。 |
 | 6 | 设备命令最终失败（agent 以网关错误终止时；设备 `Failed` 通常作为 tool 结果回填）。 |
 
 ### 5.4 输出
@@ -533,7 +542,7 @@ sekai-agent --dry-run [选项]
 - 默认：最终自然语言回答写到 **stdout**；连接/策略/进度/token 统计写到 **stderr**。
 - `--json`：stdout 只输出一个 JSON 对象：
   - `--dry-run`：`{"ok":true,"dry_run":true,"devices":{"count":...,"devices":[...]}}`；
-  - 正常结束：`{"ok":bool,"status":"completed"|"max_steps","answer":...,"steps":N,"usage":{"prompt_tokens":...,"completion_tokens":...,"total_tokens":...},"tool_calls":[...]}`。
+  - 正常结束：`{"ok":bool,"status":"completed"|"max_steps"|"context_budget","answer":...,"steps":N,"usage":{"prompt_tokens":...,"completion_tokens":...,"total_tokens":...},"tool_calls":[...]}`。
 - `--trace`：JSONL 脱敏轨迹（§4.6）。
 - 凭据绝不进入 stdout/stderr/trace；`Config`/`LlmConfig` 的 `Debug` 输出脱敏。
 
@@ -916,8 +925,9 @@ bash .build/check-lib.sh
 - 2：配置问题（参数/环境变量/trace 路径）。
 - 3：设备侧不可用（broker、订阅、设备发现、`--device`）。
 - 4：AI/API 侧（helper、鉴权、限流、响应非法）。
-- 5：步数用尽（仅在显式 `--max-steps`/`SEKAI_MAX_STEPS` 或非 PC Worker 的默认 12
-  下出现；直连 PC Worker 默认不设上限，因此不会因步数退出）。
+- 5：步数用尽或上下文预算耗尽（显式 `--max-steps`/`SEKAI_MAX_STEPS`、非 PC Worker 的
+  默认 12，或 `SEKAI_CONTEXT_BUDGET_BYTES` 触发；直连 PC Worker 默认不设步数上限，
+  因此只会因预算退出）。
 - 6：最终设备命令失败（设备返回 `Failed` 或控制端超时，且 agent 循环在失败调用后结束），
   或网关级错误（链路在命令期间断开等）。若模型在失败后继续查询并解释了原因，按退出码 0 处理。
 

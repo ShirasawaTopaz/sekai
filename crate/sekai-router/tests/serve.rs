@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use sekai::sekai_device_list::DeviceList;
-use sekai_router::agent::AgentConfig;
+use sekai_router::agent::{AgentConfig, ContextPolicy};
 use sekai_router::config::DEFAULT_MAX_STEPS;
 use sekai_router::control::{CommandKind, CommandRequest, CommandResult};
 use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
@@ -874,6 +874,7 @@ fn prompt_hub_with_chat_body(body: &str) -> Arc<PromptCore<LlmClient>> {
             timeout_ms: None,
             temperature: 0.0,
             max_tokens: 4_096,
+            context: ContextPolicy::default(),
         },
         TraceWriter::disabled(),
     ))

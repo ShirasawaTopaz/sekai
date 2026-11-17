@@ -283,7 +283,7 @@ fn report_outcome(config: &Config, outcome: &AgentOutcome) -> i32 {
         });
         let payload = ok_json(sekai_router::json!({
             "ok": outcome.status == AgentStatus::Completed,
-            "status": if outcome.status == AgentStatus::Completed { "completed" } else { "max_steps" },
+            "status": status_name(outcome.status),
             "answer": optional_string(outcome.final_text.clone()),
             "steps": outcome.steps as u64,
             "usage": usage,
@@ -315,6 +315,17 @@ fn report_outcome(config: &Config, outcome: &AgentOutcome) -> i32 {
             }
         }
         AgentStatus::MaxSteps => 5,
+        // 上下文预算与步数上限同属「未完成但非错误」，沿用退出码 5。
+        AgentStatus::ContextBudget => 5,
+    }
+}
+
+/// `--json` 的 status 字符串（与 serve/prompt ingress 的取值一致）。
+fn status_name(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Completed => "completed",
+        AgentStatus::MaxSteps => "max_steps",
+        AgentStatus::ContextBudget => "context_budget",
     }
 }
 
@@ -358,6 +369,7 @@ fn build_agent_config(config: &Config) -> AgentConfig {
         timeout_ms: config.timeout_ms,
         temperature: 0.0,
         max_tokens: 4_096,
+        context: config.context_policy(),
     }
 }
 

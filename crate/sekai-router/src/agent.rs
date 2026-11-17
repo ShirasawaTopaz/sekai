@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::control::{CommandKind, CommandRequest};
 use crate::gateway::{GatewayError, WorkerGateway};
 use crate::json::Json;
-use crate::llm::{ChatClient, ChatRequest, LlmError, Message, ToolCall, ToolChoice, Usage};
+use crate::llm::{ChatClient, ChatRequest, LlmError, Message, Role, ToolCall, ToolChoice, Usage};
 use crate::tools::{self, ParsedCall, Policy};
 use crate::trace::TraceWriter;
 
@@ -95,6 +95,39 @@ pub struct ConversationContext {
     pub turns: Vec<ConversationTurn>,
 }
 
+/// 默认保留最近 N 轮工具结果原文（更早的压缩为占位）。
+pub const DEFAULT_CONTEXT_RETAIN_STEPS: u32 = 4;
+/// 默认上下文估算字节预算（64 KiB）。
+pub const DEFAULT_CONTEXT_BUDGET_BYTES: usize = 64 * 1024;
+/// 压缩占位保留的原文头部字符数（按 UTF-8 字符边界截取）。
+pub const COMPACTED_TOOL_HEAD_CHARS: usize = 160;
+/// 压缩占位的识别前缀（幂等判断，与 [`compacted_tool_result`] 的键序一致）。
+const COMPACTED_TOOL_PREFIX: &str = "{\"compacted\":true";
+/// 每条消息的角色/结构开销估算（字节；仅用于预算启发式）。
+const MESSAGE_FRAMING_BYTES: usize = 16;
+
+/// 单轮 agent 运行的上下文治理策略。
+///
+/// 只影响送给模型的 `messages`：不改策略、不改工具权限，也不写审计。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPolicy {
+    /// 保留最近 N 轮工具结果原文；更早的替换为带摘要头的紧凑占位。
+    ///
+    /// `0` = 关闭滚动压缩（行为与旧版一致，只保留预算护栏）。
+    pub retain_steps: u32,
+    /// 上下文估算字节预算；超过即结束本轮，不再发起下一次 LLM 请求。
+    pub budget_bytes: usize,
+}
+
+impl Default for ContextPolicy {
+    fn default() -> Self {
+        Self {
+            retain_steps: DEFAULT_CONTEXT_RETAIN_STEPS,
+            budget_bytes: DEFAULT_CONTEXT_BUDGET_BYTES,
+        }
+    }
+}
+
 /// agent 运行配置。
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -115,6 +148,8 @@ pub struct AgentConfig {
     pub temperature: f64,
     /// 最大输出 token。
     pub max_tokens: u32,
+    /// 上下文治理策略（旧工具结果压缩 + 估算字节预算）。
+    pub context: ContextPolicy,
 }
 
 /// agent 终止状态。
@@ -124,6 +159,8 @@ pub enum AgentStatus {
     Completed,
     /// 达到最大步数。
     MaxSteps,
+    /// 上下文估算字节超过预算，主动停止。
+    ContextBudget,
 }
 
 /// 一次工具调用记录（trace/CLI 摘要用）。
@@ -299,6 +336,28 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             {
                 break;
             }
+            // 预算护栏：估算字节超限就不再发起下一次请求。取消优先于预算，
+            // 步数上限优先于预算（先判上限，避免把「该收尾」误报成预算）。
+            let message_bytes = messages_bytes(&messages);
+            if message_bytes > self.config.context.budget_bytes {
+                self.trace.event(
+                    "context_budget_exceeded",
+                    vec![
+                        ("step", Json::num(i64::from(step_index))),
+                        ("message_bytes", Json::from(message_bytes)),
+                        ("budget_bytes", Json::from(self.config.context.budget_bytes)),
+                    ],
+                );
+                return Ok(AgentOutcome {
+                    status: AgentStatus::ContextBudget,
+                    final_text: None,
+                    steps,
+                    usage,
+                    tool_calls: records,
+                    had_worker_failure,
+                    last_tool_failed,
+                });
+            }
             steps = step_index as usize + 1;
             let request = ChatRequest {
                 model: self.config.model.clone(),
@@ -316,6 +375,7 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                     ("model", Json::string(request.model.as_str())),
                     ("message_count", Json::from(messages.len())),
                     ("tool_count", Json::from(tools.len())),
+                    ("message_bytes", Json::from(message_bytes)),
                 ],
             );
             let response = match self.chat.chat(&request) {
@@ -423,6 +483,26 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
                     // 取消后不再进入下一轮 LLM，避免模型继续派工。
                     return Err(cancelled_error());
                 }
+            }
+            // 旧工具结果滚动压缩：只保留最近 N 轮原文，更早的换成紧凑占位。
+            // 发生在下一次请求之前，因此请求体不会随步数无限增长。
+            let bytes_before = messages_bytes(&messages);
+            let pruned =
+                prune_tool_results(&mut messages, &records, self.config.context.retain_steps);
+            if pruned > 0 {
+                self.trace.event(
+                    "context_prune",
+                    vec![
+                        ("step", Json::num(i64::from(step_index))),
+                        (
+                            "retained_steps",
+                            Json::from(self.config.context.retain_steps),
+                        ),
+                        ("pruned", Json::from(pruned)),
+                        ("bytes_before", Json::from(bytes_before)),
+                        ("bytes_after", Json::from(messages_bytes(&messages))),
+                    ],
+                );
             }
             step_index += 1;
         }
@@ -734,4 +814,307 @@ fn truncate_for_trace(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…(truncated)", &text[..end])
+}
+
+// ---------------------------------------------------------------------------
+// 上下文治理：估算、滚动压缩
+// ---------------------------------------------------------------------------
+
+/// 单条消息的估算字节数（含角色/结构开销；不是 token 精确计量）。
+fn message_bytes(message: &Message) -> usize {
+    let mut total = MESSAGE_FRAMING_BYTES;
+    total += message.content.as_deref().map_or(0, str::len);
+    total += message.reasoning_content.as_deref().map_or(0, str::len);
+    total += message.tool_call_id.as_deref().map_or(0, str::len);
+    for call in &message.tool_calls {
+        total += call.id.len() + call.name.len() + call.arguments.len();
+    }
+    total
+}
+
+/// 整段 messages 的估算字节数。
+fn messages_bytes(messages: &[Message]) -> usize {
+    messages.iter().map(message_bytes).sum()
+}
+
+/// 把超出保留窗口的工具结果替换为紧凑占位；返回被压缩的消息条数。
+///
+/// 只改 `tool` 消息的 `content`，保留 assistant 的 `tool_calls` 与 tool 消息
+/// 本身，因此工具调用/结果配对始终成立；`reasoning_content` 一律不动。
+/// 已压缩的消息按占位前缀识别并跳过，因此可重复调用（幂等）。
+fn prune_tool_results(
+    messages: &mut [Message],
+    records: &[ToolCallRecord],
+    retain_steps: u32,
+) -> usize {
+    if retain_steps == 0 {
+        return 0;
+    }
+    let exchanges = messages
+        .iter()
+        .filter(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+        .count();
+    let retain = retain_steps as usize;
+    if exchanges <= retain {
+        return 0;
+    }
+    let cutoff = exchanges - retain;
+    let mut exchange_index = 0usize;
+    let mut tool_index = 0usize;
+    let mut pruned = 0usize;
+    for message in messages.iter_mut() {
+        if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+            exchange_index += 1;
+            continue;
+        }
+        if message.role != Role::Tool {
+            continue;
+        }
+        let already_compacted = message
+            .content
+            .as_deref()
+            .is_some_and(|content| content.starts_with(COMPACTED_TOOL_PREFIX));
+        if exchange_index > 0
+            && exchange_index <= cutoff
+            && !already_compacted
+            && let Some(record) = records.get(tool_index)
+        {
+            let original = message.content.as_deref().unwrap_or_default();
+            let compacted = compacted_tool_result(record, original);
+            // 占位有固定开销：只有真的变小才替换，避免把小的 list_workers
+            // 结果「压缩」成更大的文本。
+            if compacted.len() < original.len() {
+                message.content = Some(compacted);
+                pruned += 1;
+            }
+        }
+        tool_index += 1;
+    }
+    pruned
+}
+
+/// 构造一条工具结果的压缩占位（紧凑 JSON）。
+///
+/// 保留成功/失败、函数名、Worker、命令名与错误码，外加原文头部
+/// [`COMPACTED_TOOL_HEAD_CHARS`] 个字符，便于模型判断是否需要重查。
+fn compacted_tool_result(record: &ToolCallRecord, original: &str) -> String {
+    let mut value = Json::object(Vec::new());
+    value.set("compacted", Json::Bool(true));
+    value.set("ok", Json::Bool(record.ok));
+    value.set("function", Json::string(record.function.as_str()));
+    value.set(
+        "worker_id",
+        match &record.worker_id {
+            Some(worker_id) => Json::string(worker_id.as_str()),
+            None => Json::Null,
+        },
+    );
+    value.set(
+        "name",
+        match &record.name {
+            Some(name) => Json::string(name.as_str()),
+            None => Json::Null,
+        },
+    );
+    value.set(
+        "error_code",
+        match &record.error_code {
+            Some(code) => Json::string(code.as_str()),
+            None => Json::Null,
+        },
+    );
+    value.set(
+        "head",
+        Json::string(head_chars(original, COMPACTED_TOOL_HEAD_CHARS)),
+    );
+    value.set("note", Json::string("旧工具结果已压缩；需要细节请重新调用"));
+    value.to_compact_string()
+}
+
+/// 按 UTF-8 字符边界取前 `max_chars` 个字符。
+fn head_chars(text: &str, max_chars: usize) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => String::from(&text[..end]),
+        None => String::from(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(ok: bool, name: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            function: String::from(tools::FN_WORKER_TOOL),
+            worker_id: Some(String::from("pc-worker")),
+            name: Some(String::from(name)),
+            ok,
+            error_code: if ok {
+                None
+            } else {
+                Some(String::from("timeout"))
+            },
+        }
+    }
+
+    /// 6 轮工具调用：每轮 assistant(tool_calls) + tool 结果。
+    fn six_exchanges() -> (Vec<Message>, Vec<ToolCallRecord>) {
+        let mut messages = vec![Message::system("sys"), Message::user("goal")];
+        let mut records = Vec::new();
+        for index in 0..6 {
+            let id = format!("call_{index}");
+            messages.push(Message::assistant(
+                None,
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: String::from(tools::FN_WORKER_TOOL),
+                    arguments: String::from("{}"),
+                }],
+                None,
+            ));
+            messages.push(Message::tool(
+                id,
+                format!(
+                    "{{\"ok\":true,\"payload\":\"{index}-{}\"}}",
+                    "x".repeat(1_000)
+                ),
+            ));
+            records.push(record(true, "pc.ls"));
+        }
+        (messages, records)
+    }
+
+    #[test]
+    fn prune_keeps_recent_tool_results_and_pairing() {
+        let (mut messages, records) = six_exchanges();
+        let pruned = prune_tool_results(&mut messages, &records, 2);
+        assert_eq!(pruned, 4, "6 轮保留 2 轮，应压缩前 4 条");
+
+        let tool_messages: Vec<&Message> = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .collect();
+        assert_eq!(tool_messages.len(), 6, "tool 消息不得删除");
+        for (index, message) in tool_messages.iter().enumerate() {
+            let content = message.content.as_deref().unwrap_or_default();
+            if index < 4 {
+                assert!(content.starts_with(COMPACTED_TOOL_PREFIX), "{content}");
+            } else {
+                assert!(content.starts_with("{\"ok\":true"), "{content}");
+            }
+        }
+        // 每个 assistant tool_calls 都能找到同 id 的 tool 消息（配对完整）。
+        for message in messages.iter().filter(|m| !m.tool_calls.is_empty()) {
+            let expected = message.tool_calls[0].id.as_str();
+            assert!(
+                messages.iter().any(|candidate| {
+                    candidate.role == Role::Tool
+                        && candidate.tool_call_id.as_deref() == Some(expected)
+                }),
+                "缺少 {expected} 的 tool 结果"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_keeps_everything_when_disabled() {
+        let (mut messages, records) = six_exchanges();
+        let pruned = prune_tool_results(&mut messages, &records, 0);
+        assert_eq!(pruned, 0);
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.role == Role::Tool)
+                .all(|message| !message
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .starts_with(COMPACTED_TOOL_PREFIX))
+        );
+    }
+
+    #[test]
+    fn prune_is_idempotent() {
+        let (mut messages, records) = six_exchanges();
+        assert_eq!(prune_tool_results(&mut messages, &records, 2), 4);
+        let bytes = messages_bytes(&messages);
+        assert_eq!(prune_tool_results(&mut messages, &records, 2), 0);
+        assert_eq!(messages_bytes(&messages), bytes);
+    }
+
+    #[test]
+    fn prune_within_retain_window_is_noop() {
+        let (mut messages, records) = six_exchanges();
+        assert_eq!(prune_tool_results(&mut messages, &records, 6), 0);
+        assert_eq!(prune_tool_results(&mut messages, &records, 16), 0);
+    }
+
+    #[test]
+    fn prune_skips_results_smaller_than_the_placeholder() {
+        // 两轮「很小」的结果：进入压缩窗口也不该被换成更大的占位。
+        let mut messages = vec![Message::system("sys"), Message::user("goal")];
+        let mut records = Vec::new();
+        for index in 0..2 {
+            let id = format!("tiny_{index}");
+            messages.push(Message::assistant(
+                None,
+                vec![ToolCall {
+                    id: id.clone(),
+                    name: String::from(tools::FN_LIST_WORKERS),
+                    arguments: String::from("{}"),
+                }],
+                None,
+            ));
+            messages.push(Message::tool(id, "{\"count\":0}"));
+            records.push(ToolCallRecord {
+                function: String::from(tools::FN_LIST_WORKERS),
+                worker_id: None,
+                name: None,
+                ok: true,
+                error_code: None,
+            });
+        }
+        let before = messages_bytes(&messages);
+        assert_eq!(prune_tool_results(&mut messages, &records, 1), 0);
+        assert_eq!(messages_bytes(&messages), before);
+        assert_eq!(messages[3].content.as_deref(), Some("{\"count\":0}"));
+    }
+
+    #[test]
+    fn messages_bytes_counts_content_and_tool_calls() {
+        let messages = vec![
+            Message::system("sys"),
+            Message::assistant(
+                Some(String::from("hi")),
+                vec![ToolCall {
+                    id: String::from("call_1"),
+                    name: String::from("worker_tool"),
+                    arguments: String::from("{}"),
+                }],
+                None,
+            ),
+        ];
+        let total = messages_bytes(&messages);
+        assert!(total >= 6 + 2 + 4 + 11 + 2, "{total}");
+        assert_eq!(message_bytes(&messages[0]), MESSAGE_FRAMING_BYTES + 3);
+    }
+
+    #[test]
+    fn compacted_tool_result_has_prefix_and_bounded_head() {
+        let original = "结果".repeat(200);
+        let text = compacted_tool_result(&record(true, "pc.ls"), &original);
+        assert!(text.starts_with(COMPACTED_TOOL_PREFIX));
+        assert!(text.contains("\"ok\":true"));
+        assert!(text.len() < original.len());
+        let parsed = Json::parse(&text).expect("占位必须是合法 JSON");
+        let head = parsed.get("head").and_then(Json::as_str).unwrap();
+        assert_eq!(head.chars().count(), COMPACTED_TOOL_HEAD_CHARS);
+    }
+
+    #[test]
+    fn head_chars_respects_utf8_boundary() {
+        assert_eq!(head_chars("中文测试", 2), "中文");
+        assert_eq!(head_chars("abc", 10), "abc");
+        assert_eq!(head_chars("", 3), "");
+    }
 }

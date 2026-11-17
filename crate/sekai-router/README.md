@@ -71,7 +71,7 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 `SEKAI_MQTT_ADDR`、`SEKAI_MQTT_USERNAME/PASSWORD`、`SEKAI_TOPIC_ROOT`
 （默认 `sekai/v1`）、`SEKAI_WORKER_BIN`、`SEKAI_ROUTER_TRACE`，以及调参用的
 `SEKAI_MAX_STEPS` / `SEKAI_DDL_MS` / `SEKAI_TIMEOUT_MS` / `SEKAI_WAIT_WORKER_MS` /
-`SEKAI_HTTP_TIMEOUT_MS`，以及飞书入口的 `SEKAI_FEISHU_*`（凭据/allowlist/
+`SEKAI_HTTP_TIMEOUT_MS` / `SEKAI_CONTEXT_RETAIN_STEPS` / `SEKAI_CONTEXT_BUDGET_BYTES`，以及飞书入口的 `SEKAI_FEISHU_*`（凭据/allowlist/
 `SEKAI_FEISHU_CONTEXT_TURNS` 等，见 [docs/sekai-feishu.md](../../docs/sekai-feishu.md) §8）。
 完整清单以 `sekai-router --help` 为准。
 
@@ -85,6 +85,19 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 > 与 serve 的 `link` 请求都会把新链路的默认值同步到会话与 prompt hub（`/link off`
 > 后保持原值；prompt 本身会因未建链失败）。显式 `--max-steps` 则固定不变。
 
+## 上下文治理
+
+单个目标内部，Agent 循环只把最近 `SEKAI_CONTEXT_RETAIN_STEPS` 轮（默认 4）工具结果
+保留原文；更早的 `tool` 消息被替换成带成功/失败、命令名与 160 字符摘要头的紧凑占位
+（`{"compacted":true,...}`）。占位只改内容、不删消息，工具调用/结果配对始终成立，
+`reasoning_content` 不受影响。`0` 关闭压缩。
+
+估算字节（content + 参数 + reasoning + 角色开销）超过 `SEKAI_CONTEXT_BUDGET_BYTES`
+（默认 65536，`8192..=1048576`）时，不再发起下一次 LLM 请求，以 `context_budget`
+状态结束：CLI `status` 为 `context_budget`、退出码 5，serve/ingress 的 `prompt`
+结果同名字段，飞书回「上下文预算用尽」。估算用字节而非 tokenizer（CJK 约 1 token/字符、
+英文约 4 字符/token），仅用于护栏。
+
 ## 退出码
 
 | 码 | 含义 |
@@ -94,7 +107,7 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 | 2 | 配置错误 |
 | 3 | Worker 不可用 |
 | 4 | LLM/API 错误 |
-| 5 | 达到最大步数 |
+| 5 | 达到最大步数或上下文预算 |
 | 6 | Worker 命令最终失败 |
 | 130 | TUI 被 Ctrl-C 中断 |
 
@@ -104,7 +117,7 @@ LLM 评估/派工回路生成回答后按 `id` 回投。默认：交互/serve �
 
 ## 模块地图
 
-`agent.rs`（LLM 回路）· `llm.rs`（API 客户端）· `gateway.rs` /
+`agent.rs`（LLM 回路 + 上下文治理）· `llm.rs`（API 客户端）· `gateway.rs` /
 `direct_gateway.rs` / `direct.rs`（WorkerGateway 与直连接入）· `worker.rs`
 （注册表）· `control.rs`（命令下发与超时）· `session.rs`（命令层，REPL 与 TUI
 共用）· `repl.rs` / `tui.rs`（前端）· `serve.rs`（JSONL 无头模式）·
