@@ -3,35 +3,40 @@
  * install-dsh-plugin.mjs — sekai DSH 插件一键安装/卸载脚本。
  *
  * 纯 ESM、零运行时依赖、Node >= 20。做四件事：
- *   1. 构建（可选）并原子部署 sekai-router / sekai-worker 到
- *      <DSH_HOME>/sekai/bin/（插件零配置自动发现，见 docs/sekai-dsh-plugin.md）；
- *   2. 用 `dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh` 安装插件
- *      （`file:` = pnpm 真实拷贝，peer 依赖可从 profile 解析）；
- *   3. 自检：部署文件、profile 依赖与 bundles 条目、从 profile 导入插件并调用其
- *      resolveBin 必须命中刚部署的绝对路径（零配置闭环）、--dump-config 两行；
- *   4. 打印结果与下一步（重启 DSH 会话后出现 sekai_* 工具）。
+ *   1. 构建（可选）并为所选 profile 暂存一代 sekai-router / sekai-worker；
+ *   2. 通过 `dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh` 安装或刷新插件；
+ *   3. 校验二进制、已安装的 bundle 内容、候选路径解析与 profile 组合；
+ *   4. 原子发布 <DSH_HOME>/sekai/bin/profiles/<profile>/current.json。
  *
- * 所有 dsh 子进程都会注入 DSH_HOME=<解析后的绝对路径>；Windows 上 dsh 是 .cmd，
- * 通过 ComSpec `/d /s /c` 包装并对参数加引号。脚本不会写 profile 以外的东西，
- * --dry-run 完全不写盘。
+ * dsh 子进程会收到所选 DSH_HOME 和 DSH_PROFILE。Windows 上 .cmd 通过 ComSpec
+ * `/d /s /c` 包装。--dry-run 不写盘。
  *
  * 用法：node scripts/install-dsh-plugin.mjs [选项]（--help 查看全部）
  */
 
 import { spawn } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
 import {
   chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
+  fsyncSync,
+  lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   readdirSync,
+  realpathSync,
   renameSync,
+  rmSync,
+  rmdirSync,
   statSync,
   unlinkSync,
+  writeFileSync,
 } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import path from 'node:path'
@@ -289,7 +294,11 @@ export function resolveContext(args, options = {}) {
       `可用 profile：${availableProfiles.join('、') || '（无）'}。用 --profile <name> 指定已存在的 profile；先启动一次 DSH 桌面端/CLI 创建 profile。`,
     )
   }
+  if (profile === 'node_modules' || profile.trim() !== profile || /[\\/:\u0000-\u001f]/.test(profile)) {
+    throw new InstallError(`profile 名称不适用于托管二进制：${JSON.stringify(profile)}`)
+  }
   const profileDir = path.join(profilesDir, profile)
+  const managedDir = path.join(dshHome, 'sekai', 'bin', 'profiles', profile)
 
   const dsh = resolveDshCli(args.dsh, { env, platform, cwd, home })
 
@@ -305,6 +314,7 @@ export function resolveContext(args, options = {}) {
     profilesDir,
     profile,
     profileDir,
+    managedDir,
     dsh,
     availableProfiles,
   }
@@ -519,70 +529,180 @@ export async function resolveBinaries(ctx) {
   return { sourceDir, binaries, missing }
 }
 
-/**
- * 原子部署二进制到 <DSH_HOME>/sekai/bin/（临时文件 + rename；unix chmod 755）。
- * @returns {{destDir: string, deployed: Array<{fileName: string, dest: string, size: number}>, missing: string[]}}
- */
-export function deployBinaries(ctx, binaries) {
-  const { args, platform, io, dshHome } = ctx
-  const destDir = path.join(dshHome, 'sekai', 'bin')
+function sha256(value) {
+  return createHash('sha256').update(value).digest('hex')
+}
 
-  if (args.dryRun) {
-    io.out(`[dry-run] 将部署 ${binaries.binaries.length} 个二进制到 ${destDir}`)
-    for (const binary of binaries.binaries) {
-      const status = isUsableFile(binary.src) ? 'ok' : '缺失'
-      io.out(`[dry-run]   ${binary.src} -> ${path.join(destDir, binary.fileName)}（${status}）`)
+function hashFile(file) {
+  const fd = openSync(file, 'r')
+  try {
+    const hash = createHash('sha256')
+    const buffer = Buffer.allocUnsafe(256 * 1024)
+    let size = 0
+    for (let length; (length = readSync(fd, buffer, 0, buffer.length, null)) > 0;) {
+      hash.update(buffer.subarray(0, length))
+      size += length
     }
-    return {
-      destDir,
-      deployed: binaries.binaries.map((binary) => ({
-        fileName: binary.fileName,
-        base: binary.base,
-        dest: path.join(destDir, binary.fileName),
-        size: 0,
-      })),
-      missing: binaries.missing,
+    return { hash: hash.digest('hex'), size }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function lstatIfPresent(file) {
+  try {
+    return lstatSync(file)
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined
+    throw error
+  }
+}
+
+// These roots contain the manifest, bundle composition, module entry points and runtime assets.
+// README and smoke scripts are packaging collateral, so editing them does not restart services.
+const BUNDLE_RUNTIME_PATHS = ['package.json', 'cordis.patch.yml', 'lib', 'locale', 'icon.svg', 'icons', 'docs']
+
+function fingerprintBundle(directory) {
+  const files = new Map()
+  function visit(relative, optional = false) {
+    const full = path.join(directory, relative)
+    const stat = lstatIfPresent(full)
+    if (!stat && optional) return
+    if (stat?.isDirectory()) {
+      for (const entry of readdirSync(full).sort()) visit(`${relative}/${entry}`)
+    } else if (stat?.isFile()) {
+      files.set(relative, hashFile(full).hash)
+    } else {
+      throw new InstallError(`bundle 运行文件缺失或类型不支持：${full}`)
     }
   }
+  for (const relative of BUNDLE_RUNTIME_PATHS) visit(relative, relative !== 'package.json' && relative !== 'lib')
+  return { hash: sha256(JSON.stringify([...files])), files }
+}
 
-  mkdirSync(destDir, { recursive: true })
-  const deployed = []
-  for (const binary of binaries.binaries) {
-    if (!isUsableFile(binary.src)) {
-      throw new InstallError(
-        `来源二进制缺失或为空：${binary.src}`,
-        '先运行 cargo build --release -p sekai-router -p sekai-worker，或用 --bin-dir 指定已构建目录。',
-      )
+function verifyGeneration(ctx, directory, manifest, binaries) {
+  const hint = '检查该 generation 的完整性后重试；安装器不会覆盖或删除已有 generation。'
+  try {
+    if (!lstatSync(directory).isDirectory()) throw new Error('不是普通目录')
+    const manifestPath = path.join(directory, 'manifest.json')
+    if (!lstatSync(manifestPath).isFile()) throw new Error('manifest.json 不是普通文件')
+    const actual = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    if (actual?.version !== manifest.version || actual.bundle !== manifest.bundle) {
+      throw new Error('manifest.json 不匹配')
     }
-    const dest = path.join(destDir, binary.fileName)
-    const tmp = path.join(
-      destDir,
-      `.${binary.fileName}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    )
-    copyFileSync(binary.src, tmp)
-    if (platform !== 'win32') chmodSync(tmp, 0o755)
-    try {
-      renameSync(tmp, dest)
-    } catch {
-      // Windows 上目标被占用时 rename 可能失败：删掉旧文件再 rename。
-      try {
-        unlinkSync(dest)
-      } catch {
-        /* 目标不存在则忽略 */
+    return binaries.map(({ base, fileName }) => {
+      const dest = path.join(directory, fileName)
+      const stat = lstatSync(dest)
+      if (!stat.isFile() || (ctx.platform !== 'win32' && (stat.mode & 0o111) === 0)) {
+        throw new Error(`${fileName} 不是可执行文件`)
       }
-      renameSync(tmp, dest)
-    }
-    const size = statSync(dest).size
-    if (size === 0) {
-      throw new InstallError(
-        `部署后的二进制为空：${dest}`,
-        '检查源文件与磁盘空间；重新运行安装脚本。',
-      )
-    }
-    io.out(`[ok] 已部署 ${binary.fileName} -> ${dest}（${formatBytes(size)}）`)
-    deployed.push({ fileName: binary.fileName, base: binary.base, dest, size })
+      const { hash, size } = hashFile(dest)
+      if (size === 0 || hash !== manifest.binaries[base] || hash !== actual.binaries?.[base]) {
+        throw new Error(`${fileName} 的 SHA-256 不匹配`)
+      }
+      return { base, fileName, dest, size }
+    })
+  } catch (error) {
+    throw new InstallError(`部署校验失败：${directory}（${describeError(error)}）`, hint)
   }
-  return { destDir, deployed, missing: [] }
+}
+
+/** Stage a complete generation using a directory rename. An existing generation is read-only. */
+export function deployBinaries(ctx, resolved, bundleFingerprint) {
+  const generationsDir = path.join(ctx.managedDir, 'generations')
+  const { binaries } = resolved
+  if (ctx.args.dryRun) {
+    ctx.io.out(`[dry-run] 将暂存二进制到 ${path.join(generationsDir, '<generation>')}`)
+    for (const { src, fileName } of binaries) {
+      ctx.io.out(`[dry-run]   ${src} -> ${fileName}（${isUsableFile(src) ? 'ok' : '缺失'}）`)
+    }
+    return
+  }
+
+  const hashes = Object.fromEntries(binaries.map(({ base, src }) => {
+    const { hash, size } = hashFile(src)
+    if (size === 0) throw new InstallError(`来源二进制为空：${src}`)
+    return [base, hash]
+  }))
+  const manifest = { version: 1, bundle: bundleFingerprint.hash, binaries: hashes }
+  // Include filenames so the same bytes on different platforms do not collide.
+  const generation = sha256(JSON.stringify([manifest, binaries.map(({ fileName }) => fileName)]))
+  const destDir = path.join(generationsDir, generation)
+  if (!lstatIfPresent(destDir)) {
+    mkdirSync(generationsDir, { recursive: true })
+    const stageDir = mkdtempSync(path.join(generationsDir, '.stage-'))
+    let staged = true
+    try {
+      for (const { src, fileName } of binaries) {
+        const stagedPath = path.join(stageDir, fileName)
+        copyFileSync(src, stagedPath)
+        if (ctx.platform !== 'win32') chmodSync(stagedPath, 0o755)
+      }
+      writeFileSync(path.join(stageDir, 'manifest.json'), `${JSON.stringify(manifest)}\n`, { flag: 'wx' })
+      verifyGeneration(ctx, stageDir, manifest, binaries)
+      renameSync(stageDir, destDir)
+      staged = false
+    } finally {
+      if (staged) rmSync(stageDir, { recursive: true, force: true })
+    }
+  }
+  const deployed = verifyGeneration(ctx, destDir, manifest, binaries)
+  ctx.io.out(`[ok] 候选 generation：${generation}`)
+  return { destDir, deployed, generation, manifest }
+}
+
+function publishGeneration(ctx, generation) {
+  if (typeof generation !== 'string' || generation.length !== 64 || !/^[0-9a-f]+$/.test(generation)) {
+    throw new InstallError('generation 格式无效')
+  }
+  const marker = path.join(ctx.managedDir, 'current.json')
+  const previous = lstatIfPresent(marker)
+  if (previous) {
+    if (!previous.isFile()) throw new InstallError(`发布失败：${marker} 不是普通文件`)
+    const text = readFileSync(marker, 'utf8')
+    let current
+    try { current = JSON.parse(text) } catch { /* A verified candidate can replace invalid JSON. */ }
+    if (current?.version === 1 && current.generation === generation) return false
+  }
+
+  const temporary = `${marker}.tmp-${randomUUID()}`
+  let created = false
+  try {
+    const fd = openSync(temporary, 'wx', 0o600)
+    created = true
+    try {
+      writeFileSync(fd, `${JSON.stringify({ version: 1, generation })}\n`)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(temporary, marker)
+    created = false
+  } catch (error) {
+    throw new InstallError(`无法原子发布 ${marker}（${describeError(error)}）`, '解决文件占用或权限问题后重试。')
+  } finally {
+    if (created) rmSync(temporary, { force: true })
+  }
+  return true
+}
+
+/** Serialize installers for the same profile without holding the CLI's own package lock. */
+async function withInstallerLock(ctx, operation) {
+  const lock = path.join(ctx.profileDir, '.sekai-install.lock')
+  try {
+    mkdirSync(lock)
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+    throw new InstallError(
+      `profile "${ctx.profile}" 已被另一个 Sekai 安装或卸载占用`,
+      `等待它结束后重试。若脚本意外退出，确认没有正在运行的安装或卸载，再移除锁目录 ${lock}。`,
+    )
+  }
+  try {
+    return await operation()
+  } finally {
+    rmdirSync(lock)
+  }
 }
 
 /** 安装 spec：`file:<仓库绝对路径>/plugins/sekai-dsh`（Windows 用反斜杠）。 */
@@ -590,16 +710,16 @@ export function pluginInstallSpec(ctx) {
   return `file:${path.resolve(ctx.pluginDir)}`
 }
 
-/** 子进程环境：继承当前环境并注入绝对 DSH_HOME。 */
+/** 子进程环境使用所选 profile。 */
 function childEnv(ctx) {
-  return { ...ctx.env, DSH_HOME: ctx.dshHome }
+  return { ...ctx.env, DSH_HOME: ctx.dshHome, DSH_PROFILE: ctx.profile }
 }
 
 /**
  * 安装插件：`dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`。
  * dsh 输出透传（stdio inherit）。
  */
-export async function installPlugin(ctx) {
+export async function installPlugin(ctx, { force = false } = {}) {
   const { args, io, dsh, profile, pluginDir } = ctx
   const spec = pluginInstallSpec(ctx)
 
@@ -610,18 +730,20 @@ export async function installPlugin(ctx) {
     )
   }
 
-  io.out(`[..] 安装插件：dsh plugin --profile ${profile} add ${spec}`)
+  const command = ['plugin', '--profile', profile, 'add', spec, ...(force ? ['--force'] : [])]
+  io.out(`[..] ${force ? '强制刷新' : '安装'}插件：dsh ${command.join(' ')}`)
   if (args.dryRun) {
-    io.out(`[dry-run] 将执行：${dsh} plugin --profile ${profile} add ${spec}`)
-    io.out(`[dry-run] 注入环境变量：DSH_HOME=${ctx.dshHome}`)
+    io.out(`[dry-run] 将按需执行：${dsh} ${command.join(' ')}`)
+    io.out('[dry-run] 已安装内容过期时将通过 dsh plugin add --force 刷新并复查')
+    io.out(`[dry-run] 注入环境变量：DSH_HOME=${ctx.dshHome}，DSH_PROFILE=${profile}`)
     return { spec }
   }
 
-  const result = await spawnInherit(
-    dsh,
-    ['plugin', '--profile', profile, 'add', spec],
-    { cwd: ctx.repoRoot, env: childEnv(ctx), platform: ctx.platform },
-  )
+  const result = await spawnInherit(dsh, command, {
+    cwd: ctx.repoRoot,
+    env: childEnv(ctx),
+    platform: ctx.platform,
+  })
   if (result.error) {
     throw new InstallError(
       `无法执行 dsh：${describeError(result.error)}`,
@@ -631,7 +753,7 @@ export async function installPlugin(ctx) {
   if (result.code !== 0) {
     throw new InstallError(
       `dsh plugin add 失败（退出码 ${result.code}）`,
-      `手动运行 "${dsh}" plugin --profile ${profile} add ${spec} 查看 pnpm 错误（常见原因：网络、权限、profile 被占用）。`,
+      `检查 pnpm 输出或手动运行 "${dsh}" ${command.join(' ')}（常见原因：网络、权限、profile 被占用）。`,
     )
   }
   io.out('[ok] 插件安装命令执行成功')
@@ -657,7 +779,7 @@ function bundleEntries(pkg) {
   return Array.isArray(bundles) ? bundles : []
 }
 
-/** 写入 profile package.json（仅 fake dsh / 测试用；脚本本身不写 profile）。 */
+/** 对比解析后的路径，Windows 不区分大小写。 */
 function samePath(first, second, platform) {
   try {
     const a = path.resolve(String(first))
@@ -668,33 +790,8 @@ function samePath(first, second, platform) {
   }
 }
 
-/**
- * 安装后自检：
- *   a. 部署文件存在且非空；
- *   b. profile package.json 依赖与 dsh.profile.bundles 含且不重复；
- *   c. 从 profile 解析并 import 插件，调用 resolveBin(...,{env:{DSH_HOME}}) 命中部署路径；
- *   d. `dsh --profile <p> --dump-config` 含 sekai-router 与 sekai-worker（告警级，--strict 时失败）。
- * @returns {Promise<{warnings: string[]}>}
- */
-export async function verifyInstallation(ctx, deploy) {
-  const { args, io, platform, dshHome, profile, profileDir, dsh } = ctx
-  const warnings = []
-
-  // a. 部署文件
-  const brokenBins = deploy.deployed.filter((entry) => !isUsableFile(entry.dest))
-  if (brokenBins.length > 0) {
-    throw new InstallError(
-      `部署校验失败：${brokenBins.map((entry) => entry.dest).join('、')} 缺失或为空`,
-      `重新运行安装脚本（会重新构建并覆盖部署），或手动检查 ${deploy.destDir}。`,
-    )
-  }
-  io.out(
-    `[ok] 校验 a：二进制已部署（${deploy.deployed
-      .map((entry) => `${entry.fileName} ${formatBytes(entry.size)}`)
-      .join('、')}）`,
-  )
-
-  // b. profile 依赖 + bundles
+function verifyProfileRegistration(ctx, { quiet = false } = {}) {
+  const { io, profile, profileDir } = ctx
   const pkg = readProfilePackage(ctx)
   const dependency = pkg?.dependencies?.[PLUGIN_PACKAGE]
   if (typeof dependency !== 'string' || dependency === '') {
@@ -719,23 +816,77 @@ export async function verifyInstallation(ctx, deploy) {
       `手动编辑 ${path.join(profileDir, 'package.json')} 保留一条；重跑安装。`,
     )
   }
-  io.out(`[ok] 校验 b：profile 已登记（dependencies=${dependency}，bundles 含 ${PLUGIN_PACKAGE}）`)
-
-  // c. 从 profile 导入插件 + resolveBin 闭环
-  const pkgPath = path.join(profileDir, 'package.json')
-  const requireFromProfile = createRequire(pkgPath)
-  let entry
-  try {
-    entry = requireFromProfile.resolve(PLUGIN_PACKAGE)
-  } catch (error) {
+  if (!isSourceDependency(ctx, dependency)) {
     throw new InstallError(
-      `校验 c 失败：从 profile 解析不到 ${PLUGIN_PACKAGE}（${describeError(error)}）`,
-      `确认 ${path.join(profileDir, 'node_modules', '@sekai', 'dsh-plugin')} 存在；用 dsh plugin add file:... 重新安装（不要用 link: 目录方式）。`,
+      `校验 b 失败：${PLUGIN_PACKAGE} 的依赖 ${JSON.stringify(dependency)} 未指向来源目录`,
+      `检查 pnpm 输出；预期由 ${pluginInstallSpec(ctx)} 安装。`,
     )
   }
+  if (!quiet) io.out(`[ok] 校验 b：profile 已登记（dependencies=${dependency}，bundles 含 ${PLUGIN_PACKAGE}）`)
+}
+
+function isSourceDependency(ctx, dependency) {
+  if (typeof dependency !== 'string' || !dependency.startsWith('file:')) return false
+  // pnpm may save an absolute path as a relative file: spec in the profile manifest.
+  return samePath(path.resolve(ctx.profileDir, dependency.slice('file:'.length)), ctx.pluginDir, ctx.platform)
+}
+
+function inspectInstalledBundle(ctx, source) {
+  try {
+    const nodeModules = realpathSync(path.join(ctx.profileDir, 'node_modules'))
+    const installedDir = realpathSync(path.join(nodeModules, PLUGIN_PACKAGE))
+    const relative = path.relative(nodeModules, installedDir)
+    if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('安装包不在 profile node_modules 内')
+    }
+    const installed = fingerprintBundle(installedDir)
+    if (installed.hash !== source.hash) {
+      const files = new Set([...source.files.keys(), ...installed.files.keys()])
+      const changed = [...files].filter((file) => source.files.get(file) !== installed.files.get(file))
+      return { mismatch: changed.join('、') }
+    }
+    const requireFromProfile = createRequire(path.join(ctx.profileDir, 'package.json'))
+    const entry = requireFromProfile.resolve(PLUGIN_PACKAGE)
+    const relativeEntry = path.relative(installedDir, realpathSync(entry)).split(path.sep).join('/')
+    if (!installed.files.has(relativeEntry)) throw new Error('入口模块不在已验证的已安装 bundle 内')
+    return { entry }
+  } catch (error) {
+    return { mismatch: describeError(error) }
+  }
+}
+
+async function ensureInstalledBundle(ctx, source) {
+  const pkg = readProfilePackage(ctx)
+  const dependency = pkg?.dependencies?.[PLUGIN_PACKAGE]
+  if (!isSourceDependency(ctx, dependency)) await installPlugin(ctx)
+  verifyProfileRegistration(ctx, { quiet: true })
+  let installed = inspectInstalledBundle(ctx, source)
+  if (installed.mismatch !== undefined) {
+    ctx.io.out(`[warn] 已安装 bundle 内容需要刷新：${installed.mismatch}`)
+    await installPlugin(ctx, { force: true })
+    installed = inspectInstalledBundle(ctx, source)
+  }
+  if (installed.mismatch !== undefined) {
+    throw new InstallError(
+      `强制刷新后，已安装 bundle 运行文件仍与来源不一致：${installed.mismatch}`,
+      '检查 pnpm 输出和 profile 的依赖，修复后重新运行安装脚本。',
+    )
+  }
+  return installed.entry
+}
+
+/** Verify candidate resolution before changing the marker. The CLI dump checks disk composition. */
+export async function verifyInstallation(ctx, deploy, entry) {
+  const { args, io, platform, dshHome, profile, dsh } = ctx
+  const warnings = []
+  io.out(`[ok] 校验 a：候选二进制哈希已验证（${deploy.deployed
+    .map(({ fileName, size }) => `${fileName} ${formatBytes(size)}`).join('、')}）`)
+  verifyProfileRegistration(ctx)
+  io.out('[ok] 校验 c：已安装 bundle 的运行文件与来源一致')
+
   let module
   try {
-    module = await import(`${pathToFileURL(entry).href}?v=${Date.now()}`)
+    module = await import(`${pathToFileURL(entry).href}?verify=${randomUUID()}`)
   } catch (error) {
     throw new InstallError(
       `校验 c 失败：导入已安装插件出错（${describeError(error)}）`,
@@ -768,18 +919,19 @@ export async function verifyInstallation(ctx, deploy) {
     let resolved
     try {
       resolved = module.resolveBin(component.base, component.envKey, component.base, {
-        env: { DSH_HOME: dshHome },
+        env: { DSH_HOME: dshHome, DSH_PROFILE: profile },
+        generation: deploy.generation,
       })
     } catch (error) {
       throw new InstallError(
         `校验 c 失败：调用 resolveBin(${component.base}) 抛错（${describeError(error)}）`,
-        `确认已安装插件版本包含二进制自动发现（$DSH_HOME/sekai/bin 优先）；重跑安装；必要时临时设置 ${component.envKey}。`,
+        '确认已安装插件支持按 profile 解析候选 generation，再重新运行安装脚本。',
       )
     }
-    if (typeof resolved !== 'string' || resolved === '' || !samePath(resolved, expected.dest, platform)) {
+    if (typeof resolved !== 'string' || !path.isAbsolute(resolved) || !samePath(resolved, expected.dest, platform)) {
       throw new InstallError(
         `校验 c 失败：零配置闭环未命中——${component.base} 解析为 "${resolved}"，期望 "${expected.dest}"`,
-        `确认安装的插件包含二进制自动发现（优先 $DSH_HOME/sekai/bin）；重跑安装脚本；或临时设置 ${component.envKey} 指向部署路径。`,
+        '确认已安装插件支持按 profile 解析候选 generation，再重新运行安装脚本。',
       )
     }
     io.out(`[ok] 校验 c：${component.base} 零配置解析命中 ${expected.dest}`)
@@ -875,23 +1027,16 @@ export async function uninstallPlugin(ctx) {
   }
   io.out(`[ok] 校验：profile "${profile}" 的 dependencies 与 bundles 条目已移除`)
 
-  if (existsSync(binDir)) {
-    io.out(`[warn] 已保留二进制目录：${binDir}（如需彻底清理可手动删除）`)
-  }
-  if (existsSync(stateFile)) {
-    io.out(`[warn] 已保留 worker 状态文件：${stateFile}（如需彻底清理可手动删除）`)
-  }
-  if (existsSync(binDir) || existsSync(stateFile)) {
-    io.out(`     清理示例（可选）：rm -rf "${binDir}" "${stateFile}"`)
-  }
-  io.out('[ok] 插件卸载完成；重启 DSH 会话后 sekai_* 工具消失。')
+  if (existsSync(binDir)) io.out(`[ok] 已保留二进制及 generation 标记：${binDir}`)
+  if (existsSync(stateFile)) io.out(`[ok] 已保留 worker 状态文件：${stateFile}`)
+  io.out('[ok] 已从所选 profile 卸载插件。此命令只验证了磁盘上的 profile。')
   return { removed: true }
 }
 
 /** --help 文本。 */
 export function helpText() {
   return [
-    'sekai DSH 插件一键安装/卸载（构建 → 部署二进制 → 安装插件 → 自检）',
+    'sekai DSH 插件一键安装/卸载（构建 → 暂存 → 安装/刷新 bundle → 校验 → 发布）',
     '',
     '用法：',
     '  node scripts/install-dsh-plugin.mjs [选项]',
@@ -908,12 +1053,11 @@ export function helpText() {
     '  -h, --help            显示本帮助',
     '',
     '说明：',
-    '  - 默认构建 `cargo build --release -p sekai-router -p sekai-worker`，并把两个 exe',
-    '    原子部署到 <DSH_HOME>/sekai/bin/；插件会从这里零配置发现二进制。',
-    '  - 安装使用 `dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`，',
-    '    所有 dsh 子进程都注入 DSH_HOME。',
-    '  - 装/升级后需重启 DSH 会话（运行中的会话不会热加载 bundle）；默认 router 监听',
-    `    ${DEFAULT_ROUTER_ADDR}，worker autoConnect 自动连接。`,
+    '  - 默认构建 `cargo build --release -p sekai-router -p sekai-worker`，并在',
+    '    <DSH_HOME>/sekai/bin/profiles/<profile>/generations/<generation>/ 暂存两个二进制。',
+    '  - 通过 dsh CLI 安装或刷新 bundle。校验成功后原子发布所选 profile 的 current.json。',
+    '  - 此命令校验磁盘上的安装。若运行中的 DSH 尚未载入新 bundle，请重新启动该 profile。',
+    `  - 默认 router 监听 ${DEFAULT_ROUTER_ADDR}，worker autoConnect 自动连接。`,
     '  - 详细文档：docs/sekai-dsh-plugin.md §1（安装/升级/卸载与二进制解析顺序）。',
     '',
     '示例：',
@@ -946,20 +1090,20 @@ function printError(io, error) {
 }
 
 /** 安装成功后的结果与下一步。 */
-function printInstallSummary(ctx, deploy, warnings) {
+function printInstallSummary(ctx, deploy, warnings, published) {
   const { io, profile, dshHome } = ctx
   io.out('')
   io.out(`[ok] 安装完成：profile=${profile}，DSH_HOME=${dshHome}`)
   io.out(`[ok] 插件：${pluginInstallSpec(ctx)}`)
   io.out(`[ok] 二进制：${deploy.deployed.map((entry) => entry.dest).join('、')}`)
+  io.out(`[ok] ${published ? '已发布 generation' : 'generation 未变化，保留原标记'}：${deploy.generation}`)
   if (warnings.length > 0) {
     io.out(`[warn] 有 ${warnings.length} 项告警（不影响安装，见上）；可用 --strict 复查。`)
   }
   io.out('')
-  io.out('下一步：')
-  io.out('  1. 重启 DSH 桌面端/会话（或重新运行 dsh web）——运行中的会话不会热加载新 bundle。')
-  io.out(`  2. 会话里应出现 sekai_* 工具；默认 router 监听 ${DEFAULT_ROUTER_ADDR}，worker autoConnect 自动连接。`)
-  io.out('  3. 卸载：node scripts/install-dsh-plugin.mjs --uninstall；文档：docs/sekai-dsh-plugin.md。')
+  io.out('此命令只验证了磁盘上的安装。已加载热更新机制的 DSH 会自动应用发布；首次从旧版迁移需加载新版一次。')
+  io.out(`默认 router 监听 ${DEFAULT_ROUTER_ADDR}，worker autoConnect 自动连接。`)
+  io.out('卸载：node scripts/install-dsh-plugin.mjs --uninstall（详情见 docs/sekai-dsh-plugin.md）。')
 }
 
 /**
@@ -1007,17 +1151,16 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     io.out(`[ok] profile：${ctx.profile}（${ctx.profileDir}）`)
     io.out(`[ok] dsh CLI：${ctx.dsh}`)
 
-    if (args.uninstall) {
-      await uninstallPlugin(ctx)
-      if (args.dryRun) io.out('[dry-run] 未执行任何写操作。')
-      return 0
-    }
-
-    const resolved = await resolveBinaries(ctx)
     if (args.dryRun) {
+      if (args.uninstall) {
+        await uninstallPlugin(ctx)
+        io.out('[dry-run] 未执行任何写操作。')
+        return 0
+      }
+      const resolved = await resolveBinaries(ctx)
       deployBinaries(ctx, resolved)
       await installPlugin(ctx)
-      io.out('[dry-run] 将校验：部署文件 / profile 依赖与 bundles / 从 profile import 并 resolveBin 闭环 / --dump-config 两行')
+      io.out(`[dry-run] 校验成功后将按需发布：${path.join(ctx.managedDir, 'current.json')}`)
       if (resolved.missing.length > 0) {
         io.out(`[warn] 当前缺少二进制（真正安装时会失败）：${resolved.missing.join('、')}`)
       }
@@ -1025,10 +1168,29 @@ export async function main(argv = process.argv.slice(2), options = {}) {
       return 0
     }
 
-    const deploy = deployBinaries(ctx, resolved)
-    await installPlugin(ctx)
-    const { warnings } = await verifyInstallation(ctx, deploy)
-    printInstallSummary(ctx, deploy, warnings)
+    await withInstallerLock(ctx, async () => {
+      if (args.uninstall) {
+        await uninstallPlugin(ctx)
+        return
+      }
+      const resolved = await resolveBinaries(ctx)
+      const source = fingerprintBundle(ctx.pluginDir)
+      const deploy = deployBinaries(ctx, resolved, source)
+      const entry = await ensureInstalledBundle(ctx, source)
+      const { warnings } = await verifyInstallation(ctx, deploy, entry)
+      // Catch changes while the CLI or verifier ran, before the runtime can observe the candidate.
+      if (fingerprintBundle(ctx.pluginDir).hash !== source.hash) {
+        throw new InstallError('来源 bundle 在安装期间发生变化', '待来源文件稳定后重新运行安装脚本。')
+      }
+      const installed = inspectInstalledBundle(ctx, source)
+      if (installed.mismatch !== undefined || !samePath(installed.entry, entry, platform)) {
+        throw new InstallError(`已安装 bundle 在校验期间发生变化：${installed.mismatch ?? '入口模块已改变'}`)
+      }
+      verifyGeneration(ctx, deploy.destDir, deploy.manifest, deploy.deployed)
+      verifyProfileRegistration(ctx, { quiet: true })
+      const published = publishGeneration(ctx, deploy.generation)
+      printInstallSummary(ctx, deploy, warnings, published)
+    })
     return 0
   } catch (error) {
     printError(io, error)

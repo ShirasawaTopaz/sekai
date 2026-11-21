@@ -118,15 +118,20 @@ impl<'a> Reader<'a> {
 
 /// 解码 UTF-8 字符串：必须是合法 UTF-8 且不含 U+0000。
 pub(crate) fn decode_utf8(raw: &[u8]) -> Result<String, DecodeError> {
-    let text = core::str::from_utf8(raw).map_err(|_| DecodeError::Malformed("UTF-8 字符串非法"))?;
-    if text.as_bytes().contains(&0) {
-        return Err(DecodeError::Malformed("UTF-8 字符串包含 U+0000"));
-    }
+    let text = decode_utf8_ref(raw)?;
     let mut out = String::new();
     out.try_reserve_exact(text.len())
         .map_err(|_| DecodeError::AllocationFailed)?;
     out.push_str(text);
     Ok(out)
+}
+
+pub(crate) fn decode_utf8_ref(raw: &[u8]) -> Result<&str, DecodeError> {
+    let text = core::str::from_utf8(raw).map_err(|_| DecodeError::Malformed("UTF-8 字符串非法"))?;
+    if text.as_bytes().contains(&0) {
+        return Err(DecodeError::Malformed("UTF-8 字符串包含 U+0000"));
+    }
+    Ok(text)
 }
 
 /// 编码输出目标。

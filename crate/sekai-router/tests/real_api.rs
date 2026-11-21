@@ -235,7 +235,7 @@ fn two_workers() -> Rc<RefCell<Harness>> {
 fn test_policy() -> Policy {
     Policy {
         allow_write: true,
-        allow_tasks: true,
+        tasks: sekai_router::tools::TaskAccess::All,
         allow_admin: false,
         worker_filter: None,
         deny_llm_relay: false,

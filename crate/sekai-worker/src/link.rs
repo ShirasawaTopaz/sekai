@@ -42,19 +42,10 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::{Duration, Instant};
 
-use sekai::mqtt::packet::Packet;
-use sekai::sekai_stdin::STDIN_HEADER_LEN;
-use sekai::sekai_stdout::STDOUT_HEADER_LEN;
-use sekai::sekai_wire::MAX_PAYLOAD;
-
-/// 长度前缀的字节数（u32 大端）。
-pub const FRAME_PREFIX_LEN: usize = 4;
-
-/// 单帧载荷（V1 帧本体）的最大长度：`max(Stdin, Stdout) 头 + 载荷上限`。
-pub const MAX_FRAME_LEN: usize = STDOUT_HEADER_LEN + MAX_PAYLOAD;
-
-/// Stdin 帧的最大长度（诊断/测试用）。
-pub const MAX_STDIN_FRAME_LEN: usize = STDIN_HEADER_LEN + MAX_PAYLOAD;
+pub use sekai::direct::{
+    FRAME_PREFIX_LEN, KeepAlive, MAX_FRAME_LEN, MAX_STDIN_FRAME_LEN, decode_keepalive,
+    encode_keepalive,
+};
 
 /// 直连链路读空闲判定默认阈值（毫秒）：1.5 × 默认 keep_alive（30s）。
 ///
@@ -184,40 +175,6 @@ fn validate_frame_len(frame: &[u8]) -> Result<(), LinkError> {
 
 /// 直连链路承载的 MQTT 保活控制报文。
 ///
-/// 直连承载下两端各有一个 MQTT 客户端（Router 的 ControlPlane 与 Worker 的
-/// Runtime）；保活必须真正跨链路，否则对端静默死亡无法被发现（P10）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeepAlive {
-    /// 保活请求（发送方等待对端回应）。
-    Pingreq,
-    /// 保活应答。
-    Pingresp,
-}
-
-/// 识别链路帧是否为 MQTT 保活控制报文；V1 Stdin/Stdout 帧返回 `None`。
-///
-/// 判定用 MQTT 报文解码：PINGREQ/PINGRESP 是固定 2 字节报文；V1 帧首字节
-/// 是协议版本号 1，不可能被解成保活报文。
-pub fn decode_keepalive(frame: &[u8]) -> Option<KeepAlive> {
-    match Packet::decode(frame) {
-        Ok((Packet::Pingreq, used)) if used == frame.len() => Some(KeepAlive::Pingreq),
-        Ok((Packet::Pingresp, used)) if used == frame.len() => Some(KeepAlive::Pingresp),
-        _ => None,
-    }
-}
-
-/// 编码 MQTT 保活控制报文（作为一条链路帧写出）。
-///
-/// PINGREQ/PINGRESP 是固定两字节报文，编码不会失败；万一失败返回空帧，
-/// 由 [`Link::write_frame`] 的长度校验拒绝，不会静默丢帧。
-pub fn encode_keepalive(kind: KeepAlive) -> Vec<u8> {
-    let packet = match kind {
-        KeepAlive::Pingreq => Packet::Pingreq,
-        KeepAlive::Pingresp => Packet::Pingresp,
-    };
-    packet.encode().unwrap_or_default()
-}
-
 /// 有界流式分帧器：把字节流按「u32 大端长度前缀 + 帧字节」切分。
 pub struct FrameDecoder {
     buffer: Vec<u8>,

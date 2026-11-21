@@ -1,7 +1,7 @@
 [workspace]
 resolver = '3'
 members = [
-    "crate/sekai", "crate/sekai-build", "crate/sekai-embedded", "crate/sekai-gpio", "crate/sekai-router", "crate/sekai-worker",
+    "crate/sekai", "crate/sekai-build", "crate/sekai-embedded", "crate/sekai-gpio", "crate/sekai-router", "crate/sekai-worker", "crate/sekai-stm32",
 ]
 
 package.version = "0.2.0"
@@ -12,3 +12,10 @@ package.license = "Apache-2.0"
 # 使用 dev profile 时仍然要有可用性能，因此这里单独提高 esp-radio 的优化级别。
 [profile.dev.package.esp-radio]
 opt-level = 3
+
+[profile.stm32]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

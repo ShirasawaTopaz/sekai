@@ -77,7 +77,7 @@ args 与输出均为**原始 UTF-8 文本**（无 key=value 前缀；与 `gpio.*
 | 编码 | 输出统一 UTF-8（非法字节替换为 U+FFFD；结果 JSON 带 `encoding` 字段） |
 | 截断 | 总输出 ≤4096 字节，按 UTF-8 字符边界截断，追加 `[[truncated]]` |
 | 超时 | 内部默认 **10000ms**（env `SEKAI_PC_EXEC_MS`，范围 100..=300000）；超时杀**整棵进程树**、保留已收输出并追加 `[[timeout after <ms>ms]]` |
-| 进程树 | Unix 用独立进程组（`process_group(0)` + `kill -KILL -pgid`）；Windows 先 `taskkill /T /F /PID` 再 kill 父进程，孙进程不会成孤儿 |
+| 进程树 | Unix 用独立进程组（`process_group(0)` + `kill -KILL -pgid`）。Windows 在运行命令前把 shell 加入 Job Object，超时或取消时终止整个 Job。 |
 | stdin | 子进程 stdin 为 `null`，不会抢 Worker 的 V1 帧流 / prompt JSONL |
 | 策略 | 需 `--allow-write`（Router 侧默认拒绝） |
 
@@ -300,27 +300,23 @@ ingress 与 serve `prompt` 方法共用同一核心，只做**策略授权**
 
 ### 5.1 策略分类（Router 侧，发布 Stdin 前强制）
 
-Router 按「**调用通道 + 工具名**」分类（`tools.rs::check_policy`），工具通道与任务通道
-门槛不同：
+Router 按命令名称和实际下发类型授权。`worker_task` 与自动路由为 Task 的 `worker_tool` 使用同一份 Task 名单。
 
-| 通道 | 名称 | 默认 | 解锁开关 |
+| 类别 | 名称 | 默认 | 授权方式 |
 | --- | --- | --- | --- |
-| `worker_tool` | `pc.read` / `pc.ls` / `pc.info` | 放行 | —（只读白名单） |
-| `worker_tool` | `pc.write` / `pc.exec` | 拒绝 | `--allow-write`（写白名单） |
-| `worker_tool` | 其余一切名字（admin 桶） | 拒绝 | `--allow-admin` |
-| `worker_task` | 一切任务名：`pc.job` / `pc.ask` / `echo` / `sleep` / `dsh.tools` / `dsh.call` | 拒绝 | `--allow-tasks`（不按名字分类） |
+| 只读 Tool | `pc.read`、`pc.ls`、`pc.info` | 放行 | — |
+| 写操作 | `pc.write`、`pc.exec` | 拒绝 | `--allow-write` |
+| Task | `pc.job`、`pc.ask`、`echo`、`sleep`、`dsh.tools`、`dsh.call` 等 | 拒绝 | 可重复的 `--allow-task NAME`，或用 `--allow-tasks` 全开 |
+| 其余 Tool | 其他名称 | 拒绝 | `--allow-admin` |
 
-即：Worker 把 `pc.job`/`pc.ask` 广告为 Task，实际门槛是 `--allow-tasks`；「admin 桶
-（`--allow-admin`）」只作用于 `worker_tool` 通道里不在两个白名单内的名字。
-策略可经 REPL `/policy` 或 serve `policy.set` 调整；`--worker <ID>`/
-`worker_filter` 可把可操作范围锁定到单个 Worker。
+策略可经 REPL `/policy tasks only NAME...` 或 serve `policy.set` 的 `allowed_tasks` 调整。`--worker <ID>` 或 `worker_filter` 可将操作范围锁定到单个 Worker。
 
 > **`pc.exec` 的线类型与策略分离**：`pc.exec` 在 Worker 侧实现为 Task（不阻塞帧循环），
 > 但 Router **按名字**把它归为写操作，门槛仍是 `--allow-write`，不是 `--allow-tasks`。
 > 同样地，`worker_tool` 命中 Worker 通告的 tasks 列表时会自动按 Task 下发（D5）。
 
 > **DSH 工具桥同样由 Task 通道门控**：`dsh.tools` / `dsh.call` 在 Worker 侧只是两个普通
-> Task，Router 不新增策略分类，`--allow-tasks` 打开才可派发；插件侧还有独立 allowlist
+> Task。Router 可分别授权 `dsh.tools` 和 `dsh.call`。插件侧还有独立 allowlist
 > （`dshTools.enabled` 默认关闭、默认只读）作为第二层防线，两层都过才能执行。
 
 `pc.exec`/`pc.job` 在 Worker 本机以 shell 执行任意命令，权限面最大：默认拒绝之外，

@@ -2,12 +2,14 @@
 #
 # 推荐用一键脚本安装（在仓库根运行）：
 #   node scripts/install-dsh-plugin.mjs
-# 它会构建二进制、部署到 $DSH_HOME/sekai/bin、把本包加入 profile bundles 并自检；
+# 它会安装并校验本包及二进制，再发布当前 profile 的托管版本；
 # 也可手动 dsh plugin add @sekai/dsh-plugin，或在 profile 的 cordis.patch.yml /
 # bundles 配置中列出。两行默认 config 见下；已保存的 profile 行覆盖优先于本补丁
 # 默认值生效。
 
 - insert:
+    - id: sekai-status-panel
+      name: '@sekai/dsh-plugin'
     - id: sekai-router
       name: '@sekai/dsh-plugin/router'
       config:

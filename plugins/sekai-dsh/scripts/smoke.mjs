@@ -32,7 +32,7 @@
  */
 import { strict as assert } from 'node:assert'
 import { realpathSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -50,7 +50,7 @@ import {
   resolveBin,
   resolveDshHome,
 } from '../lib/shared.js'
-import { SekaiRouterPlugin } from '../lib/router.js'
+import { resolveRouterConfig, SekaiRouterPlugin } from '../lib/router.js'
 import {
   DSH_TOOLS_DEFAULTS,
   SekaiWorkerPlugin,
@@ -75,7 +75,19 @@ import {
 const FAKE_SERVE = `
 import readline from 'node:readline'
 const write = (obj) => process.stdout.write(JSON.stringify(obj) + '\\n')
-let policy = { allow_write: false, allow_tasks: false, allow_admin: false, worker_filter: null }
+const legacy = process.env.FAKE_LEGACY_ROUTER === '1'
+const exactMismatch = process.env.FAKE_ROUTER_POLICY_MISMATCH
+const args = process.argv.slice(2)
+const exact = args.flatMap((arg, i) => arg === '--allow-task' ? [args[i + 1]] : [])
+if (legacy && exact.length > 0) {
+  console.error('unknown argument --allow-task')
+  process.exit(2)
+}
+const allowAll = args.includes('--allow-tasks')
+if (allowAll && exact.length > 0) process.exit(2)
+let policy = { allow_write: false, allow_tasks: allowAll, allow_admin: false, worker_filter: null }
+if (!legacy && exactMismatch !== 'startup') policy.allowed_tasks = [...new Set(exact)].sort()
+const policyUpdates = []
 let linked = false
 let linkDesc = ''
 write({ event: 'ready' })
@@ -125,7 +137,8 @@ rl.on('line', (line) => {
     if (!linked) { write({ id, ok: false, error: { code: 'link_error', message: 'not linked' } }); return }
     const name = msg.method === 'tool_call' ? params.tool : params.task
     const wantsWrite = name === 'gpio.write' || name === 'gpio.config'
-    if (wantsWrite && !policy.allow_write) {
+    const taskDenied = msg.method === 'task' && !policy.allow_tasks && !policy.allowed_tasks?.includes(name)
+    if ((wantsWrite && !policy.allow_write) || taskDenied) {
       write({ id, ok: true, result: { ok: false, worker_id: params.worker_id,
         kind: msg.method === 'tool_call' ? 'tool' : 'task', name, cmd_id: 1, elapsed_ms: 3,
         payload: '', encoding: 'utf8',
@@ -137,13 +150,35 @@ rl.on('line', (line) => {
       payload: 'echo:' + (params.args ?? ''), encoding: 'utf8' } })
     return
   }
-  if (msg.method === 'policy.get') { write({ id, ok: true, result: { ...policy } }); return }
+  if (msg.method === 'policy.get') {
+    const reply = () => write({ id, ok: true, result: { ...policy } })
+    if (exactMismatch === 'startup') setTimeout(reply, 100)
+    else reply()
+    return
+  }
   if (msg.method === 'policy.set') {
+    const hasList = 'allowed_tasks' in params
+    if (hasList && exactMismatch === 'replay') {
+      setTimeout(() => write({ id, ok: true, result: { ...policy, allow_tasks: true, allowed_tasks: [] } }), 100)
+      return
+    }
+    if ((hasList && legacy) || (params.allow_tasks === true && params.allowed_tasks?.length > 0)) {
+      write({ id, ok: false, error: { code: 'invalid_arguments', message: 'invalid Task policy' } })
+      return
+    }
+    policyUpdates.push(params)
     if (typeof params.allow_write === 'boolean') policy.allow_write = params.allow_write
-    if (typeof params.allow_tasks === 'boolean') policy.allow_tasks = params.allow_tasks
+    if (typeof params.allow_tasks === 'boolean' || hasList) {
+      policy.allow_tasks = params.allow_tasks === true
+      if (!legacy) policy.allowed_tasks = hasList ? [...new Set(params.allowed_tasks)].sort() : []
+    }
     if (typeof params.allow_admin === 'boolean') policy.allow_admin = params.allow_admin
     if ('worker_filter' in params) policy.worker_filter = params.worker_filter ?? null
     write({ id, ok: true, result: { ...policy } })
+    return
+  }
+  if (msg.method === 'test_policy_updates') {
+    write({ id, ok: true, result: { updates: policyUpdates } })
     return
   }
   if (msg.method === 'status') {
@@ -323,7 +358,7 @@ const FAKE_DSH_TOOL_DEFINITIONS = Object.freeze([
  * agents.createImpl 可注入假实现（桥测试用）：未注入时给出伪造的 DSH
  * 工具清单、成功的 execute 结果和可 dispose 的假 agent 句柄。
  */
-function createFakeHost() {
+function createFakeHost(root) {
   const tools = new Map()
   const disposers = []
   const entries = []
@@ -374,6 +409,7 @@ function createFakeHost() {
     },
   }
   const ctx = {
+    root,
     logger,
     get(name) {
       if (name === 'tools') return toolsService
@@ -403,8 +439,9 @@ function createFakeHost() {
       }
     },
     teardown() {
-      for (const dispose of disposers.splice(0).reverse()) dispose()
+      const cleanup = disposers.splice(0).reverse().map((dispose) => dispose())
       generators.length = 0
+      return Promise.all(cleanup)
     },
   }
 }
@@ -728,6 +765,25 @@ function defineJsonlProcessTests(servePath) {
 }
 
 function defineRouterPluginTests(servePath) {
+  test('resolveRouterConfig validates and canonicalizes the exact Task allowlist', () => {
+    const config = (policy, extraArgs) => resolveRouterConfig({ policy, extraArgs })
+    assert.deepEqual(config().policy.allowedTasks, [])
+    assert.deepEqual(config({ allowedTasks: [' pc.ask  ', 'blink', 'pc.ask'] }).policy.allowedTasks, ['blink', 'pc.ask'])
+    assert.deepEqual(config({ allowedTasks: ['a'.repeat(48), 'a_0.-'] }).policy.allowedTasks, ['a_0.-', 'a'.repeat(48)])
+    const atLimit = Array.from({ length: 64 }, (_, i) => `task.${i}`)
+    assert.equal(config({ allowedTasks: [...atLimit, ...atLimit] }).policy.allowedTasks.length, 64)
+    assert.throws(() => config({ allowedTasks: [...atLimit, 'overflow'] }), /64 distinct/)
+    for (const allowedTasks of [null, 'blink', [null], [3], [''], ['  '], ['Blink'], ['任务'], ['pc.*'], ['a b'], ['ab\ncd'], ['a'.repeat(49)]]) {
+      assert.throws(() => config({ allowedTasks }), /policy\.allowedTasks/)
+    }
+    assert.throws(() => config({ allowTasks: true, allowedTasks: ['blink'] }), /conflicts/)
+    assert.equal(config({ allowTasks: true, allowedTasks: [] }).policy.allowTasks, true)
+    for (const extraArgs of [['--allow-tasks'], ['--allow-task', 'other'], ['--allow-task=other']]) {
+      assert.throws(() => config({ allowedTasks: ['blink'] }, extraArgs), /extraArgs Task flags conflict/)
+    }
+    assert.deepEqual(config({}, ['--allow-tasks']).extraArgs, ['--allow-tasks'])
+  })
+
   test('router 插件：工具注册、schema 卫生、autoLink、四工具转发、策略解锁', async () => {
     const host = createFakeHost()
     const plugin = new SekaiRouterPlugin(host.ctx, {
@@ -737,7 +793,11 @@ function defineRouterPluginTests(servePath) {
       requestTimeoutMs: 4000,
     })
     // seam：把真实 spawn 换成假 serve（node fake-serve.mjs --serve --link tcp ...）
-    plugin.serveSpawnTarget = (bin, args) => ({ command: process.execPath, args: [servePath, ...args] })
+    plugin.serveSpawnTarget = (bin, args) => ({
+      command: process.execPath,
+      args: [servePath, ...args],
+      env: { ...process.env, FAKE_LEGACY_ROUTER: '1' },
+    })
     host.start()
     try {
       assert.deepEqual(
@@ -756,7 +816,10 @@ function defineRouterPluginTests(servePath) {
       assert.ok(host.entries.some(([level, message]) => level === 'warn' && message.includes('unknown event')), 'unknown event warned')
       assert.match(plugin.state.linkDesc, /tcp 127\.0\.0\.1:7421/)
       await waitFor(() => plugin.state.workerCount === 1, { label: 'worker_online counted' })
-      assert.deepEqual(plugin.state.policy, { allowWrite: false, allowTasks: false, allowAdmin: false, workerFilter: null })
+      assert.deepEqual(plugin.state.policy, { allowWrite: false, allowTasks: false, allowedTasks: [], allowAdmin: false, workerFilter: null })
+      assert.deepEqual((await plugin.proc.request('test_policy_updates')).updates, [
+        { allow_write: false, allow_tasks: false, allow_admin: false },
+      ])
 
       // sekai_status：合并 status 响应
       const status = await host.tools.get('sekai_status').execute({}, {})
@@ -800,11 +863,12 @@ function defineRouterPluginTests(servePath) {
       assert.equal(granted.name, 'gpio.write')
       await plugin.proc.request('policy.set', { allow_write: false })
 
-      // sekai_worker_task：任务路径
-      const task = await host.tools.get('sekai_worker_task').execute(
-        { worker_id: 'pc-worker', task: 'blink', args: '', ddl_ms: 1000 },
-        {},
-      )
+      // Legacy Router: default deny; the original boolean still allows every Task.
+      const taskArgs = { worker_id: 'pc-worker', task: 'blink', args: '', ddl_ms: 1000 }
+      assert.equal((await taskTool.execute(taskArgs, {})).error.code, 'policy_denied')
+      await plugin.proc.request('policy.set', { allow_tasks: true })
+      const task = await taskTool.execute(taskArgs, {})
+      assert.equal((await host.tools.get('sekai_status').execute({}, {})).policy.allowTasks, true)
       assert.equal(task.ok, true)
       assert.equal(task.name, 'blink')
       assert.equal(task.kind, 'task')
@@ -841,6 +905,127 @@ function defineRouterPluginTests(servePath) {
     assert.equal(plugin.restartTimer, null)
     assert.equal(host.tools.size, 0, 'tools unregistered on teardown')
   })
+
+  test('router plugin passes and replays the exact CLI and JSONL Task policy on restart', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiRouterPlugin(host.ctx, {
+      routerBin: 'unused-sekai-router',
+      policy: { allowedTasks: ['pc.ask', ' blink ', 'pc.ask'] },
+      extraArgs: ['--max-steps', '10'],
+      requestTimeoutMs: 4000,
+    })
+    const spawns = []
+    plugin.serveSpawnTarget = (bin, args) => {
+      spawns.push(args)
+      return { command: process.execPath, args: [servePath, ...args] }
+    }
+    const argv = ['--serve', '--link', 'tcp', '--allow-task', 'blink', '--allow-task', 'pc.ask', '--max-steps', '10']
+    const replay = { allow_write: false, allow_tasks: false, allowed_tasks: ['blink', 'pc.ask'], allow_admin: false }
+    const verifyReplay = async () => {
+      assert.deepEqual((await plugin.proc.request('test_policy_updates')).updates, [replay])
+      const status = await host.tools.get('sekai_status').execute({}, {})
+      assert.equal(status.ready, true)
+      assert.equal(status.policy.allowTasks, false)
+      assert.deepEqual(status.policy.allowedTasks, ['blink', 'pc.ask'])
+    }
+    const completed = () => host.entries.filter(([, message]) => message.includes('autoLink complete')).length
+    host.start()
+    try {
+      await waitFor(() => completed() === 1, { label: 'exact policy applied' })
+      assert.deepEqual(spawns, [argv])
+      await verifyReplay()
+      const task = host.tools.get('sekai_worker_task')
+      const call = (name) => task.execute({ worker_id: 'pc-worker', task: name, args: '' }, {})
+      assert.equal((await call('blink')).ok, true)
+      assert.equal((await call('blink.fast')).error.code, 'policy_denied')
+
+      await plugin.proc.request('policy.set', { allowed_tasks: ['other'] })
+      const updated = await host.tools.get('sekai_status').execute({}, {})
+      assert.deepEqual(updated.policy.allowedTasks, ['other'], 'status uses live policy, not the config snapshot')
+      plugin.proc.kill()
+      await waitFor(() => completed() === 2, { label: 'exact policy replayed after restart' })
+      assert.deepEqual(spawns, [argv, argv])
+      await verifyReplay()
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('router plugin passes exact startup policy even without autoLink', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiRouterPlugin(host.ctx, {
+      routerBin: 'unused-sekai-router',
+      autoLink: false,
+      policy: { allowedTasks: ['blink'] },
+      requestTimeoutMs: 4000,
+    })
+    plugin.serveSpawnTarget = (bin, args) => ({ command: process.execPath, args: [servePath, ...args] })
+    host.start()
+    try {
+      await waitFor(() => plugin.exactPolicyProc !== null, { label: 'manual Router policy confirmed' })
+      const status = await host.tools.get('sekai_status').execute({}, {})
+      assert.equal(status.ready, false)
+      assert.deepEqual((await plugin.proc.request('policy.get')).allowed_tasks, ['blink'])
+      assert.deepEqual(status.policy.allowedTasks, ['blink'])
+      assert.deepEqual((await plugin.proc.request('test_policy_updates')).updates, [])
+      await plugin.proc.request('policy.set', { allow_tasks: false })
+      assert.deepEqual((await host.tools.get('sekai_status').execute({}, {})).policy.allowedTasks, [])
+    } finally {
+      host.teardown()
+    }
+  })
+
+  test('router plugin does not downgrade an exact allowlist for an old Router', async () => {
+    const host = createFakeHost()
+    const plugin = new SekaiRouterPlugin(host.ctx, {
+      routerBin: 'unused-sekai-router',
+      policy: { allowedTasks: ['blink'] },
+      requestTimeoutMs: 1000,
+    })
+    const spawns = []
+    plugin.serveSpawnTarget = (bin, args) => {
+      spawns.push(args)
+      return { command: process.execPath, args: [servePath, ...args], env: { ...process.env, FAKE_LEGACY_ROUTER: '1' } }
+    }
+    host.start()
+    try {
+      await waitFor(() => spawns.length >= 2 && plugin.lastExitInfo?.code === 2, { label: 'unsupported Router restarts without fallback' })
+      assert.ok(spawns.every((args) => args.includes('--allow-task') && !args.includes('--allow-tasks')))
+      assert.equal(plugin.state.ready, false)
+    } finally {
+      host.teardown()
+    }
+  })
+
+  for (const [phase, autoLink] of [['startup', false], ['replay', true]]) {
+    test(`router plugin blocks Worker calls while verifying exact policy at ${phase}`, async () => {
+      const host = createFakeHost()
+      const plugin = new SekaiRouterPlugin(host.ctx, {
+        routerBin: 'unused-sekai-router',
+        autoLink,
+        policy: { allowedTasks: ['blink'] },
+        requestTimeoutMs: 1000,
+      })
+      plugin.serveSpawnTarget = (bin, args) => ({
+        command: process.execPath,
+        args: [servePath, ...args],
+        env: { ...process.env, FAKE_ROUTER_POLICY_MISMATCH: phase },
+      })
+      host.start()
+      try {
+        await waitFor(() => autoLink ? plugin.state.ready : plugin.autoLinkBusy, { label: `${phase} verification pending` })
+        const call = await host.tools.get('sekai_worker_task').execute({ worker_id: 'pc-worker', task: 'blink', args: '' }, {})
+        assert.equal(call.error.code, 'policy_unverified')
+        const workers = await host.tools.get('sekai_list_workers').execute({}, {})
+        assert.equal(workers.error.code, 'policy_unverified')
+        assert.equal(plugin.exactPolicyProc, null)
+        await waitFor(() => plugin.lastExitInfo, { label: `${phase} verification failed and exited` })
+        assert.ok(host.entries.some(([, message]) => message.includes('has not confirmed the configured exact Task allowlist')))
+      } finally {
+        host.teardown()
+      }
+    })
+  }
 
   test('router 插件：link 读 addr；链路断开时 status 探测补发 link_state 且幂等', async () => {
     const host = createFakeHost()
@@ -2045,6 +2230,137 @@ function defineDshToolsBridgeTests(workerPath, workerDshPath) {
   })
 }
 
+function defineHotUpdateTests(servePath, workerPath, dir) {
+  const home = join(dir, 'updates')
+  const managed = (name) => join(home, 'sekai', 'bin', 'profiles', name)
+  const hex = (character) => character.repeat(64)
+  async function publish(profile, id, bundle, router = id, worker = id) {
+    const base = managed(profile)
+    const generation = hex(id)
+    const deployed = join(base, 'generations', generation)
+    const ext = process.platform === 'win32' ? '.exe' : ''
+    await mkdir(deployed, { recursive: true })
+    await Promise.all([
+      writeFile(join(deployed, `sekai-router${ext}`), router),
+      writeFile(join(deployed, `sekai-worker${ext}`), worker),
+      writeFile(join(deployed, 'manifest.json'), JSON.stringify({
+        version: 1, bundle: hex(bundle), binaries: { 'sekai-router': hex(router), 'sekai-worker': hex(worker) },
+      })),
+    ])
+    await writeFile(join(base, 'next.json'), JSON.stringify({ version: 1, generation }))
+    await rename(join(base, 'next.json'), join(base, 'current.json'))
+    return generation
+  }
+
+  test('hot deployment: changed binary replaces Router after exit and replays policy', async () => {
+    const profile = 'binary-only'
+    const initial = await publish(profile, '1', 'a')
+    const root = { get: (key) => key === 'profileContext' ? { home, name: profile } : undefined }
+    const host = createFakeHost(root)
+    const portServer = net.createServer()
+    const port = await listen(portServer)
+    await closeServer(portServer)
+    const boundServePath = join(dir, 'bound-serve.mjs')
+    const script = await readFile(servePath, 'utf8')
+    await writeFile(boundServePath, `import net from 'node:net'\nconst owner = net.createServer()\nawait new Promise((ok, fail) => owner.once('error', fail).listen(${port}, '127.0.0.1', ok))\n` + script)
+    const router = new SekaiRouterPlugin(host.ctx, { policy: { allowedTasks: ['blink'] } })
+    const worker = new SekaiWorkerPlugin(host.ctx, { autoConnect: true })
+    const spawns = []
+    router.serveSpawnTarget = (bin, args) => {
+      spawns.push(bin)
+      return { command: process.execPath, args: [boundServePath, ...args] }
+    }
+    worker.workerSpawnTarget = (_, args) => ({
+      command: process.execPath, args: [workerPath, ...args],
+      env: { ...process.env, FAKE_WORKER_HOLD: '1', FAKE_WORKER_LIFETIME_MS: '600000' },
+    })
+    host.start()
+    try {
+      await waitFor(() => router.state.ready && worker.child?.pid, { label: 'both started' })
+      const oldRouter = router.proc
+      const oldWorker = worker.child
+      assert.equal((await router.statusValue()).binaryGeneration, initial)
+      await publish('other-profile', '9', 'f')
+      const generation = await publish(profile, '2', 'a', '2', '1')
+      await waitFor(() => router.binaryTarget?.generation === generation && router.state.ready, { label: 'updated Router reclaimed port' })
+      assert.ok(oldRouter.exited)
+      assert.notEqual(router.proc.pid, oldRouter.pid)
+      assert.equal(worker.child, oldWorker, 'unchanged Worker binary is not interrupted')
+      assert.equal(spawns.length, 2)
+      assert.deepEqual((await router.proc.request('policy.get', {})).allowed_tasks, ['blink'])
+      assert.equal((await router.statusValue()).binaryGeneration, generation)
+    } finally {
+      await host.teardown()
+    }
+  })
+
+  test('hot bundle update hands over a manually connected Worker and preserves a manual disconnect', async () => {
+    const profile = 'bundle-update'
+    await publish(profile, '1', 'a')
+    const stateFile = join(dir, 'manual-hot-worker-state.json')
+    const address = '127.0.0.1:7411'
+    let refresh, hostReady, current, reloads = 0, spawns = 0, fail = false, ready = false
+    const entries = []
+    const hmr = {
+      async watchConfig(_, callback) { refresh = callback; return () => { refresh = undefined } },
+      async reconcileProfile() {
+        reloads++
+        if (fail) throw new Error('synthetic HMR failure')
+        const old = current.worker.child
+        await current.host.teardown()
+        if (old) assert.ok(old.exitCode != null || old.signalCode != null)
+        mount(reloads === 1 ? false : true)
+        return { warnings: [], pending: [] }
+      },
+    }
+    const appReady = { onReady(callback) { hostReady = callback; return () => { hostReady = undefined } } }
+    const root = {
+      get: (key) => ({ profileContext: { home, name: profile }, appReady, hmr: ready ? hmr : undefined })[key],
+      logger: { warn: (line) => entries.push(line) },
+    }
+    function mount(autoConnect) {
+      const host = createFakeHost(root)
+      const worker = new SekaiWorkerPlugin(host.ctx, { autoConnect, stateFile })
+      worker.workerSpawnTarget = (_, args) => {
+        spawns++
+        return { command: process.execPath, args: [workerPath, ...args] }
+      }
+      current = { host, worker }
+      host.start()
+    }
+    mount(false)
+    try {
+      assert.equal(refresh, undefined, 'wait for DSH services before choosing the watcher')
+      ready = true
+      hostReady()
+      assert.equal(typeof refresh, 'function')
+      assert.ok(!current.worker.child)
+      await current.worker.connectWorker(address)
+      const initial = await waitFor(() => current.worker.child?.pid, { label: 'manually started Worker' })
+      fail = true
+      await publish(profile, '2', 'b')
+      await refresh()
+      assert.equal(current.worker.child.pid, initial)
+      assert.ok(entries.some((line) => line.includes('synthetic HMR failure')))
+      fail = false
+      const generation = await publish(profile, '3', 'c')
+      await refresh()
+      const replacement = await waitFor(() => current.worker.child?.pid, { label: 'manual Worker restarted by HMR' })
+      assert.notEqual(replacement, initial)
+      assert.equal(current.worker.routerAddr, address)
+      assert.equal(current.worker.statusValue().binaryGeneration, generation)
+      assert.equal(spawns, 2)
+      await current.worker.disconnectWorker()
+      await publish(profile, '4', 'd')
+      await refresh()
+      assert.equal(current.worker.child, null)
+      assert.equal(spawns, 2)
+    } finally {
+      await current.host.teardown()
+    }
+  })
+}
+
 // ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
@@ -2075,6 +2391,7 @@ async function main() {
   defineAutoConnectTests(workerPath, dir)
   definePromptRelayTests(workerPath, workerPromptPath)
   defineDshToolsBridgeTests(workerPath, workerDshPath)
+  defineHotUpdateTests(servePath, workerPath, dir)
 
   const failures = []
   for (const { name, fn } of tests) {

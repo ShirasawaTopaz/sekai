@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Sekai 桥接",
-    "description": "把 DSH 接到 Sekai 世界。router 插件运行 `sekai-router --serve` 并发布 sekai_status、sekai_list_workers、sekai_worker_tool、sekai_worker_task；worker 插件运行 `sekai-worker connect`，按 autoConnect 自动连回上次的 Router、中转 pc.ask prompt，并发布 sekai_worker_status 与手动 connect/disconnect 工具。在「插件」页启用后重启会话，工具才会出现。两个二进制都在本机 spawn；写操作与 Task 默认拒绝，需在插件设置里打开 policy.allowWrite / policy.allowTasks。",
+    "description": "把 DSH 接到 Sekai 世界。router 插件运行 `sekai-router --serve` 并发布 sekai_status、sekai_list_workers、sekai_worker_tool、sekai_worker_task；worker 插件运行 `sekai-worker connect`，按 autoConnect 自动连回上次的 Router、中转 pc.ask prompt，并发布 sekai_worker_status 与手动 connect/disconnect 工具。在「插件」页启用后重启会话，工具才会出现。两个二进制都在本机运行。Router 设置中的 policy.allowWrite 允许写操作，policy.allowedTasks 仅授权指定名称的 Task，policy.allowTasks 则授权所有 Task。写操作与 Task 默认拒绝。",
     "detail": "docs/DETAIL.zh.md"
   }
 }

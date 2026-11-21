@@ -8,6 +8,7 @@
  * @module @sekai/dsh-plugin
  */
 export { SekaiRouterPlugin, ROUTER_DEFAULTS, ROUTER_SPAWN_HINT, MAX_DDL_MS } from './router.js'
+export { apply, inject } from './status.js'
 export {
   SekaiWorkerPlugin,
   WORKER_DEFAULTS,

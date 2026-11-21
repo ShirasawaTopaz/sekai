@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x64
+          - os: windows-latest
+            platform: windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag and build
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "sekai-router") | .version')
+          test "$GITHUB_REF_NAME" = "v$version"
+          cargo test --workspace --locked
+          cargo build --locked --release -p sekai-router -p sekai-worker
+          cargo build --locked --release -p sekai-worker --features uart-bridge --bin stm32-bridge
+      - name: Archive Linux binaries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          tar -czf "sekai-$GITHUB_REF_NAME-linux-x64.tar.gz" -C target/release sekai-router sekai-worker stm32-bridge
+      - name: Archive Windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tar = Join-Path $env:WINDIR 'System32/tar.exe'
+          & $tar --format zip -cf "sekai-$env:GITHUB_REF_NAME-windows-x64.zip" -C target/release sekai-router.exe sekai-worker.exe stm32-bridge.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.platform }}
+          path: sekai-${{ github.ref_name }}-${{ matrix.platform }}.*
+          if-no-files-found: error
+
+  draft:
+    needs: binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          path: dist
+          merge-multiple: true
+      - name: Create release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum sekai-* > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes dist/*

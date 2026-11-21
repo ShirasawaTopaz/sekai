@@ -45,6 +45,8 @@ pub mod control;
 pub mod direct;
 pub mod direct_gateway;
 pub mod feishu;
+pub mod feishu_api;
+mod feishu_task_policy;
 pub mod gateway;
 pub mod host_link;
 pub mod http;

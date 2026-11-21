@@ -249,6 +249,8 @@ pub struct Agent<C: ChatClient, G: WorkerGateway> {
     cancel: CancelToken,
     /// 带外前端注入的会话上下文（`None` = 纯文本目标，行为同旧版）。
     context: Option<ConversationContext>,
+    /// 仅由已鉴权的飞书前端按运行注入，不向其它入口共享。
+    feishu_tools: Option<Arc<crate::feishu_api::FeishuTools>>,
 }
 
 impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
@@ -268,6 +270,7 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             trace,
             cancel: CancelToken::new(),
             context: None,
+            feishu_tools: None,
         }
     }
 
@@ -280,6 +283,12 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
     /// 挂接带外前端的会话上下文（飞书多轮记忆 + 会话元数据）。
     pub fn with_conversation_context(mut self, context: ConversationContext) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// 注入本轮飞书工具；凭据与工具能力不进入会话历史。
+    pub fn with_feishu_tools(mut self, tools: Arc<crate::feishu_api::FeishuTools>) -> Self {
+        self.feishu_tools = Some(tools);
         self
     }
 
@@ -301,6 +310,9 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             ],
         );
         let mut system = crate::prompt::system_prompt(&workers, &self.policy);
+        if self.feishu_tools.is_some() {
+            system.push_str(&crate::prompt::feishu_tools_block());
+        }
         let mut messages: Vec<Message> = Vec::new();
         if let Some(context) = &self.context {
             system.push_str(&crate::prompt::conversation_context_block(context));
@@ -317,7 +329,10 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             }
         }
         messages.push(Message::user(goal));
-        let tools = tools::tool_defs();
+        let mut tools = tools::tool_defs();
+        if let Some(feishu) = &self.feishu_tools {
+            tools.extend(feishu.tool_defs());
+        }
         let mut usage = Usage::default();
         let mut records: Vec<ToolCallRecord> = Vec::new();
         let mut had_worker_failure = false;
@@ -565,6 +580,27 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
     }
 
     fn execute_call_inner(&mut self, call: &ToolCall) -> CallOutcome {
+        if let Some(feishu) = &self.feishu_tools
+            && feishu.handles(&call.name)
+        {
+            let json = feishu.execute(&call.name, &call.arguments, self.policy.allow_write);
+            let ok = json.get("ok").and_then(Json::as_bool) == Some(true);
+            let error_code = json
+                .get_path(&["error", "code"])
+                .and_then(Json::as_str)
+                .map(String::from);
+            return CallOutcome {
+                json,
+                record: ToolCallRecord {
+                    function: call.name.clone(),
+                    worker_id: None,
+                    name: Some(call.name.clone()),
+                    ok,
+                    error_code,
+                },
+                worker_failure: false,
+            };
+        }
         if !is_known_function(&call.name) {
             return failure_outcome(
                 &call.name,
@@ -627,20 +663,22 @@ impl<C: ChatClient, G: WorkerGateway> Agent<C, G> {
             .list_workers()
             .into_iter()
             .find(|worker| worker.worker_id == worker_id);
-        if let Err(denied) = tools::check_policy_for_worker(&self.policy, parsed, worker.as_ref()) {
-            return failure_outcome(
-                &call.name,
-                &worker_id,
-                Some(requested_kind),
-                &name,
-                tools::CODE_POLICY_DENIED,
-                &denied.to_string(),
-                false,
-                false,
-            );
-        }
-        // D5：按「名字 → 线类型」自动路由（Worker tasks 列表 / pc.ask/pc.job）。
-        let kind = tools::route_command_kind(worker.as_ref(), &name, requested_kind);
+        let kind = match tools::authorize_worker_call(&self.policy, parsed, worker.as_ref()) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => unreachable!("execute_worker_command requires a Worker command"),
+            Err(denied) => {
+                return failure_outcome(
+                    &call.name,
+                    &worker_id,
+                    Some(requested_kind),
+                    &name,
+                    tools::CODE_POLICY_DENIED,
+                    &denied.to_string(),
+                    false,
+                    false,
+                );
+            }
+        };
         let request = CommandRequest {
             worker_id: worker_id.clone(),
             kind,

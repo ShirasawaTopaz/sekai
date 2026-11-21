@@ -10,6 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { after, before, test } from 'node:test'
 import {
   chmodSync,
@@ -17,8 +18,10 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -48,6 +51,7 @@ function getProfile() {
   if (index === -1) die('缺少 --profile')
   const profile = argv[index + 1]
   if (!profile) die('--profile 缺少值')
+  if (profile !== process.env.DSH_PROFILE) die('DSH_PROFILE 与 --profile 不一致')
   return profile
 }
 function copyTree(source, dest) {
@@ -68,13 +72,16 @@ function register(pkg, profile, spec) {
   if (!pkg.dsh.profile.bundles.includes('@sekai/dsh-plugin')) pkg.dsh.profile.bundles.push('@sekai/dsh-plugin')
   writeJson(profilePackage(profile), pkg)
 }
-function addPlugin(profile, spec) {
+function addPlugin(profile, spec, force) {
   if (!spec.startsWith('file:')) die('add 只支持 file: spec，收到：' + spec)
   const source = spec.slice('file:'.length)
   if (!fs.existsSync(path.join(source, 'package.json'))) die('插件目录不存在：' + source)
   const pkg = readJson(profilePackage(profile))
   if (process.env.FAKE_DSH_SKIP_REGISTER === '1') return
   const dest = path.join(profilesDir, profile, 'node_modules', '@sekai', 'dsh-plugin')
+  fs.appendFileSync(path.join(profilesDir, profile, 'cli.log'), force ? 'force\n' : 'add\n')
+  if (force && process.env.FAKE_DSH_FORCE_FAIL === '1') die('forced refresh failed')
+  if ((!force && fs.existsSync(dest)) || (force && process.env.FAKE_DSH_STAY_STALE === '1')) return
   fs.rmSync(dest, { recursive: true, force: true })
   copyTree(source, dest)
   register(pkg, profile, spec)
@@ -114,7 +121,7 @@ if (argv[0] === 'plugin') {
   const subcommand = argv[index]
   const target = argv[index + 1]
   if (!target) die(subcommand + ' 缺少目标')
-  if (subcommand === 'add') addPlugin(profile, target)
+  if (subcommand === 'add') addPlugin(profile, target, argv.includes('--force'))
   else removePlugin(profile, target)
   process.exit(0)
 }
@@ -122,34 +129,22 @@ if (argv[0] === 'plugin') {
 die('不支持的 argv：' + argv.join(' '))
 `
 
-/** stub 插件入口：与真实插件同一 4 参 resolveBin 契约，命中 <DSH_HOME>/sekai/bin。 */
+/** stub 插件入口与真实插件共享候选 generation 解析契约。 */
 const STUB_PLUGIN_INDEX = String.raw`
+export { resolveBin } from './shared.js'
+
+export class SekaiRouterPlugin {}
+export class SekaiWorkerPlugin {}
+`
+const STUB_PLUGIN_SHARED = String.raw`
 import { existsSync } from 'node:fs'
-import { homedir } from 'node:os'
 import path from 'node:path'
 
 const SUFFIX = process.platform === 'win32' ? '.exe' : ''
 
-export class SekaiRouterPlugin {
-  constructor() {
-    this.id = 'sekai-router'
-  }
-}
-
-export class SekaiWorkerPlugin {
-  constructor() {
-    this.id = 'sekai-worker'
-  }
-}
-
-export function resolveBin(configured, envKey, defaultBin, options = {}) {
-  if (typeof configured === 'string' && configured.trim() !== '' && configured !== defaultBin) return configured
-  const env = options.env ?? process.env
-  const fromEnv = env[envKey]
-  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv
-  const envHome = typeof env.DSH_HOME === 'string' && env.DSH_HOME.trim() !== '' ? env.DSH_HOME : ''
-  const home = envHome !== '' ? envHome : path.join(homedir(), '.dsh')
-  const candidate = path.join(home, 'sekai', 'bin', defaultBin + SUFFIX)
+export function resolveBin(configured, envKey, defaultBin, { env, generation } = {}) {
+  if (!env?.DSH_HOME || !env?.DSH_PROFILE || !/^[a-f0-9]{64}$/.test(generation)) return defaultBin
+  const candidate = path.join(env.DSH_HOME, 'sekai', 'bin', 'profiles', env.DSH_PROFILE, 'generations', generation, defaultBin + SUFFIX)
   return existsSync(candidate) ? candidate : defaultBin
 }
 `
@@ -191,8 +186,28 @@ function writeFakeBinary(dir, base) {
   return file
 }
 
-function deployedBinary(base) {
-  return path.join(dshHome, 'sekai', 'bin', IS_WIN ? `${base}.exe` : base)
+function managedDir(profile) {
+  return path.join(dshHome, 'sekai', 'bin', 'profiles', profile)
+}
+
+function markerPath(profile) {
+  return path.join(managedDir(profile), 'current.json')
+}
+
+function readMarker(profile) {
+  return JSON.parse(readFileSync(markerPath(profile), 'utf8'))
+}
+
+function generationDir(profile, generation = readMarker(profile).generation) {
+  return path.join(managedDir(profile), 'generations', generation)
+}
+
+function deployedBinary(profile, base, generation) {
+  return path.join(generationDir(profile, generation), IS_WIN ? `${base}.exe` : base)
+}
+
+function cliCalls(profile) {
+  return readFileSync(path.join(profilesDir, profile, 'cli.log'), 'utf8').trim().split('\n')
 }
 
 /** 可注入的字符串输出流（替代 process.stdout/stderr）。 */
@@ -263,6 +278,8 @@ before(() => {
     )}\n`,
   )
   writeFileSync(path.join(pluginDir, 'lib', 'index.js'), STUB_PLUGIN_INDEX)
+  writeFileSync(path.join(pluginDir, 'lib', 'shared.js'), STUB_PLUGIN_SHARED)
+  writeFileSync(path.join(pluginDir, 'cordis.patch.yml'), '[]\n')
 
   // 假 dsh：win 生成 .cmd 包装 node 实现；unix 生成带 shebang 的可执行脚本。
   const fakeDir = path.join(tempRoot, 'fake-dsh')
@@ -398,11 +415,21 @@ test('首次安装成功：依赖 file:、bundles 含、部署两文件、resolv
   assert.equal(pkg.dsh.profile.bundles.filter((entry) => entry === PLUGIN_PACKAGE).length, 1)
   assert.ok(pkg.dsh.profile.bundles.includes('@deepseek-ai/dsh-base'))
 
+  const marker = readMarker('testprof')
+  assert.deepEqual(Object.keys(marker).sort(), ['generation', 'version'])
+  assert.equal(marker.version, 1)
+  assert.match(marker.generation, /^[a-f0-9]{64}$/)
+  const manifest = JSON.parse(readFileSync(path.join(generationDir('testprof'), 'manifest.json'), 'utf8'))
+  assert.equal(manifest.version, 1)
+  assert.match(manifest.bundle, /^[a-f0-9]{64}$/)
   for (const base of ['sekai-router', 'sekai-worker']) {
-    const file = deployedBinary(base)
-    assert.ok(existsSync(file), `缺少部署文件 ${file}`)
-    assert.ok(statSync(file).size > 0, `部署文件为空 ${file}`)
+    const file = deployedBinary('testprof', base)
+    const bytes = readFileSync(file)
+    assert.equal(bytes.toString(), `fake-${base}-binary\n`)
+    assert.equal(manifest.binaries[base], createHash('sha256').update(bytes).digest('hex'))
+    assert.equal(existsSync(path.join(dshHome, 'sekai', 'bin', path.basename(file))), false)
   }
+  assert.deepEqual(cliCalls('testprof'), ['add'])
 
   assert.ok(existsSync(path.join(profilePluginsDir('testprof'), 'package.json')))
 
@@ -411,18 +438,77 @@ test('首次安装成功：依赖 file:、bundles 含、部署两文件、resolv
   assert.match(out, /\[ok\] 校验 c：sekai-router 零配置解析命中/)
   assert.match(out, /\[ok\] 校验 c：sekai-worker 零配置解析命中/)
   assert.match(out, /\[ok\] 校验 d/)
-  assert.match(out, /下一步/)
-  assert.match(out, /sekai_\*/)
+  assert.match(out, /已发布 generation/)
+  assert.match(out, /只验证了磁盘上的安装/)
 })
 
-test('重复安装幂等：bundles 不重复、依赖不变', async () => {
+test('重复安装幂等：依赖、CLI 调用和发布标记不变', async () => {
   const first = readProfilePackage('testprof')
+  const marker = readMarker('testprof')
+  const calls = cliCalls('testprof')
   const { code, err } = await runInstaller()
   assert.equal(code, 0, `stderr=${err}`)
+  assert.deepEqual(readProfilePackage('testprof'), first)
+  assert.deepEqual(readMarker('testprof'), marker)
+  assert.deepEqual(cliCalls('testprof'), calls)
+})
 
-  const second = readProfilePackage('testprof')
-  assert.deepEqual(second.dependencies, first.dependencies)
-  assert.equal(second.dsh.profile.bundles.filter((entry) => entry === PLUGIN_PACKAGE).length, 1)
+test('代码和二进制独立升级，失败保留标记和旧文件', async () => {
+  const profile = 'updateprof'
+  makeProfile(profile)
+  assert.equal((await runInstaller({ profile })).code, 0)
+  const initial = readMarker(profile).generation
+  const oldBundle = readFileSync(path.join(generationDir(profile), 'manifest.json'), 'utf8')
+  const sourceEntry = path.join(fixtureRepo, 'plugins', 'sekai-dsh', 'lib', 'index.js')
+  const source = readFileSync(sourceEntry, 'utf8')
+  const isolatedBinaryDir = path.join(tempRoot, 'changed-bin')
+  mkdirSync(isolatedBinaryDir)
+  const router = writeFakeBinary(isolatedBinaryDir, 'sekai-router')
+  writeFakeBinary(isolatedBinaryDir, 'sekai-worker')
+  try {
+    writeFileSync(sourceEntry, `${source}\nexport const updateProbe = true\n`)
+    for (const flag of ['FAKE_DSH_FORCE_FAIL', 'FAKE_DSH_STAY_STALE']) {
+      const failed = await runInstaller({ profile, env: { ...baseEnv, [flag]: '1' } })
+      assert.notEqual(failed.code, 0)
+      assert.equal(readMarker(profile).generation, initial)
+    }
+    const jsOnly = await runInstaller({ profile })
+    assert.equal(jsOnly.code, 0, jsOnly.err)
+    const jsGeneration = readMarker(profile).generation
+    assert.notEqual(jsGeneration, initial)
+    assert.deepEqual(readFileSync(deployedBinary(profile, 'sekai-router')), readFileSync(deployedBinary(profile, 'sekai-router', initial)))
+    assert.equal(readFileSync(path.join(generationDir(profile, initial), 'manifest.json'), 'utf8'), oldBundle)
+
+    writeFileSync(router, 'router v2\n')
+    const calls = cliCalls(profile)
+    const binaryOnly = await runInstaller({ profile, binDir: isolatedBinaryDir })
+    assert.equal(binaryOnly.code, 0, binaryOnly.err)
+    assert.notEqual(readMarker(profile).generation, jsGeneration)
+    assert.deepEqual(cliCalls(profile), calls)
+    assert.equal(readFileSync(deployedBinary(profile, 'sekai-router'), 'utf8'), 'router v2\n')
+    assert.equal(readMarker('testprof').generation, initial)
+
+    const marker = readMarker(profile)
+    writeFileSync(markerPath(profile), '{invalid marker')
+    const repair = await runInstaller({ profile, binDir: isolatedBinaryDir })
+    assert.equal(repair.code, 0, repair.err)
+    assert.deepEqual(readMarker(profile), marker)
+    assert.deepEqual(cliCalls(profile), calls)
+  } finally {
+    writeFileSync(sourceEntry, source)
+  }
+})
+
+test('同一 profile 的安装和卸载由同一个锁串行化', async () => {
+  const profile = 'lockedprof'
+  const dir = makeProfile(profile)
+  mkdirSync(path.join(dir, '.sekai-install.lock'))
+  for (const extra of [[], ['--uninstall']]) {
+    const result = await runInstaller({ profile, extra })
+    assert.notEqual(result.code, 0)
+    assert.match(result.err, /另一个 Sekai 安装或卸载占用/)
+    assert.equal(existsSync(markerPath(profile)), false)
+  }
 })
 
 test('校验失败路径：dsh 未注册插件时非零退出且带 hint', async () => {
@@ -432,8 +518,8 @@ test('校验失败路径：dsh 未注册插件时非零退出且带 hint', async
   assert.match(err, /\[fail\]/)
   assert.match(err, /校验 b 失败/)
   assert.match(err, /hint:/)
-  // 部署步骤已成功（失败发生在注册校验），说明脚本确实部署了二进制。
-  assert.ok(existsSync(deployedBinary('sekai-router')))
+  assert.equal(existsSync(markerPath('failprof')), false)
+  assert.ok(existsSync(path.join(managedDir('failprof'), 'generations')))
 })
 
 test('--strict：--dump-config 缺组件行时失败；默认只告警', async () => {
@@ -442,6 +528,7 @@ test('--strict：--dump-config 缺组件行时失败；默认只告警', async (
   const strictRun = await runInstaller({ profile: 'strictprof', env, extra: ['--strict'] })
   assert.notEqual(strictRun.code, 0)
   assert.match(strictRun.err, /校验 d 失败/)
+  assert.equal(existsSync(markerPath('strictprof')), false)
 
   const lenientRun = await runInstaller({ profile: 'strictprof', env })
   assert.equal(lenientRun.code, 0, `stderr=${lenientRun.err}`)
@@ -462,10 +549,9 @@ test('--uninstall：清理依赖与 bundles 条目，保留二进制与状态文
   assert.equal(pkg.dsh.profile.bundles.includes(PLUGIN_PACKAGE), false)
   assert.equal(existsSync(profilePluginsDir('testprof')), false)
   // 二进制与状态文件保留，并打印清理提示。
-  assert.ok(existsSync(deployedBinary('sekai-router')))
-  assert.ok(existsSync(deployedBinary('sekai-worker')))
+  assert.ok(existsSync(deployedBinary('testprof', 'sekai-router')))
+  assert.ok(existsSync(deployedBinary('testprof', 'sekai-worker')))
   assert.ok(existsSync(stateFile))
-  assert.match(out, /保留二进制目录/)
+  assert.match(out, /保留二进制及 generation 标记/)
   assert.match(out, /保留 worker 状态文件/)
-  assert.match(out, /清理示例/)
 })

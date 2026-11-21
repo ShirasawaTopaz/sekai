@@ -51,11 +51,13 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::agent::{Agent, AgentConfig, AgentStatus, CancelToken, ConversationContext};
+use crate::feishu_task_policy::{Mutation, MutationResult, TaskPolicyStore};
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::json::Json;
 use crate::llm::{ChatClient, Usage};
@@ -125,8 +127,8 @@ pub struct PromptCore<C: ChatClient + Clone> {
     builder: Box<dyn Fn() -> Option<C> + Send + Sync>,
     /// 网关快照（None = 未连接）。
     gateway: Mutex<Option<GatewayHandle>>,
-    /// 策略快照（执行时克隆并置 deny_llm_relay=true）。
-    policy: Mutex<Policy>,
+    /// 启动/会话策略与飞书动态授权共用互斥锁，保存成功后原子发布快照。
+    policy: Mutex<PromptPolicy>,
     /// 跨连接的 Agent 运行许可（上限 `MAX_CONCURRENT_PROMPT_RUNS`）。
     run_gate: RunGate,
     /// ingress 计数（连接/拒绝/限流/prompt 次数）。
@@ -137,6 +139,28 @@ pub struct PromptCore<C: ChatClient + Clone> {
     trace: TraceWriter,
 }
 
+struct PromptPolicy {
+    base: Policy,
+    feishu_tasks: Option<TaskPolicyStore>,
+}
+
+impl PromptPolicy {
+    fn new(base: Policy) -> Self {
+        Self {
+            base,
+            feishu_tasks: None,
+        }
+    }
+
+    fn effective(&self) -> Policy {
+        let mut policy = self.base.clone();
+        if let Some(store) = &self.feishu_tasks {
+            policy.tasks = store.effective(&policy.tasks);
+        }
+        policy
+    }
+}
+
 impl<C: ChatClient + Clone> PromptCore<C> {
     /// 直接给定 chat 客户端（REPL：与会话共用同一客户端克隆）。
     pub fn new(chat: C, policy: Policy, agent_config: AgentConfig, trace: TraceWriter) -> Self {
@@ -145,7 +169,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             // 槽位已预填，构造器不会被触发；返回 None 仅作占位。
             builder: Box::new(|| None::<C>),
             gateway: Mutex::new(None),
-            policy: Mutex::new(policy),
+            policy: Mutex::new(PromptPolicy::new(policy)),
             run_gate: RunGate::new(),
             ingress_stats: Arc::new(IngressStats::default()),
             agent_config: Mutex::new(agent_config),
@@ -165,7 +189,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
             chat: Mutex::new(None),
             builder,
             gateway: Mutex::new(None),
-            policy: Mutex::new(policy),
+            policy: Mutex::new(PromptPolicy::new(policy)),
             run_gate: RunGate::new(),
             ingress_stats: Arc::new(IngressStats::default()),
             agent_config: Mutex::new(agent_config),
@@ -180,15 +204,51 @@ impl<C: ChatClient + Clone> PromptCore<C> {
 
     /// 同步策略（`/policy`、serve policy.set 修改后调用）。
     pub fn set_policy(&self, policy: Policy) {
-        *self.policy.lock().unwrap_or_else(|p| p.into_inner()) = policy;
+        let mut state = self.policy.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(store) = &state.feishu_tasks
+            && !store.fits_base(&policy.tasks)
+        {
+            eprintln!("sekai-router: 警告：基础与动态 Task 授权的并集超限；已停用飞书动态授权");
+            state.feishu_tasks = None;
+        }
+        state.base = policy;
     }
 
-    /// 当前策略快照（测试用）。
+    /// 当前有效策略（启动策略与持久化的飞书动态名单合并）。
     pub fn policy(&self) -> Policy {
         self.policy
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .effective()
+    }
+
+    pub(crate) fn load_feishu_tasks(&self, path: &Path, app_id: &str) -> std::io::Result<()> {
+        let mut state = self.policy.lock().unwrap_or_else(|p| p.into_inner());
+        state.feishu_tasks = None;
+        state.feishu_tasks = Some(TaskPolicyStore::load(path, app_id, &state.base.tasks)?);
+        Ok(())
+    }
+
+    pub(crate) fn feishu_task_list(&self) -> Option<(tools::TaskAccess, Vec<String>)> {
+        let state = self.policy.lock().unwrap_or_else(|p| p.into_inner());
+        let store = state.feishu_tasks.as_ref()?;
+        Some((
+            state.base.tasks.clone(),
+            store.grants().iter().cloned().collect(),
+        ))
+    }
+
+    pub(crate) fn mutate_feishu_tasks(
+        &self,
+        message_id: &str,
+        mutation: Mutation<'_>,
+    ) -> std::io::Result<Option<MutationResult>> {
+        let mut state = self.policy.lock().unwrap_or_else(|p| p.into_inner());
+        let PromptPolicy { base, feishu_tasks } = &mut *state;
+        feishu_tasks
+            .as_mut()
+            .map(|store| store.mutate(&base.tasks, message_id, mutation))
+            .transpose()
     }
 
     /// 同步 agent 步数上限（链路类型变化时按链路更新默认值用）。
@@ -238,7 +298,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         text: &str,
         max_steps: Option<u32>,
     ) -> Result<PromptRunResult, PromptRunError> {
-        self.run_prompt_inner(text, max_steps, None, None)
+        self.run_prompt_inner(text, max_steps, None, None, None)
     }
 
     /// 同 [`PromptCore::run_prompt`]，额外挂上协作式取消令牌。
@@ -252,7 +312,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         max_steps: Option<u32>,
         cancel: CancelToken,
     ) -> Result<PromptRunResult, PromptRunError> {
-        self.run_prompt_inner(text, max_steps, Some(cancel), None)
+        self.run_prompt_inner(text, max_steps, Some(cancel), None, None)
     }
 
     /// 同 [`PromptCore::run_prompt_with_cancel`]，额外注入带外前端的会话上下文
@@ -268,7 +328,20 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         cancel: CancelToken,
         context: ConversationContext,
     ) -> Result<PromptRunResult, PromptRunError> {
-        self.run_prompt_inner(text, max_steps, Some(cancel), Some(context))
+        self.run_prompt_inner(text, max_steps, Some(cancel), Some(context), None)
+    }
+
+    /// 已鉴权飞书消息专用：本轮注入飞书 API，无在线 Worker 也能执行。
+    /// 工具不保存到共享核心，TCP ingress 与 serve prompt 不会继承权限。
+    pub fn run_feishu_prompt(
+        &self,
+        text: &str,
+        max_steps: Option<u32>,
+        cancel: CancelToken,
+        context: ConversationContext,
+        tools: Arc<crate::feishu_api::FeishuTools>,
+    ) -> Result<PromptRunResult, PromptRunError> {
+        self.run_prompt_inner(text, max_steps, Some(cancel), Some(context), Some(tools))
     }
 
     /// `run_prompt*` 的共同实现（取消令牌与会话上下文均可选）。
@@ -278,6 +351,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
         max_steps: Option<u32>,
         cancel: Option<CancelToken>,
         context: Option<ConversationContext>,
+        feishu_tools: Option<Arc<crate::feishu_api::FeishuTools>>,
     ) -> Result<PromptRunResult, PromptRunError> {
         let gateway = self
             .gateway
@@ -290,7 +364,7 @@ impl<C: ChatClient + Clone> PromptCore<C> {
                 "无链路网关：先建立 Worker 链路（/link 或 serve link 请求）",
             ));
         };
-        if gateway.list_workers().is_empty() {
+        if gateway.list_workers().is_empty() && feishu_tools.is_none() {
             return Err(PromptRunError::new(
                 CODE_NO_WORKERS,
                 "无已发现的 Worker：等待 Worker 上线后再试",
@@ -314,12 +388,19 @@ impl<C: ChatClient + Clone> PromptCore<C> {
                 format!("已有 {MAX_CONCURRENT_PROMPT_RUNS} 个 prompt 在运行，请稍后重试"),
             )
         })?;
+        // Snapshot after acquiring a slot: queued requests see the latest committed grants.
+        let mut policy = self.policy();
+        // 防递归：本通道发起的 Agent 拒绝嵌套 pc.ask。
+        policy.deny_llm_relay = true;
         let mut agent = Agent::new(chat, gateway, policy, config, self.trace.clone());
         if let Some(cancel) = cancel {
             agent = agent.with_cancel(cancel);
         }
         if let Some(context) = context {
             agent = agent.with_conversation_context(context);
+        }
+        if let Some(tools) = feishu_tools {
+            agent = agent.with_feishu_tools(tools);
         }
         match agent.run(text) {
             Ok(outcome) => Ok(PromptRunResult {
@@ -762,7 +843,7 @@ fn accept_loop<C: ChatClient + Clone + Send + 'static>(
 fn reject_connection(mut stream: TcpStream, code: &str, message: &str) {
     {
         let mut writer = BufWriter::new(&mut stream);
-        let _ = write_line(&mut writer, &error_response(0, code, message));
+        write_line(&mut writer, &error_response(0, code, message));
         let _ = writer.flush();
     }
     let _ = stream.shutdown(std::net::Shutdown::Both);

@@ -18,6 +18,7 @@
  * @module @sekai/dsh-plugin/router
  */
 import { createRequire } from 'node:module'
+import { registerStatus } from './status.js'
 import {
   JsonlError,
   JsonlProcess,
@@ -25,8 +26,9 @@ import {
   describeError,
   describeExitInfo,
   nextBackoffMs,
+  registerHotUpdate,
   renderJson,
-  resolveBin,
+  resolveBinTarget,
 } from './shared.js'
 
 const require = createRequire(import.meta.url)
@@ -52,7 +54,13 @@ export const ROUTER_DEFAULTS = Object.freeze({
   routerBin: 'sekai-router',
   extraArgs: Object.freeze([]),
   autoLink: true,
-  policy: Object.freeze({ allowWrite: false, allowTasks: false, allowAdmin: false, workerFilter: null }),
+  policy: Object.freeze({
+    allowWrite: false,
+    allowTasks: false,
+    allowedTasks: Object.freeze([]),
+    allowAdmin: false,
+    workerFilter: null,
+  }),
   requestTimeoutMs: 120000,
 })
 
@@ -82,6 +90,26 @@ export const ROUTER_SPAWN_HINT = 'Run `node scripts/install-dsh-plugin.mjs` in t
 /** 与 crate/sekai/src/sekai_wire.rs 的 MAX_DDL_MS 冻结一致。 */
 export const MAX_DDL_MS = 300000
 
+// Mirror the Router's trimmed wire-name grammar and distinct-name limit.
+const TASK_NAME_PATTERN = /^\p{White_Space}*([a-z0-9._-]{1,48})\p{White_Space}*$/u
+const MAX_ALLOWED_TASKS = 64
+
+function normalizeAllowedTasks(value) {
+  if (!Array.isArray(value)) throw new TypeError('policy.allowedTasks must be an array of Task names')
+  const names = new Set()
+  for (const [index, item] of value.entries()) {
+    const name = typeof item === 'string' ? TASK_NAME_PATTERN.exec(item)?.[1] : undefined
+    if (!name) {
+      throw new TypeError(`policy.allowedTasks[${index}] must contain 1–48 lowercase ASCII letters, digits, or ._- after trimming`)
+    }
+    names.add(name)
+    if (names.size > MAX_ALLOWED_TASKS) {
+      throw new RangeError(`policy.allowedTasks may contain at most ${MAX_ALLOWED_TASKS} distinct Task names`)
+    }
+  }
+  return [...names].sort()
+}
+
 function makeRouterConfig() {
   if (!z) return undefined
   return z.object({
@@ -101,7 +129,10 @@ function makeRouterConfig() {
       allowWrite: z.boolean().default(false)
         .description('Allow write-class worker tools such as gpio.write.'),
       allowTasks: z.boolean().default(false)
-        .description('Allow starting worker Tasks such as blink or pc.job.'),
+        .description('Allow all worker Tasks. Cannot be combined with a nonempty allowedTasks list.'),
+      // Keep null distinct from omission so resolveRouterConfig can reject it.
+      allowedTasks: z.array(z.string().pattern(TASK_NAME_PATTERN).required()).default(undefined)
+        .description('Allow only these exact Task names, e.g. blink. Defaults to []. At most 64 distinct lowercase ASCII names of 1–48 characters after trimming. Requires a Router with --allow-task support.'),
       allowAdmin: z.boolean().default(false)
         .description('Allow admin operations such as set_time, workers.set, and jump.'),
       // '' 或省略 = 不限制 Worker。
@@ -124,8 +155,20 @@ export function resolveRouterConfig(raw = {}) {
     for (const key of ['allowWrite', 'allowTasks', 'allowAdmin']) {
       if (typeof raw.policy[key] === 'boolean') policy[key] = raw.policy[key]
     }
+    if (raw.policy.allowedTasks !== undefined) {
+      policy.allowedTasks = Object.freeze(normalizeAllowedTasks(raw.policy.allowedTasks))
+    }
     const filter = raw.policy.workerFilter
     policy.workerFilter = typeof filter === 'string' && filter.trim() !== '' ? filter : null
+  }
+  const extraArgs = Array.isArray(raw?.extraArgs)
+    ? raw.extraArgs.filter((item) => typeof item === 'string')
+    : []
+  if (policy.allowedTasks.length > 0) {
+    if (policy.allowTasks) throw new TypeError('policy.allowTasks=true conflicts with nonempty policy.allowedTasks')
+    if (extraArgs.some((arg) => /^(--allow-task|--allow-tasks)(=|$)/.test(arg))) {
+      throw new TypeError('extraArgs Task flags conflict with nonempty policy.allowedTasks')
+    }
   }
   return {
     enabled: raw?.enabled !== false,
@@ -136,9 +179,7 @@ export function resolveRouterConfig(raw = {}) {
     routerBin: typeof raw?.routerBin === 'string' && raw.routerBin.trim() !== ''
       ? raw.routerBin
       : ROUTER_DEFAULTS.routerBin,
-    extraArgs: Array.isArray(raw?.extraArgs)
-      ? raw.extraArgs.filter((item) => typeof item === 'string')
-      : [],
+    extraArgs,
     autoLink: raw?.autoLink !== false,
     policy,
     requestTimeoutMs: Number.isFinite(raw?.requestTimeoutMs) && raw.requestTimeoutMs >= 1000
@@ -195,9 +236,10 @@ const STATUS_OUTPUT_SCHEMA = Object.freeze({
     mode: { type: 'string', description: 'Link mode: tcp | stdio | mqtt.' },
     linkDesc: { type: 'string', description: 'Human-readable link description (empty when not linked).' },
     workerCount: { type: 'integer', description: 'Connected worker count.' },
-    policy: { type: 'object', additionalProperties: true, description: 'Effective policy snapshot {allowWrite, allowTasks, allowAdmin, workerFilter}.' },
+    policy: { type: 'object', additionalProperties: true, description: 'Effective policy snapshot when available {allowWrite, allowTasks, allowedTasks, allowAdmin, workerFilter}. allowTasks means all Tasks; allowedTasks lists exact names.' },
     routerPid: { type: 'integer', description: 'sekai-router serve process id; omitted while not running.' },
     version: { type: 'string', description: 'Router version string; omitted until known.' },
+    binaryGeneration: { type: 'string', description: 'Managed binary generation of the active Router; omitted for unmanaged binaries.' },
     error: ERROR_PROPERTY,
   },
 })
@@ -287,6 +329,12 @@ export class SekaiRouterPlugin {
     this.ctx = ctx
     this.config = resolveRouterConfig(config)
     this.proc = null
+    this.binaryTarget = null
+    this.retiringProc = null
+    this.retiringPromise = null
+    this.stopPromise = null
+    this.hotUpdate = null
+    this.disposeLifecycle = null
     this.state = {
       ready: false,
       mode: this.config.link,
@@ -301,6 +349,7 @@ export class SekaiRouterPlugin {
     this.restartTimer = null
     this.stopped = false
     this.autoLinkBusy = false
+    this.exactPolicyProc = null
     // 链路状态兜底探测（B11）：serve 不在 TCP 对端断开时补发 link_state 时，
     // 由 status 轮询把插件状态修正回来。
     this.watchTimer = null
@@ -313,13 +362,27 @@ export class SekaiRouterPlugin {
         plugin.log('info', 'sekai-router plugin is disabled (enabled:false); nothing spawned, no tools registered')
         return
       }
+      if (plugin.stopped) return
+      const update = registerHotUpdate(ctx, {
+        key: 'router',
+        component: 'sekai-router',
+        restart: (generation) => plugin.restartForUpdate(generation),
+      })
+      plugin.hotUpdate = update
       const stopTools = plugin.registerTools()
+      const stopStatus = registerStatus('router', () => plugin.state)
+      plugin.disposeLifecycle = () => {
+        const previous = plugin.proc ?? plugin.retiringProc
+        try {
+          update?.dispose({ isAlive: () => previous != null && !previous.exited })
+        } finally {
+          stopStatus()
+          stopTools()
+        }
+      }
       plugin.start()
       plugin.startLinkWatch()
-      yield () => {
-        plugin.stop()
-        stopTools()
-      }
+      yield () => plugin.stop()
     }, 'sekai-router lifecycle')
   }
 
@@ -343,28 +406,70 @@ export class SekaiRouterPlugin {
     return { command: bin, args }
   }
 
-  /** spawn serve 并接线事件；重复调用安全（已有进程时忽略）。 */
-  start() {
-    if (this.stopped || this.proc) return
-    const bin = resolveBin(this.config.routerBin, 'SEKAI_ROUTER_BIN', ROUTER_DEFAULTS.routerBin)
-    const argv = ['--serve', '--link', this.config.link, ...this.config.extraArgs]
-    const target = this.serveSpawnTarget(bin, argv)
-    const proc = new JsonlProcess({
-      command: target.command,
-      args: target.args,
-      env: target.env,
+  resolveBinary(generation = this.hotUpdate?.generation?.()) {
+    return resolveBinTarget(this.config.routerBin, 'SEKAI_ROUTER_BIN', ROUTER_DEFAULTS.routerBin, {
+      profileContext: this.ctx?.root?.get?.('profileContext') ?? this.ctx?.get?.('profileContext'),
+      generation,
+    })
+  }
+
+  /** Spawn through the same policy and event path for startup, crashes and updates. */
+  start(binary) {
+    if (this.stopped || !this.config.enabled || this.proc || this.retiringPromise) return
+    if ((this.retiringProc && !this.retiringProc.exited) || this.hotUpdate?.canStart?.() === false) {
+      this.scheduleRestart()
+      return
+    }
+    this.retiringProc = null
+    this.cancelRestart()
+    const target = binary ?? this.resolveBinary()
+    this.binaryTarget = target
+    this.lastExitInfo = null
+    const taskArgs = this.config.policy.allowedTasks.flatMap((name) => ['--allow-task', name])
+    const argv = ['--serve', '--link', this.config.link, ...taskArgs, ...this.config.extraArgs]
+    const spawnTarget = this.serveSpawnTarget(target.command, argv)
+    let proc
+    proc = new JsonlProcess({
+      command: spawnTarget.command,
+      args: spawnTarget.args,
+      env: spawnTarget.env,
       logger: this.ctx?.logger ?? null,
       spawnHint: ROUTER_SPAWN_HINT,
-      onEvent: (event) => this.handleEvent(event),
-      onExit: (info) => this.handleExit(info),
+      onEvent: (event) => {
+        if (this.proc === proc) this.handleEvent(event)
+      },
+      onExit: (info) => {
+        if (this.proc === proc) this.handleExit(info)
+      },
     })
     this.proc = proc
     this.state.routerPid = proc.pid
-    this.log('info', `sekai-router serve spawn: ${target.command} ${target.args.join(' ')} (pid ${proc.pid ?? '?'})`)
-    if (proc.exited) {
-      // 同步 spawn 失败：onExit 已在构造里触发 handleExit；这里只清理引用。
-      if (this.proc === proc) this.proc = null
+    this.log('info', `sekai-router serve spawn: ${spawnTarget.command} ${spawnTarget.args.join(' ')} (pid ${proc.pid ?? '?'})`)
+    // A synchronous spawn failure runs onExit before proc receives its identity.
+    if (proc.exited) this.handleExit(proc.exitInfo)
+  }
+
+  async restartForUpdate(generation) {
+    if (this.stopped || !this.config.enabled) return
+    const current = this.binaryTarget
+    const candidate = this.resolveBinary(generation)
+    if (!candidate.generation || candidate.generation !== generation) return
+    if (current?.source === 'config' || current?.source === 'env') return
+    const sameBinary = current?.hash && candidate.hash
+      ? current.hash === candidate.hash
+      : current?.command === candidate.command && current?.generation === candidate.generation
+    if (sameBinary) return
+
+    this.cancelRestart()
+    this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+    this.log('info', `sekai-router switching to managed binary generation ${generation}`)
+    const exited = await this.retireProcess()
+    if (this.stopped) return
+    if (!exited) {
+      this.scheduleRestart()
+      throw new Error('sekai-router previous process exit was not confirmed; replacement was deferred')
     }
+    this.start(candidate)
   }
 
   /**
@@ -375,8 +480,8 @@ export class SekaiRouterPlugin {
   handleEvent(event) {
     switch (event?.event) {
       case 'ready':
-        // ready 即视为本次启动成功：退避复位，然后重放 link/policy。
-        this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+        // With an exact allowlist, reset backoff only after the Router confirms it.
+        if (this.config.policy.allowedTasks.length === 0) this.backoffMs = RESTART_BACKOFF_INITIAL_MS
         void this.runAutoLink()
         break
       case 'link_state':
@@ -399,15 +504,32 @@ export class SekaiRouterPlugin {
     }
   }
 
-  /** autoLink：link 请求（按模式附地址）→ policy.set（只发已配置键）。 */
+  /** Verify the startup Task policy, then optionally link and replay the configured policy. */
   async runAutoLink() {
-    if (!this.config.autoLink || this.autoLinkBusy || this.stopped) return
+    const proc = this.proc
+    const policy = this.config.policy
+    const needsExactPolicy = policy.allowedTasks.length > 0
+    if (!proc || this.autoLinkBusy || this.stopped || (!this.config.autoLink && !needsExactPolicy)) return
     this.autoLinkBusy = true
+    const request = (method, params = {}) => proc.request(method, params, { timeoutMs: this.config.requestTimeoutMs })
     try {
+      if (needsExactPolicy) {
+        this.exactPolicyProc = null
+        const startup = await request('policy.get')
+        this.assertExactPolicy(startup)
+        if (proc !== this.proc) return
+        this.state.policy = { ...this.state.policy, ...normalizeRouterPolicy(startup) }
+      }
+      if (!this.config.autoLink) {
+        this.exactPolicyProc = proc
+        this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+        return
+      }
       const linkParams = { mode: this.config.link }
       if (this.config.link === 'tcp') linkParams.listen_addr = this.config.listenAddr
       else if (this.config.link === 'mqtt') linkParams.mqtt_addr = this.config.listenAddr
-      const linked = await this.request('link', linkParams)
+      const linked = await request('link', linkParams)
+      if (proc !== this.proc) return
       if (linked && typeof linked === 'object') {
         if (typeof linked.mode === 'string' && linked.mode !== '') this.state.mode = linked.mode
         // serve 的 link 响应实际地址字段是 `addr`；`listen_addr`/`mqtt_addr`
@@ -420,20 +542,51 @@ export class SekaiRouterPlugin {
         })
       }
       const policyParams = {}
-      const policy = this.config.policy
       if (typeof policy.allowWrite === 'boolean') policyParams.allow_write = policy.allowWrite
       if (typeof policy.allowTasks === 'boolean') policyParams.allow_tasks = policy.allowTasks
+      // Legacy Routers reject unknown policy.set fields. The boolean-only request
+      // already expresses deny-all or allow-all when the list is empty.
+      if (policy.allowedTasks.length > 0) policyParams.allowed_tasks = policy.allowedTasks
       if (typeof policy.allowAdmin === 'boolean') policyParams.allow_admin = policy.allowAdmin
       if (policy.workerFilter) policyParams.worker_filter = policy.workerFilter
-      const applied = await this.request('policy.set', policyParams)
-      const merged = normalizeSnakePolicy(applied)
+      const applied = await request('policy.set', policyParams)
+      if (needsExactPolicy) this.assertExactPolicy(applied)
+      if (proc !== this.proc) return
+      const merged = normalizeRouterPolicy(applied)
       if (merged) this.state.policy = { ...this.state.policy, ...merged }
+      if (needsExactPolicy) {
+        this.exactPolicyProc = proc
+        this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+      }
       this.log('info', `sekai-router autoLink complete (mode=${this.state.mode}, desc=${this.state.linkDesc})`)
     } catch (error) {
+      if (proc !== this.proc) return
       this.log('warn', `sekai-router autoLink failed: ${describeError(error)}`)
+      if (needsExactPolicy) proc.kill()
     } finally {
-      this.autoLinkBusy = false
+      if (proc === this.proc) this.autoLinkBusy = false
     }
+  }
+
+  assertExactPolicy(raw) {
+    const expected = this.config.policy.allowedTasks
+    const actual = raw?.allowed_tasks
+    if (raw?.allow_tasks !== false || !Array.isArray(actual) || actual.length !== expected.length
+      || [...actual].sort().some((name, index) => name !== expected[index])) {
+      throw this.unverifiedPolicyError()
+    }
+  }
+
+  unverifiedPolicyError() {
+    return new JsonlError(
+      'policy_unverified',
+      'Router has not confirmed the configured exact Task allowlist.',
+      'Check that routerBin supports --allow-task and the allowed_tasks JSONL field.',
+    )
+  }
+
+  exactPolicyPending() {
+    return this.config.policy.allowedTasks.length > 0 && (!this.proc || this.proc !== this.exactPolicyProc)
   }
 
   /**
@@ -493,7 +646,7 @@ export class SekaiRouterPlugin {
     this.watchBusy = true
     try {
       const raw = await proc.request('status', {}, { timeoutMs: LINK_WATCH_TIMEOUT_MS })
-      if (!isPlainObject(raw)) return
+      if (proc !== this.proc || !isPlainObject(raw)) return
       if (raw.ready === true) {
         this.linkDownSamples = 0
         const desc = firstString(raw.link, raw.link_desc, raw.linkDesc, raw.desc)
@@ -513,7 +666,7 @@ export class SekaiRouterPlugin {
     } catch {
       // 请求失败（超时 / not_ready 等）保持现状：进程退出由 handleExit 统一处理。
     } finally {
-      this.watchBusy = false
+      if (proc === this.proc) this.watchBusy = false
     }
   }
 
@@ -521,6 +674,7 @@ export class SekaiRouterPlugin {
   async request(method, params, exec) {
     const proc = this.proc
     if (!proc || proc.exited) throw this.downError()
+    if (method !== 'status' && this.exactPolicyPending()) throw this.unverifiedPolicyError()
     return proc.request(method, params, {
       timeoutMs: this.config.requestTimeoutMs,
       signal: exec?.signal,
@@ -558,13 +712,7 @@ export class SekaiRouterPlugin {
     if (this.proc && !this.proc.exited) return // 迟到的旧进程事件：忽略
     this.proc = null
     this.lastExitInfo = info ?? null
-    this.state.ready = false
-    this.state.routerPid = null
-    this.state.linkDesc = ''
-    // router 进程死亡意味着旧链路与在线表全部失效：计数清零，重启后由
-    // worker_online 通知与 workers 响应重建。
-    this.state.workerCount = 0
-    this.linkDownSamples = 0
+    this.resetProcessState()
     if (info?.spawnError) {
       this.log('warn', `sekai-router spawn failed: ${describeError(info.spawnError)} — ${ROUTER_SPAWN_HINT}`)
     } else {
@@ -579,29 +727,71 @@ export class SekaiRouterPlugin {
     this.backoffMs = nextBackoffMs(this.backoffMs, RESTART_BACKOFF_MAX_MS)
     this.log('info', `sekai-router restart scheduled in ${delay}ms`)
     const timer = setTimeout(() => {
+      if (this.restartTimer !== timer) return
       this.restartTimer = null
-      if (!this.stopped) this.start()
+      this.start()
     }, delay)
     timer.unref?.()
     this.restartTimer = timer
   }
 
-  /** 停止：清定时器 + dispose（shutdown→宽限→kill）。幂等。 */
-  stop() {
-    if (this.stopped) return
-    this.stopped = true
-    this.stopLinkWatch()
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer)
-      this.restartTimer = null
-    }
-    const proc = this.proc
-    this.proc = null
+  cancelRestart() {
+    clearTimeout(this.restartTimer)
+    this.restartTimer = null
+  }
+
+  resetProcessState() {
     this.state.ready = false
     this.state.routerPid = null
-    if (proc && !proc.exited) {
-      void proc.dispose({ requestTimeoutMs: 1500, graceMs: 1000 }).catch(() => {})
+    this.state.version = null
+    this.state.mode = this.config.link
+    this.state.linkDesc = ''
+    this.state.workerCount = 0
+    this.state.policy = { ...this.config.policy }
+    this.autoLinkBusy = false
+    this.exactPolicyProc = null
+    this.watchBusy = false
+    this.linkDownSamples = 0
+  }
+
+  retireProcess() {
+    if (this.retiringPromise) return this.retiringPromise
+    const proc = this.proc ?? this.retiringProc
+    this.proc = null
+    this.resetProcessState()
+    if (!proc || proc.exited) {
+      this.retiringProc = null
+      return Promise.resolve(true)
     }
+    this.retiringProc = proc
+    this.retiringPromise = (async () => {
+      try {
+        if (await proc.dispose({ requestTimeoutMs: 1500, graceMs: 1000 })) {
+          this.retiringProc = null
+          return true
+        }
+      } catch (error) {
+        this.log('warn', `sekai-router shutdown failed: ${describeError(error)}`)
+      }
+      this.log('warn', `sekai-router process ${proc.pid ?? '?'} exit was not confirmed`)
+      return false
+    })().finally(() => { this.retiringPromise = null })
+    return this.retiringPromise
+  }
+
+  /** Clear synchronous state and join the child shutdown. */
+  stop() {
+    if (this.stopped) return this.stopPromise
+    const disposeLifecycle = this.disposeLifecycle
+    this.disposeLifecycle = null
+    try { disposeLifecycle?.() } catch (error) {
+      this.log('warn', `sekai-router lifecycle cleanup failed: ${describeError(error)}`)
+    }
+    this.stopped = true
+    this.stopLinkWatch()
+    this.cancelRestart()
+    this.stopPromise = this.retireProcess()
+    return this.stopPromise
   }
 
   // -------------------------------------------------------------------------
@@ -632,8 +822,9 @@ export class SekaiRouterPlugin {
         output: passthroughOutput(WORKERS_OUTPUT_DOCUMENTED),
         async execute(_args, exec) {
           try {
+            const proc = plugin.proc
             const result = await plugin.request('workers', {}, exec)
-            if (result && typeof result.count === 'number') plugin.state.workerCount = result.count
+            if (proc === plugin.proc && result && typeof result.count === 'number') plugin.state.workerCount = result.count
             if (isPlainObject(result)) return result
             return { error: { code: 'protocol_error', message: 'unexpected workers response shape' } }
           } catch (error) {
@@ -652,7 +843,7 @@ export class SekaiRouterPlugin {
       },
       {
         name: 'sekai_worker_task',
-        description: `Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. Only allowed when tasks are explicitly enabled (policy.allowTasks). Call sekai_list_workers first; worker ids and task names must come from its result. Long tasks (pc.job / pc.ask) need an explicit ddl_ms >= ${LONG_TASK_DDL_HINT_MS}; the Router default budget is 1000ms. Calls are forwarded serially through one sekai-router --serve process; aborting this call only stops waiting locally — the command keeps running on the worker.`,
+        description: `Start a Task on one connected Sekai worker. args is raw UTF-8 task argument text; empty string for no args. The Router must authorize the exact Task name via policy.allowedTasks or authorize all Tasks via policy.allowTasks. Call sekai_list_workers first; worker ids and task names must come from its result. Long tasks (pc.job / pc.ask) need an explicit ddl_ms >= ${LONG_TASK_DDL_HINT_MS}; the Router default budget is 1000ms. Calls are forwarded serially through one sekai-router --serve process; aborting this call only stops waiting locally — the command keeps running on the worker.`,
         parameters: workerCallParameters('task'),
         output: passthroughOutput(COMMAND_RESULT_DOCUMENTED),
         async execute(args, exec) {
@@ -691,8 +882,11 @@ export class SekaiRouterPlugin {
     }
     if (typeof state.routerPid === 'number') value.routerPid = state.routerPid
     if (state.version) value.version = state.version
+    const proc = this.proc
+    if (proc && this.binaryTarget?.generation) value.binaryGeneration = this.binaryTarget.generation
     try {
       const raw = await this.request('status', {})
+      if (proc !== this.proc) throw this.downError()
       if (isPlainObject(raw)) {
         if (raw.ready === true || state.ready) value.ready = true
         if (typeof raw.mode === 'string' && raw.mode !== '') value.mode = raw.mode
@@ -703,9 +897,6 @@ export class SekaiRouterPlugin {
           value.workerCount = count
           state.workerCount = count
         }
-        // Rust 侧 policy 摘要可能是对象或字符串：只接受对象；字符串摘要忽略
-        //（本地快照已提供结构化策略）。
-        if (isPlainObject(raw.policy)) value.policy = raw.policy
         const pid = firstInteger(raw.pid)
         if (pid !== null) value.routerPid = pid
         const version = firstString(raw.version, raw.ver)
@@ -713,6 +904,25 @@ export class SekaiRouterPlugin {
           value.version = version
           state.version = version
         }
+        let effectivePolicy = normalizeRouterPolicy(raw.policy)
+        if (!effectivePolicy && proc === this.proc && proc && !proc.exited) {
+          // Serve status normally returns a text summary. policy.get supplies
+          // structured state even on legacy Routers and with autoLink disabled.
+          try {
+            const effective = await proc.request('policy.get', {}, { timeoutMs: LINK_WATCH_TIMEOUT_MS })
+            effectivePolicy = normalizeRouterPolicy(effective)
+          } catch {
+            // Best effort: preserve an otherwise successful status result.
+          }
+        }
+        if (effectivePolicy && proc === this.proc) {
+          state.policy = { ...state.policy, ...effectivePolicy }
+          value.policy = { ...state.policy }
+        }
+      }
+      if (this.exactPolicyPending()) {
+        value.ready = false
+        value.error = this.unverifiedPolicyError().toJSON()
       }
       return value
     } catch (error) {
@@ -766,17 +976,26 @@ function firstInteger(...values) {
   return null
 }
 
-/** policy.set 响应（snake_case）→ 插件策略快照（camelCase），无效返回 null。 */
-function normalizeSnakePolicy(raw) {
+/** Convert structured Router policy to the plugin's camelCase snapshot. */
+function normalizeRouterPolicy(raw) {
   if (!isPlainObject(raw)) return null
   const out = {}
-  let any = false
-  if (typeof raw.allow_write === 'boolean') { out.allowWrite = raw.allow_write; any = true }
-  if (typeof raw.allow_tasks === 'boolean') { out.allowTasks = raw.allow_tasks; any = true }
-  if (typeof raw.allow_admin === 'boolean') { out.allowAdmin = raw.allow_admin; any = true }
-  if (typeof raw.worker_filter === 'string') { out.workerFilter = raw.worker_filter || null; any = true }
-  else if (raw.worker_filter === null) { out.workerFilter = null; any = true }
-  return any ? out : null
+  const allowWrite = raw.allow_write ?? raw.allowWrite
+  const allowTasks = raw.allow_tasks ?? raw.allowTasks
+  const allowAdmin = raw.allow_admin ?? raw.allowAdmin
+  const allowedTasks = raw.allowed_tasks ?? raw.allowedTasks
+  const workerFilter = Object.hasOwn(raw, 'worker_filter') ? raw.worker_filter : raw.workerFilter
+  if (typeof allowWrite === 'boolean') out.allowWrite = allowWrite
+  if (typeof allowTasks === 'boolean') out.allowTasks = allowTasks
+  if (typeof allowAdmin === 'boolean') out.allowAdmin = allowAdmin
+  if (workerFilter === null || typeof workerFilter === 'string') out.workerFilter = workerFilter || null
+  if (Array.isArray(allowedTasks) && allowedTasks.every((name) => typeof name === 'string')) {
+    out.allowedTasks = Object.freeze([...allowedTasks])
+  } else if (typeof allowTasks === 'boolean') {
+    // Legacy booleans have no exact-list mode.
+    out.allowedTasks = ROUTER_DEFAULTS.policy.allowedTasks
+  }
+  return Object.keys(out).length > 0 ? out : null
 }
 
 // Cordis 类插件约定：默认导出即插件本体（参照 dsh-dcp 的 `export default DcpEngine`）。

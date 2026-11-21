@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use sekai::sekai_device_list::Endpoint;
 use sekai::sekai_wire::{MAX_DDL_MS, validate_worker_id};
 
+use crate::tools::normalize_task_names;
+
 use crate::agent::{ContextPolicy, DEFAULT_CONTEXT_BUDGET_BYTES, DEFAULT_CONTEXT_RETAIN_STEPS};
 use crate::topic::{DEFAULT_TOPIC_ROOT, TopicError, TopicRoot};
 
@@ -135,6 +137,10 @@ pub const DEFAULT_FEISHU_DOMAIN: &str = "https://open.feishu.cn";
 pub const ENV_FEISHU_ALLOW_USERS: &str = "SEKAI_FEISHU_ALLOW_USERS";
 /// 环境变量名：飞书允许的会话 id 列表（逗号分隔 chat_id）。
 pub const ENV_FEISHU_ALLOW_CHATS: &str = "SEKAI_FEISHU_ALLOW_CHATS";
+/// 环境变量名：飞书 Task 管理员 open_id 列表（逗号分隔）。
+pub const ENV_FEISHU_TASK_ADMINS: &str = "SEKAI_FEISHU_TASK_ADMINS";
+/// 环境变量名：飞书动态 Task 授权文件（绝对路径）。
+pub const ENV_FEISHU_TASK_POLICY_FILE: &str = "SEKAI_FEISHU_TASK_POLICY_FILE";
 /// 环境变量名：收到消息先回「正在处理」（on/off）。
 pub const ENV_FEISHU_ACK: &str = "SEKAI_FEISHU_ACK";
 /// 环境变量名：每消息 agent 步数上限（1..=32；缺省随全局）。
@@ -300,8 +306,10 @@ pub struct Config {
     pub worker_filter: Option<String>,
     /// 是否允许 GPIO 写。
     pub allow_write: bool,
-    /// 是否允许 Task。
+    /// 是否允许 Task（`--allow-tasks`，全开）。
     pub allow_tasks: bool,
+    /// Task 精确授权名单（`--allow-task NAME`，可重复；与 `--allow-tasks` 互斥）。
+    pub allowed_tasks: Vec<String>,
     /// 是否允许管理工具。
     pub allow_admin: bool,
     /// 是否输出 JSON。
@@ -367,6 +375,7 @@ impl fmt::Debug for Config {
             .field("worker_filter", &self.worker_filter)
             .field("allow_write", &self.allow_write)
             .field("allow_tasks", &self.allow_tasks)
+            .field("allowed_tasks", &self.allowed_tasks)
             .field("allow_admin", &self.allow_admin)
             .field("json", &self.json)
             .field("dry_run", &self.dry_run)
@@ -530,6 +539,7 @@ impl Config {
             worker_filter: None,
             allow_write: false,
             allow_tasks: false,
+            allowed_tasks: Vec::new(),
             allow_admin: false,
             json: false,
             dry_run: false,
@@ -551,6 +561,8 @@ impl Config {
     pub fn apply_args(&mut self, args: &[String]) -> Result<(), ConfigError> {
         let mut goal: Option<String> = None;
         let mut goal_file: Option<PathBuf> = None;
+        // 精确授权名单：按出现顺序收集，循环结束后统一校验（去重/上限）。
+        let mut allowed_tasks: Vec<String> = Vec::new();
         let mut index = 0;
         while index < args.len() {
             let arg = args[index].as_str();
@@ -659,6 +671,9 @@ impl Config {
                 }
                 "--allow-write" => self.allow_write = true,
                 "--allow-tasks" => self.allow_tasks = true,
+                "--allow-task" => {
+                    allowed_tasks.push(take_value("--allow-task")?);
+                }
                 "--allow-admin" => self.allow_admin = true,
                 "--json" => self.json = true,
                 "--dry-run" => self.dry_run = true,
@@ -696,6 +711,14 @@ impl Config {
                 "--goal 与 --goal-file 二选一",
             )));
         }
+        // Task 授权：全开与精确名单互斥，避免「以为只开了两个、其实全开」。
+        if self.allow_tasks && !allowed_tasks.is_empty() {
+            return Err(ConfigError::Conflict(String::from(
+                "--allow-tasks 与 --allow-task 互斥（全开或精确授权，二选一）",
+            )));
+        }
+        self.allowed_tasks = normalize_task_names(&allowed_tasks)
+            .map_err(|message| ConfigError::InvalidArg(format!("--allow-task 非法：{message}")))?;
         // 前端互斥（一次只允许一种）：--serve / --feishu / 交互（--tui/-i）/
         // 批处理（--goal/--goal-file/--dry-run）。
         let mut frontends: Vec<&str> = Vec::new();
@@ -818,6 +841,57 @@ impl Config {
     }
 }
 
+/// 只有显式配置管理员及绝对持久化路径时才启用飞书 `/task` 管理。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuTaskAdminConfig {
+    /// 管理员的应用级 open_id（另须通过普通消息 allowlist）。
+    pub open_ids: Vec<String>,
+    /// 本实例独占的动态授权文件。
+    pub policy_file: PathBuf,
+}
+
+impl FeishuTaskAdminConfig {
+    fn from_env_map(env: &HashMap<String, String>) -> Result<Option<Self>, ConfigError> {
+        if !env.contains_key(ENV_FEISHU_TASK_ADMINS)
+            && !env.contains_key(ENV_FEISHU_TASK_POLICY_FILE)
+        {
+            return Ok(None);
+        }
+        let mut open_ids = parse_id_list(env, ENV_FEISHU_TASK_ADMINS)?;
+        if open_ids.is_empty()
+            || open_ids.iter().any(|id| {
+                id.strip_prefix("ou_").is_none_or(|suffix| {
+                    suffix.is_empty()
+                        || !suffix
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+            })
+        {
+            return Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_TASK_ADMINS,
+                message: String::from("须与策略文件成对配置，并填写显式的 ou_ 开头 open_id"),
+            });
+        }
+        open_ids.sort_unstable();
+        open_ids.dedup();
+        let policy_file = PathBuf::from(
+            env_string(env, &[ENV_FEISHU_TASK_POLICY_FILE])
+                .ok_or(ConfigError::MissingEnv(ENV_FEISHU_TASK_POLICY_FILE))?,
+        );
+        if !policy_file.is_absolute() || policy_file.file_name().is_none() {
+            return Err(ConfigError::InvalidEnv {
+                name: ENV_FEISHU_TASK_POLICY_FILE,
+                message: String::from("必须是绝对文件路径"),
+            });
+        }
+        Ok(Some(Self {
+            open_ids,
+            policy_file,
+        }))
+    }
+}
+
 /// 飞书入口配置（`SEKAI_FEISHU_*`，docs/sekai-feishu.md §8）。
 ///
 /// 安全约束：凭据只从环境变量读取、Debug 脱敏、不落盘；allowlist 默认
@@ -836,6 +910,8 @@ pub struct FeishuConfig {
     pub allow_users: Vec<String>,
     /// 允许的会话 id 列表（chat_id；p2p 与群聊皆查；空 = 全拒）。
     pub allow_chats: Vec<String>,
+    /// 可选的飞书动态 Task 管理配置。
+    pub task_admin: Option<FeishuTaskAdminConfig>,
     /// 收到消息先回「正在处理」（默认开）。
     pub ack: bool,
     /// 每消息 agent 步数上限（None = 随全局 `SEKAI_MAX_STEPS`）。
@@ -852,6 +928,7 @@ impl fmt::Debug for FeishuConfig {
             .field("domain", &self.domain)
             .field("allow_users", &self.allow_users)
             .field("allow_chats", &self.allow_chats)
+            .field("task_admin_configured", &self.task_admin.is_some())
             .field("ack", &self.ack)
             .field("max_steps", &self.max_steps)
             .field("context_turns", &self.context_turns)
@@ -917,6 +994,7 @@ impl FeishuConfig {
             domain,
             allow_users,
             allow_chats,
+            task_admin: FeishuTaskAdminConfig::from_env_map(env)?,
             ack,
             max_steps,
             context_turns,
@@ -949,15 +1027,32 @@ fn parse_id_list(
 
 /// 解析命令行；先处理 --help/--version，再读环境与参数。
 pub fn parse(args: &[String]) -> Result<Parsed, ConfigError> {
-    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        return Ok(Parsed::Help);
-    }
-    if args.iter().any(|arg| arg == "--version") {
-        return Ok(Parsed::Version);
+    if let Some(action) = early_action(args) {
+        return Ok(action);
     }
     let mut config = Config::from_env()?;
     config.apply_args(args)?;
     Ok(Parsed::Run(Box::new(config)))
+}
+
+fn early_action(args: &[String]) -> Option<Parsed> {
+    let mut flags = args.iter().map(String::as_str);
+    let mut version = false;
+    while let Some(flag) = flags.next() {
+        match flag {
+            "-h" | "--help" => return Some(Parsed::Help),
+            "--version" => version = true,
+            // Values (including valid Task names such as "--help") are not switches.
+            "--goal" | "--goal-file" | "--link" | "--worker-bin" | "--worker-arg" | "--listen"
+            | "--worker" | "--model" | "--base-url" | "--max-steps" | "--ddl-ms"
+            | "--timeout-ms" | "--wait-worker-ms" | "--trace" | "--allow-task"
+            | "--prompt-addr" => {
+                flags.next();
+            }
+            _ => {}
+        }
+    }
+    version.then_some(Parsed::Version)
 }
 
 /// 版本字符串。
@@ -1009,6 +1104,10 @@ pub fn usage() -> String {
   SEKAI_FEISHU_*        飞书入口配置（--feishu）：_APP_ID/_APP_SECRET 必需，
                         _DOMAIN/_ALLOW_USERS/_ALLOW_CHATS/_ACK/_MAX_STEPS/
                         _CONTEXT_TURNS 可选（docs/sekai-feishu.md §8）
+  {ENV_FEISHU_TASK_ADMINS}
+                        允许 /task 管理的飞书 open_id（逗号分隔，另须通过普通 allowlist）
+  {ENV_FEISHU_TASK_POLICY_FILE}
+                        动态 Task 授权的绝对文件路径（与 {ENV_FEISHU_TASK_ADMINS} 成对配置）
   {ENV_MAX_STEPS}        agent 最大步数（1..=64）；缺省按链路：直连 PC Worker
                         （stdio/tcp）不设上限，MQTT/嵌入式保留 {DEFAULT_MAX_STEPS}
   {ENV_CONTEXT_RETAIN_STEPS}
@@ -1042,6 +1141,7 @@ pub fn usage() -> String {
   --wait-worker-ms <N>  等待Worker上线时间（默认 {DEFAULT_WAIT_WORKER_MS}）
   --allow-write         允许 gpio.config / gpio.write 等写操作
   --allow-tasks         允许下发Worker Task（含 pc.ask / pc.job 等长任务）
+  --allow-task <NAME>   只允许指定 Task（可重复；与 --allow-tasks 互斥）
   --allow-admin         允许管理命令：serve admin/jump 与 sekai.set_time /
                         sekai.workers.set / sekai.cancel
   --prompt-addr <HOST:PORT|off>
@@ -1615,6 +1715,34 @@ mod tests {
     }
 
     #[test]
+    fn feishu_task_admin_requires_paired_explicit_config() {
+        let mut vars = feishu_env();
+        assert!(
+            FeishuTaskAdminConfig::from_env_map(&vars)
+                .unwrap()
+                .is_none()
+        );
+        let path = std::env::temp_dir().join("sekai-task-policy.json");
+        vars.insert(
+            ENV_FEISHU_TASK_POLICY_FILE.into(),
+            path.display().to_string(),
+        );
+        assert!(FeishuTaskAdminConfig::from_env_map(&vars).is_err());
+        for invalid in ["*", "oc_chat", "ou_", "ou_abc.*", "u_user"] {
+            vars.insert(ENV_FEISHU_TASK_ADMINS.into(), invalid.into());
+            assert!(FeishuTaskAdminConfig::from_env_map(&vars).is_err());
+        }
+        vars.insert(ENV_FEISHU_TASK_ADMINS.into(), "ou_b, ou_a, ou_b".into());
+        let admin = FeishuTaskAdminConfig::from_env_map(&vars).unwrap().unwrap();
+        assert_eq!(admin.open_ids, ["ou_a", "ou_b"]);
+        assert_eq!(admin.policy_file, path);
+        vars.insert(ENV_FEISHU_TASK_POLICY_FILE.into(), "relative.json".into());
+        assert!(FeishuTaskAdminConfig::from_env_map(&vars).is_err());
+        vars.remove(ENV_FEISHU_TASK_POLICY_FILE);
+        assert!(FeishuTaskAdminConfig::from_env_map(&vars).is_err());
+    }
+
+    #[test]
     fn feishu_lists_trim_and_drop_empty() {
         let mut map = feishu_env();
         map.insert(
@@ -1752,6 +1880,66 @@ mod tests {
             let mut config = Config::from_env_map(&env()).unwrap();
             config.apply_args(&args(&["--prompt-addr", good])).unwrap();
             assert_eq!(config.prompt_addr.as_deref(), Some(good));
+        }
+    }
+
+    #[test]
+    fn help_switches_can_be_exact_task_names() {
+        let argv = args(&[
+            "--serve",
+            "--allow-task",
+            "--help",
+            "--allow-task",
+            "--version",
+        ]);
+        assert!(early_action(&argv).is_none());
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config.apply_args(&argv).unwrap();
+        assert_eq!(config.allowed_tasks, ["--help", "--version"]);
+        assert!(matches!(
+            early_action(&args(&["--allow-task", "echo", "--help"])),
+            Some(Parsed::Help)
+        ));
+    }
+
+    #[test]
+    fn allow_task_flag_collects_and_validates_names() {
+        let mut config = Config::from_env_map(&env()).unwrap();
+        config
+            .apply_args(&args(&[
+                "--goal",
+                "run echo",
+                "--allow-task",
+                "echo",
+                "--allow-task",
+                " pc.ask ",
+                "--allow-task",
+                "echo",
+            ]))
+            .unwrap();
+        assert_eq!(
+            config.allowed_tasks,
+            vec![String::from("echo"), String::from("pc.ask")]
+        );
+        assert!(!config.allow_tasks);
+
+        // 通配符与非法名称报配置错误。
+        for bad in ["*", "ECHO", "bad name"] {
+            let mut config = Config::from_env_map(&env()).unwrap();
+            assert!(
+                config
+                    .apply_args(&args(&["--goal", "x", "--allow-task", bad]))
+                    .is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        // 全开与精确授权互斥（两种顺序都拦）。
+        for argv in [
+            vec!["--goal", "x", "--allow-tasks", "--allow-task", "echo"],
+            vec!["--goal", "x", "--allow-task", "echo", "--allow-tasks"],
+        ] {
+            let mut config = Config::from_env_map(&env()).unwrap();
+            assert!(config.apply_args(&args(&argv)).is_err(), "{argv:?}");
         }
     }
 

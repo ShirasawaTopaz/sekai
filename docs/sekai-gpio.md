@@ -1,5 +1,7 @@
 # Sekai GPIO 抽象与 gpio.* 用户工具
 
+ESP32、STM32 实板接线、烧录与自动验收见 [实板 GPIO 回环](sekai-gpio-loopback.md)。
+
 本文描述 `crate/sekai-gpio`：家族无关的 GPIO 抽象、ESP32/STM32F1/F4 引脚表、宿主虚拟后端，
 以及 AI 通过 MQTT ToolCall 直接调用的四个用户工具 `gpio.info`/`gpio.config`/`gpio.read`/`gpio.write`。
 

@@ -33,7 +33,7 @@ prompt 通道的共享核心执行，把答案回复到原消息。
    │                         │ ──────────────────────────────▶ │ feishu.rs 事件泵
    │                         │ ◀──────── ack（{"code":200}）── │   （授权/去重/限流）
    │                         │                                  │ 会话元数据 + 多轮记忆快照
-   │                         │                                  │ PromptCore::run_prompt_with_context
+   │                         │                                  │ PromptCore::run_feishu_prompt
    │                         │                                  │   （deny_llm_relay、RunGate=4）
    │                         │                                  │   （策略/网关快照）
    │                         │                                  │ Agent → Worker 链路（V1 帧，不变）
@@ -42,10 +42,10 @@ prompt 通道的共享核心执行，把答案回复到原消息。
 ```
 
 与 prompt 通道的关系：**同为「带外前端」**。飞书消息最终进入
-[`PromptCore::run_prompt_with_context`](../crate/sekai-router/src/prompt_server.rs)
-（无上下文语义与 `run_prompt(&self, text: &str, max_steps: Option<u32>)` 相同），
+[`PromptCore::run_feishu_prompt`](../crate/sekai-router/src/prompt_server.rs)
+（现通过 `run_feishu_prompt` 为已鉴权消息额外注入飞书工具，见 §4.3），
 天然继承其全部护栏：`deny_llm_relay` 防递归、`RunGate` 全局 4 路并发、策略/
-网关快照、错误码（`llm_unavailable`/`not_linked`/`no_workers`/`agent_error`/`busy`）。
+网关快照、错误码（`llm_unavailable`/`not_linked`/`agent_error`/`busy`）。飞书运行无需已发现的 Worker；普通 ingress/serve `prompt` 仍保留 `no_workers` 校验。
 V1 二进制帧协议**一字不动**（[sekai-protocol.md](sekai-protocol.md) §0.1
 带外清单不改）。
 
@@ -181,9 +181,9 @@ WS 二进制消息即一条 protobuf 消息，schema（字段号即 wire tag）�
 
 `POST {domain}/open-apis/auth/v3/tenant_access_token/internal`，
 body `{"app_id","app_secret"}`（无需鉴权头）。响应
-`{"code":0,"tenant_access_token":"t-xxx","expire_in":7200}`（约 2 小时）。
+`{"code":0,"tenant_access_token":"t-xxx","expire":7200}`（约 2 小时）。
 
-- **内存缓存，不落盘**；`expire_in - 300s` 前提视为过期，惰性刷新。
+- **内存缓存，不落盘**；优先读取官方 `expire` 字段并兼容 `expire_in`。长 token 提前 300 秒、短 token 提前约 10% 刷新，不超出实际有效期；并发刷新合并为一次请求。
 - 收到 token 失效错误码（如 `99991663`/`99991661`，以对拍为准）：强制刷新
   后**重试一次**原请求，仍失败则按该消息 outcome 记审计。
 
@@ -198,6 +198,75 @@ body `{"app_id","app_secret"}`（无需鉴权头）。响应
 - 失败重试：仅对 **429/5xx** 指数退避（1s、2s）各重试一次；其余（4xx 权限类）
   不重试。重试耗尽 → stderr 审计 `outcome=reply_failed`，该消息处理结束
   （不重跑 Agent）。
+
+### 4.3 日历与日程工具
+
+`--feishu` 的已鉴权对话在每次 Agent 运行中新增以下工具。REST 请求由 Router
+直接执行，与 IM 收发共用 token 缓存；无需启动 Worker。TCP 监听链路仍正常建立，
+后续需要 `pc.*` 等能力时可以接入 Worker。其它 REPL/TUI/serve/ingress 入口不会
+因为设置飞书凭据而获得这些工具。
+
+| 工具 | 用途 | 权限 |
+| --- | --- | --- |
+| `feishu_calendar_list` | 列出应用可访问的日历与访问角色，支持分页 | 默认可读 |
+| `feishu_event_list` | 查询指定日历的日程，支持时间范围与分页 | 默认可读 |
+| `feishu_event_get` | 读取日程详情 | 默认可读 |
+| `feishu_event_create` | 创建日程，返回实际事件 ID 与链接（上游提供时） | `--allow-write` |
+| `feishu_event_update` | 修改日程标题、描述或起止时间 | `--allow-write` |
+| `feishu_event_delete` | 删除指定日程 | `--allow-write` |
+
+应用使用 `tenant_access_token`，代表**应用身份**，没有实现用户 OAuth。
+请在飞书开发者后台开通并发布相应日历权限：只读通常需要 `calendar:calendar:readonly`
+（或当前平台列出的细分日历/日程读取权限），写入需要 `calendar:calendar`
+（或日程创建、更新、删除的细分权限）；准确授权项以每个端点的「权限要求」为准。
+API 权限与目标日历的访问控制都必须满足。先让机器人列出日历，确认返回的
+`calendar_id`、日历名称与 `writer`/`owner` 角色；若目标个人日历不可见或不可写，
+需要先向应用授予该日历权限。创建到应用可写日历不会自动加入个人主日历，
+本实现也不自动邀请参与人。
+
+PowerShell 启动示例（其它已有飞书配置沿用）：
+
+```powershell
+$env:SEKAI_FEISHU_APP_ID = 'cli_your_app'
+$env:SEKAI_FEISHU_APP_SECRET = '<应用密钥>'
+$env:SEKAI_FEISHU_ALLOW_USERS = 'ou_your_open_id'
+$env:DEEPSEEK_API_KEY = '<模型 API key>'
+.\target\release\sekai-router.exe --feishu --allow-write
+```
+
+在飞书中依次发送：
+
+1. 「列出你能访问的飞书日历，并显示每个日历的 ID 和权限。」
+2. 「在日历 `<刚查到的 calendar_id>` 创建一个日程：2026 年 12 月 1 日上海时间
+   14:00 到 15:00，标题『项目讨论』。」
+3. 「查询这个日历当天的日程。」
+4. 「把刚创建的日程标题改为『项目评审』。」
+
+时间参数使用 `start_time`/`end_time` 对象：定时日程为 Unix **秒字符串**
+`{"timestamp":"1796104800","timezone":"Asia/Shanghai"}`，不是毫秒或 RFC3339。
+全天日程为 `{"date":"2026-12-01"}`，结束日期为排他的次日。
+定时日程默认时区为 `Asia/Shanghai`，支持的时区见工具 schema 的枚举；起止时间
+必须成对，结束晚于开始。每次运行注入 Router 当前 Unix 秒，帮助模型解释「明天」；
+用户时间或目标日历不明确时先澄清。
+
+创建必须传入 32～128 字符的 `idempotency_key`（位于 API query），同一次操作
+重试应保持不变。日程写请求遇到网络错误、5xx 或损坏的成功响应时**不自动重试**，
+因为远端可能已经生效；应先查询核对。明确的 token 失效最多刷新并重发一次。
+只读 GET 可以有限重试。参数非法和策略拒绝均在发出 HTTP 前返回结构化错误，
+API 权限不足会返回 `feishu_api_error`，不会伪报成功。
+
+自动验收需要真实应用的 `SEKAI_FEISHU_APP_ID`、`SEKAI_FEISHU_APP_SECRET`、
+`SEKAI_REAL_FEISHU=1` 和明确指定的可写测试日历 `SEKAI_FEISHU_TEST_CALENDAR_ID`。
+用例会在该日历创建、读取、更新并删除一条临时日程。删除失败时输出日程 ID，便于清理。
+
+```sh
+cargo test -p sekai-router --lib real_feishu_calendar_round_trip -- --ignored
+```
+
+接口依据：[列出日历](https://open.feishu.cn/document/server-docs/calendar-v4/calendar/list)、
+[创建日程](https://open.feishu.cn/document/server-docs/calendar-v4/calendar-event/create)、
+[更新日程](https://open.feishu.cn/document/server-docs/calendar-v4/calendar-event/patch)、
+[删除日程](https://open.feishu.cn/document/server-docs/calendar-v4/calendar-event/delete)。
 
 ## 5. 消息回路语义
 
@@ -220,7 +289,7 @@ ack 后丢弃。
 
 1. （可选）ack 消息：`已收到，正在处理…`（`SEKAI_FEISHU_ACK=off` 关闭；
    命令类消息 §5.3 不发 ack）。
-2. 调 `PromptCore::run_prompt(text, SEKAI_FEISHU_MAX_STEPS)`（该调用内部
+2. 调 `PromptCore::run_feishu_prompt`（注入本轮飞书工具与会话上下文；该调用内部
    已克隆策略并置 `deny_llm_relay=true`、过 RunGate 全局 4 路、5s 等槽后回
    `busy`）。
 3. 回复映射（reply 到原 `message_id`）：
@@ -232,7 +301,7 @@ ack 后丢弃。
 | `Ok{status: ContextBudget, answer?}` | `（上下文预算用尽，已停止）` + answer（如有） |
 | `Err llm_unavailable` | `LLM 未配置：需要 DEEPSEEK_API_KEY` |
 | `Err not_linked` | `Worker 链路未建立` |
-| `Err no_workers` | `暂无 Worker 在线，请稍后再试` |
+| `Err no_workers`（仅其它 prompt 入口） | `暂无 Worker 在线，请稍后再试`；飞书 API 运行不要求在线 Worker |
 | `Err agent_error` | `执行失败：<message>`（LLM/网关错误的 Display 文本，不含凭据） |
 | `Err busy` | `系统繁忙，请稍后再试` |
 
@@ -248,6 +317,9 @@ ack 后丢弃。
 | --- | --- |
 | `/cancel` | 置位该 chat 的在途 `CancelToken`（复用 `agent::CancelToken`）；回复「已请求取消」；无在途运行时回复「当前没有运行中的任务」 |
 | `/status` | 回复一行状态：链路类型与连接态、在线 Worker 数（id 列表，截断到前 5）、当前 chat 是否有在途运行、全局运行数/4 |
+| `/task grant NAME` | 管理员私聊添加一个 Task 的实例级授权，保存后生效 |
+| `/task revoke NAME` | 管理员私聊撤销该名称的飞书授权，回复会指出启动配置是否仍允许它 |
+| `/task list` | 管理员私聊查看启动策略、飞书追加名单和当前有效权限 |
 
 ### 5.4 并发与串行
 
@@ -313,10 +385,12 @@ V1 帧协议）。
 
 ### 6.2 策略与防递归
 
-- 策略投影**同 CLI**：`--allow-write`/`--allow-tasks`/`--allow-admin`/
-  `--worker` 语义不变，默认全关（只读白名单）。`deny_llm_relay` 由
-  `run_prompt` 内部强制置 true，飞书回路发起的运行内再派 `pc.ask` 一律
-  `policy_denied`（与 ingress/serve 完全一致）。
+- Task 默认拒绝。启动时可重复指定 `--allow-task NAME`，或用 `--allow-tasks` 全开。`--allow-write`、`--allow-admin` 和 `--worker` 分别控制写操作、管理操作和可访问的 Worker。飞书和 TCP prompt ingress 内派发 `pc.ask` 仍会触发防递归规则并返回 `policy_denied`。
+- 配置 `SEKAI_FEISHU_TASK_ADMINS` 和 `SEKAI_FEISHU_TASK_POLICY_FILE` 后，管理员可私聊机器人管理当前实例的追加名单。管理员本人还须通过 §6.1 的消息接入检查。管理入口以事件中的应用身份、发送者 `open_id`、用户类型和私聊类型为准。
+- 最终权限是启动策略与飞书名单的并集。变更同时作用于本实例后续的飞书和 TCP prompt 运行。在途运行沿用开始时的策略。`/task revoke NAME` 只撤销飞书追加的条目，回复会说明启动配置是否仍允许该名称。像 `pc.exec` 这样的写类命令仍受写权限控制。
+- 策略文件跨重启保留。每个 Router 实例应独占一个文件，所在目录须由部署账号控制。文件不存在时从空名单开始。文件损坏、应用 ID 不匹配或启动名单与动态名单的并集超出 64 项时，Router 会告警并停用动态授权，启动配置继续生效。
+- 授权名称须匹配 `[a-z0-9._-]{1,48}`，精确名单合并去重后最多 64 项。`/task list` 将每个名称列一次，并标记来自启动配置 `S`、动态授权 `D` 或两者 `S+D`，整份名单可放入一条 4000 字节以内的消息。
+- 文件格式为 `{version, app_id, allowed_tasks, applied_message_ids}`，其中 `version` 为 `1`。Router 在同目录写入并同步临时文件，原子替换成功后才更新内存并确认。文件保留最近 1024 条管理变更的消息 ID，重启后仍可识别其重投。
 
 ### 6.3 凭据与脱敏
 
@@ -343,7 +417,7 @@ len=<prompt 字节数> outcome=<ok|max_steps|context_budget|error:<code>|busy|de
 non_text|empty|too_long|reply_failed> ms=<处理毫秒>
 ```
 
-**不记录消息内容与回复内容**（同 ingress peer/method/outcome 风格）；§5.5 的
+Task 管理额外记录 `cmd=task.grant|task.revoke|task.list`、管理员 ID 和处理结果。合法的管理员变更命令另记 `task=NAME`。原始消息文本和回复不写入日志。§5.5 的
 会话上下文也只存在内存并送给 LLM，不进审计行与 trace（trace 只多
 `context_turns` 计数）。
 
@@ -383,7 +457,7 @@ crate/sekai-router/src/
 | 主线程 | 配置解析、PromptCore 构造、信号处理、退出码 |
 | WS IO 线程 | 阻塞读帧（`read_timeout` 切分：超时时检查是否该发 ping / 是否 2×interval 无 pong）；分片重组；**先 ack 再投递** |
 | dispatch 线程 | 从 mpsc 取完整事件：allowlist/命令/限流判定，per-chat 串行 spawn 运行线程 |
-| 运行线程（短命） | `run_prompt_with_context`（元数据 + 历史），Ok 后先写回历史，再 REST 回复 + 审计行，结束即退 |
+| 运行线程（短命） | `run_feishu_prompt`（飞书工具 + 元数据 + 历史），Ok 后先写回历史，再 REST 回复 + 审计行，结束即退 |
 
 ### 7.3 为什么不引入现成库（对照表）
 
@@ -406,6 +480,8 @@ crate/sekai-router/src/
 | `SEKAI_FEISHU_DOMAIN` | 开放平台域名 | `https://open.feishu.cn` | 必须为 `https://`（Lark 用 `https://open.larksuite.com`） |
 | `SEKAI_FEISHU_ALLOW_USERS` | 允许的用户 id 列表 | 空（全拒） | 禁 `*`；非空项 trim 后非空 |
 | `SEKAI_FEISHU_ALLOW_CHATS` | 允许的会话 id 列表 | 空（全拒） | 同上 |
+| `SEKAI_FEISHU_TASK_ADMINS` | 以逗号分隔的管理员 `open_id` 列表 | 禁用管理命令 | 禁用通配符，与策略文件成对配置 |
+| `SEKAI_FEISHU_TASK_POLICY_FILE` | 实例专用的 Task 策略文件 | 无 | 使用绝对路径，父目录须存在且可写 |
 | `SEKAI_FEISHU_ACK` | 收到消息先回「正在处理」 | `on` | `on`/`off` |
 | `SEKAI_FEISHU_MAX_STEPS` | 每消息 agent 步数上限 | 不覆盖（随全局；feishu 默认 tcp = 直连 PC Worker → 不设上限） | `1..=32`（同 `MAX_PROMPT_STEPS`） |
 | `SEKAI_FEISHU_CONTEXT_TURNS` | 每会话保留的最近问答轮数（0 = 只注入元数据，关闭多轮记忆） | `8` | `0..=50`；非法配置退出码 2 |
@@ -432,6 +508,10 @@ skill 引用本文的表（不复制协议常量，避免漂移），本文不�
 7. 取允许名单 id：启动 `sekai-router --feishu`（allowlist 可为空），给自己/
    群发一条消息，从 stderr 审计行抄 `chat=`/`sender=`（open_id 以 `ou_`
    开头、chat_id 以 `oc_` 开头）。
+8. 若要开启 Task 管理，把管理员的 `open_id` 加入 `SEKAI_FEISHU_ALLOW_USERS` 和
+   `SEKAI_FEISHU_TASK_ADMINS`，为实例配置 `SEKAI_FEISHU_TASK_POLICY_FILE`。启动后，
+   管理员私聊发送 `/task grant echo` 和 `/task list`，确认列表显示 `echo`。可用
+   `/task revoke echo` 撤销这项动态授权。Task 管理复用机器人的私聊收发消息权限。
 
 ## 10. 测试策略
 
@@ -498,7 +578,7 @@ skill 引用本文的表（不复制协议常量，避免漂移），本文不�
 | 群聊触发判据 | `mentions` 含本机器人 | 依赖 Feishu 仅向机器人投递被 @ 的群消息 + `mentions` 非空静态判定，并剥离所有 @ 占位符 | 事件载荷不含机器人 open_id，无法静态比对。**若应用被授予 `im:message`（群内全部消息），含 @ 他人的群消息也会被当作触发**：V1 请按 §9 只授 `im:message.group_at_msg:readonly`；上线验证见 §9 第 4 步实操 |
 | 内存上限 | 未规定 | WS 单帧 ≤16 MiB（`ws.rs`）；分片重组 ≤4 MiB/事件；ack/分片缓冲随连接重建清空 | 防异常/恶意事件撑爆常驻进程 |
 | 退出码 4 | HTTPS helper 缺失或运行期 `llm_unavailable` 致命场景 | 仅当构建未启用 `tls` feature（无法承载 `wss://`）时返回 4；运行期 `llm_unavailable` 按 §5.2 回复「LLM 未配置」，不退出 | 常驻服务不因缺 API key 退出；缺 TLS 属于部署/构建错误，启动即失败最直观 |
-| 链路建立失败 | 退出码 3 仅列飞书链路 | Worker 链路建立失败同样退出码 3（沿用批处理约定）；**建链后不等待 Worker 上线**即进入事件泵 | 常驻服务应能先于 Worker 启动（建连 skill 第 4 步先起 Router 取 chat_id）；无 Worker 时消息回「暂无 Worker 在线」，运行期断开回「Worker 链路未建立」 |
+| 链路建立失败 | 退出码 3 仅列飞书链路 | Worker 链路建立失败同样退出码 3（沿用批处理约定）；**建链后不等待 Worker 上线**即进入事件泵 | 常驻服务应能先于 Worker 启动；飞书日历 API 无需在线 Worker，Worker 命令仍需要已连接的目标 |
 | 心跳实现 | §3.4：应用层 CONTROL `{type:"ping"}`/`{type:"pong"}` | 发 **RFC 6455 协议层 ping**，收到协议层 **pong** 刷新存活时间（`WsMessage::Pong`）；应用层 CONTROL pong 的解析保留（兼容/未来） | 2026-11-07 真连实测：飞书网关按下发的 `PingInterval`（实测 90s）对 WS ping 回 WS pong；此前仅按应用层 pong 刷新存活时间，导致每 2×PingInterval 误判断线重连一次 |
 | 会话上下文与多轮记忆 | §1/§12 原列「每条消息独立目标（不保留跨消息上下文）」 | V1.1 增加进程内 per-session 元数据注入 + 最近 N 轮问答（§5.5）；`SEKAI_FEISHU_CONTEXT_TURNS` 默认 8、0 关闭；不新增飞书权限/API | Router 自身即长连接与事件泵所在处，可直接读取会话信息；用户明确要求 Router 能读取飞书会话上下文。跨重启持久化/历史 API 回填仍不做（§12） |
 

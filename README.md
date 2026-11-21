@@ -40,7 +40,7 @@ function tools）把自然语言目标评估、拆解成 Task / ToolCall，派�
 - **DSH 工具桥（带外，可选）**：PC Worker 加 `--dsh-tools` 后新增 `dsh.tools` /
   `dsh.call` 两个 Task，经与 prompt 通道并列的 JSONL 调用本机 DSH 工具（DSH worker
   插件执行）；插件 `dshTools` 默认关闭、默认只读 allowlist，Router 侧仍由
-  `--allow-tasks` 门控，V1 帧不变。
+  Task 权限门控，可用 `--allow-task NAME` 逐个开放。
 - **内置 HTTPS**：Router 默认用 `native-tls`（Windows schannel / 系统 OpenSSL）
   直连 DeepSeek API，不再需要 node 或 curl（`SEKAI_HTTPS_MODE=helper` 可回退）。
 - **`no_std` 核心**：`crate/sekai` 只依赖 `core` + `alloc`，同一份协议代码同时
@@ -85,10 +85,10 @@ cargo build --release -p sekai-router -p sekai-worker
 node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-重启 DSH 会话后出现 `sekai_*` 工具（共 7 个：router 4 个 + worker 3 个）；插件适配
-**DSH 0.2.2-rc.3**（`engines.dsh = ">=0.2.2-rc.3 <0.3.0"`，工具注册等待 `tools`
-服务），`--dry-run`/`--uninstall`、profile 自动选择与二进制解析顺序见
-[docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1。
+重跑同一命令可更新插件。支持热加载的 DSH 会自动应用新版插件，并重启需要切换版本的
+Router 和正在运行的 Worker。首次从旧版迁移时，需让 DSH 加载新版插件一次。
+插件适配 **DSH 0.2.2-rc.3**。安装选项、更新限制和验证方法见
+[Sekai × DSH 插件](docs/sekai-dsh-plugin.md#1-安装与配置)。
 
 ### 两个终端跑通闭环
 
@@ -108,11 +108,11 @@ sekai> 看一下这台机器的系统信息        # → pc.info（只读，默�
 sekai> 列一下当前目录有哪些文件        # → pc.ls（只读，默认放行）
 ```
 
-进阶（按需解锁，`--allow-write`/`--allow-tasks` 启动旗标或 REPL `/policy`）：
+在 REPL 中用 `/policy tasks only pc.ask` 单独开放 `pc.ask`，或在启动时使用 `--allow-task pc.ask`。写操作另用 `--allow-write` 或 `/policy allow-write on`。
 
 ```bash
 sekai> 跑一下 cargo --version         # → pc.exec（需 allow-write；shell 执行）
-sekai> 帮我问一下 LLM：Rust 的 Deref 是什么   # → pc.ask（需 allow-tasks；经 Router
+sekai> 帮我问一下 LLM：Rust 的 Deref 是什么   # → pc.ask（需授权 pc.ask，经 Router
                                        #   prompt ingress 取回回答，防递归）
 ```
 
@@ -134,7 +134,7 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 | 拉起子进程 | `sekai-router --link stdio`（REPL 内 `/link stdio`） | Router 直接 spawn `sekai-worker`，stdin/stdout 即链路，单进程演示 |
 | 全屏 TUI | `sekai-router --tui` | ratatui 界面：状态栏 + 滚动输出 + 输入行；非终端管道下自动回退行式 REPL |
 | 无头服务 | `sekai-router --serve` | stdin/stdout 走 JSONL 协议（链路操作不调 LLM、无需 API key；`prompt` 方法经内置回路调 LLM），供 [DSH 插件](plugins/sekai-dsh)驱动 |
-| 飞书对话入口 | `sekai-router --feishu` | WebSocket 长连接收 IM 事件、REST 回复原消息；同会话注入会话元数据与最近 N 轮问答（内存，`SEKAI_FEISHU_CONTEXT_TURNS`，默认 8）。需 `SEKAI_FEISHU_APP_ID`/`_APP_SECRET`；链路默认 tcp；详见 [docs/sekai-feishu.md](docs/sekai-feishu.md) 与 [建连 skill](skills/feishu-setup/SKILL.md) |
+| 飞书对话入口 | `sekai-router --feishu` | WebSocket 收 IM、REST 回复，保留最近 N 轮问答（`SEKAI_FEISHU_CONTEXT_TURNS`，默认 8）；内置日历查询与日程增删改查，写入加 `--allow-write`，无需在线 Worker。需 `SEKAI_FEISHU_APP_ID`/`_APP_SECRET` 与消息 allowlist；日历以应用身份访问；详见 [飞书 API 配置与示例](docs/sekai-feishu.md#43-日历与日程工具) 与 [建连 skill](skills/feishu-setup/SKILL.md) |
 | MQTT 链路 | `SEKAI_MQTT_ADDR=127.0.0.1:1883 sekai-router --goal "…"` | 嵌入式链路沿用（默认 `--link mqtt`），需要 MQTT 5 broker |
 | 只看链路 | `sekai-router --dry-run` | 连接并列出 Worker，不调用 LLM，无需 API key |
 
@@ -169,16 +169,19 @@ REPL 常用命令：`/help`、`/link <mqtt|stdio|tcp>`（建/换链路）、`/wo
 ## 安全模型
 
 - **默认只读**：`pc.exec` / `pc.write` 与 `gpio.config` / `gpio.write` 等写操作、
-  Task 下发（`pc.job` / `pc.ask` / `echo` / `sleep`）、管理与其他工具，分别需要
-  `--allow-write` / `--allow-tasks` / `--allow-admin`（或 REPL `/policy`、serve 侧
-  `policy.set`）显式解锁；`pc.read` / `pc.ls` / `pc.info` 只读白名单默认放行。
+  Task 下发、管理与其他工具分别需要显式授权。写操作使用 `--allow-write`，管理操作使用
+  `--allow-admin`，Task 优先使用可重复的 `--allow-task NAME`。已有 `--allow-tasks` 仍可全开，
+  与按名授权互斥。REPL `/policy`、serve `policy.set` 和 DSH 插件都支持精确名单。
+- **飞书授权**：配置管理员名单和策略文件后，管理员可私聊机器人用 `/task grant echo`、
+  `/task revoke echo`、`/task list` 管理当前 Router 的追加名单。授权跨重启保留，也适用于
+  同实例启用的 TCP prompt 入口。配置见 [飞书权限管理](docs/sekai-feishu.md#62-策略与防递归)。
 - **拒绝即不发布**：策略校验发生在 Router 组帧发布 Stdin 之前，被拒命令
   根本不会到达 Worker。`pc.exec`/`pc.job` 在 Worker 本机执行任意 shell 命令，
   权限面最大，仅在受控环境放开。
-- **prompt 防递归**：经 prompt ingress / serve `prompt` 到达的 LLM 运行内再派
+- **prompt 防递归**。经飞书、prompt ingress 或 serve `prompt` 到达的 LLM 运行内再派
   `pc.ask` 一律拒绝（`policy_denied`「嵌套 prompt（pc.ask）」），与开关状态无关。
-- **DSH 工具桥**：Worker 的 `dsh.tools`/`dsh.call` 是普通 Task（按 `--allow-tasks`
-  门控）；插件侧 `dshTools` 默认关闭且默认只读（`read`/`glob`/`grep`），并硬拒绝
+- **DSH 工具桥**。Worker 的 `dsh.tools` 和 `dsh.call` 受 Router 的 Task 策略控制。
+  插件侧 `dshTools` 默认关闭，启用后默认只读（`read`/`glob`/`grep`），并硬拒绝
   `run_code` 与 `sekai_worker_*`；两层都通过才执行。
 - **ingress 访问控制**：prompt ingress 默认只监听回环；绑定非回环地址必须显式
   `SEKAI_INGRESS_ALLOW_REMOTE=1`，且必须配置 `SEKAI_INGRESS_TOKEN`（连接第一行

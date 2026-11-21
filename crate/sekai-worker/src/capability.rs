@@ -18,7 +18,7 @@
 //!   stdin（stdio 模式下那是 V1 帧流，`--llm dsh` 下是 prompt JSONL）。
 //! - **进程树**：Unix 用 `process_group(0)` 建独立进程组，超时/取消时先
 //!   `child.kill()` 再 `kill -KILL -<pgid>`；Windows 追加
-//!   `taskkill /T /F /PID <pid>`——孙进程不会成为孤儿继续占着管道。
+//!   Job Object——孙进程不会成为孤儿继续占着管道。
 //! - **输出泵**：先有界 join 读线程再取缓冲；没来得及收全时追加
 //!   `[[truncated]]` 标记，尾部输出不会静默丢失。
 //! - **编码**：结果统一 UTF-8 lossy（非法字节替换为 U+FFFD），配合 Router
@@ -565,6 +565,15 @@ fn assemble_bounded(
 // 子进程基础设施（pc.exec / pc.job 共用）
 // ---------------------------------------------------------------------------
 
+#[cfg(windows)]
+mod windows_process;
+
+struct ShellChild {
+    child: Child,
+    #[cfg(windows)]
+    job: windows_process::Job,
+}
+
 /// 跨平台 shell 启动：Windows `cmd /C <command>`，其余 `sh -c <command>`。
 ///
 /// - `stdin` 一律接 `NUL` / `/dev/null`：子进程**不得继承** Worker 的 stdin
@@ -572,12 +581,21 @@ fn assemble_bounded(
 ///   继承会让子进程抢走帧/响应）；
 /// - Unix 上让子进程成为新进程组组长（`process_group(0)`，pgid == 子进程
 ///   pid），超时/取消时由 [`kill_process_tree`] 按进程组杀整棵树。
-fn spawn_shell(command: &str) -> std::io::Result<Child> {
-    let mut builder = if cfg!(windows) {
+fn spawn_shell(command: &str) -> std::io::Result<ShellChild> {
+    #[cfg(windows)]
+    let mut builder = {
+        use std::os::windows::process::CommandExt;
+
         let mut builder = Command::new("cmd");
-        builder.arg("/C").arg(command);
+        // cmd parses /C itself. /S strips the outer pair of quotes and preserves
+        // quotes inside the command, including paths and PowerShell arguments.
         builder
-    } else {
+            .args(["/D", "/S", "/C"])
+            .raw_arg(format!("\"{command}\""));
+        builder
+    };
+    #[cfg(not(windows))]
+    let mut builder = {
         let mut builder = Command::new("sh");
         builder.arg("-c").arg(command);
         builder
@@ -591,7 +609,17 @@ fn spawn_shell(command: &str) -> std::io::Result<Child> {
         use std::os::unix::process::CommandExt;
         builder.process_group(0);
     }
-    builder.spawn()
+    #[cfg(windows)]
+    {
+        let (child, job) = windows_process::spawn(&mut builder)?;
+        Ok(ShellChild { child, job })
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(ShellChild {
+            child: builder.spawn()?,
+        })
+    }
 }
 
 /// 启动命令并挂好输出泵：返回 (子进程, 累积缓冲)。
@@ -601,11 +629,17 @@ fn spawn_command(
     command: &str,
     cap: usize,
     keep_tail: bool,
-) -> std::io::Result<(Child, Arc<OutputSink>)> {
+) -> std::io::Result<(ShellChild, Arc<OutputSink>)> {
     let mut child = spawn_shell(command)?;
     let sink = OutputSink::new(cap, keep_tail);
-    spawn_pipe_pump(child.stdout.take().expect("stdout 已 piped"), sink.clone());
-    spawn_pipe_pump(child.stderr.take().expect("stderr 已 piped"), sink.clone());
+    spawn_pipe_pump(
+        child.child.stdout.take().expect("stdout 已 piped"),
+        sink.clone(),
+    );
+    spawn_pipe_pump(
+        child.child.stderr.take().expect("stderr 已 piped"),
+        sink.clone(),
+    );
     Ok((child, sink))
 }
 
@@ -613,35 +647,23 @@ fn spawn_command(
 ///
 /// 平台顺序不同（原因见各分支注释）：
 ///
-/// - Windows：**先** `taskkill /T /F /PID <pid>`（树根还活着时才能递归枚举
-///   并终止子孙），再用 `Child::kill()` 兜底；如果先 kills 树根，`cmd /C` 的
-///   孙进程（编译器等）会变成孤儿继续跑、taskkill 也再找不到它们；
+/// - Windows：Job Object 跟踪整个进程树，直接终止 Job。
 /// - Unix：子进程由 [`spawn_shell`] 以 `process_group(0)` 启动，pgid 等于
 ///   子进程 pid，先 `Child::kill()` 再 `kill -KILL -<pgid>` 杀整个进程组
 ///   （不引入 libc 依赖）。
 ///
 /// 最后 `wait()` 收割直接子进程，避免僵尸。
-fn kill_process_tree(child: &mut Child) {
-    let pid = child.id();
+fn kill_process_tree(child: &mut ShellChild) {
     #[cfg(windows)]
     {
-        // 必须先 taskkill：父进程存活时 /T 才能沿父子链枚举到孙进程。
-        let _ = Command::new("taskkill")
-            .arg("/T")
-            .arg("/F")
-            .arg("/PID")
-            .arg(pid.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        child.job.terminate();
     }
-    let _ = child.kill();
+    let _ = child.child.kill();
     #[cfg(unix)]
     {
         // 负 pid 表示"进程组"：组内还有孙进程时它们一并被 SIGKILL。
         // 进程已被 kill、句柄仍打开时 pid/pgid 依然有效。
-        let pgid = format!("-{pid}");
+        let pgid = format!("-{}", child.child.id());
         let _ = Command::new("kill")
             .arg("-KILL")
             .arg(&pgid)
@@ -650,7 +672,7 @@ fn kill_process_tree(child: &mut Child) {
             .stderr(Stdio::null())
             .status();
     }
-    let _ = child.wait();
+    let _ = child.child.wait();
 }
 
 /// 子进程输出累积缓冲：读线程并发追加；达到 `cap` 后按模式保留头部或尾部。
@@ -976,7 +998,7 @@ impl TaskHandler for SleepTask {
 ///
 /// 输出只保留尾部（≤ `MAX_PAYLOAD`），完成结果 `exit=<code>\n` + 输出尾部。
 struct JobTask {
-    child: Option<Child>,
+    child: Option<ShellChild>,
     sink: Arc<OutputSink>,
 }
 
@@ -999,7 +1021,7 @@ impl Drop for JobTask {
 impl TaskHandler for JobTask {
     fn poll(&mut self, ctx: &mut TaskContext<'_>) -> TaskPoll {
         if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
+            match child.child.try_wait() {
                 Ok(Some(status)) => {
                     let code = status.code().unwrap_or(-1);
                     self.child = None; // try_wait 已收割，仅放弃句柄。
@@ -1046,7 +1068,7 @@ impl TaskHandler for JobTask {
 /// - 内部上限（`SEKAI_PC_EXEC_MS`，默认 10s）→ 杀进程树，但保留已收输出
 ///   并追加 `[[timeout after Nms]]` 标记（与"工具时代"的 pc.exec 语义一致）。
 struct ExecTask {
-    child: Option<Child>,
+    child: Option<ShellChild>,
     sink: Arc<OutputSink>,
     started: Instant,
     timeout_ms: u64,
@@ -1083,7 +1105,7 @@ impl Drop for ExecTask {
 impl TaskHandler for ExecTask {
     fn poll(&mut self, ctx: &mut TaskContext<'_>) -> TaskPoll {
         if let Some(child) = self.child.as_mut() {
-            match child.try_wait() {
+            match child.child.try_wait() {
                 Ok(Some(status)) => {
                     let code = status.code().unwrap_or(-1);
                     self.child = None; // try_wait 已收割，仅放弃句柄。
@@ -2058,60 +2080,55 @@ mod tests {
     // ---- 进程树（B4.3/P1） ----
 
     /// 孙进程探针：构造一条「shell → 长跑孙进程」的命令树，并能验证孙进程
-    /// 是否仍存活。Windows 用重命名的 powershell 副本（按镜像名查 tasklist，
-    /// `Start-Sleep` 不依赖网络）；Unix 用后台 sleep（pid 落盘，kill -0 探测）。
+    /// Windows records the PID of the system PowerShell process.
     #[cfg(windows)]
     struct TreeProbe {
-        dir: TempDir,
-        image: String,
+        _dir: TempDir,
+        pid_file: PathBuf,
     }
 
     #[cfg(windows)]
     impl TreeProbe {
         fn new(tag: &str) -> Self {
             let dir = TempDir::new(tag);
-            // 镜像名压到 ≤25 字符：tasklist 默认表格输出会截断 Image Name。
-            static PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
-            let serial = PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let image = format!("skp-{}-{serial}.exe", std::process::id());
-            let system_root =
-                std::env::var("SystemRoot").unwrap_or_else(|_| String::from("C:\\Windows"));
-            // 复制 powershell 而不是 ping：`ping` 在离线/受限网络下会立刻失败，
-            // 无法稳定充当"长跑孙进程"。
-            let source = PathBuf::from(system_root)
-                .join("System32")
-                .join("WindowsPowerShell")
-                .join("v1.0")
-                .join("powershell.exe");
-            let target = dir.join(&image);
-            assert!(
-                !target.to_string_lossy().contains(' '),
-                "临时目录路径含空格，cmd /C 无法透传：{}",
-                target.display()
-            );
-            std::fs::copy(&source, &target).expect("复制 powershell.exe 失败");
-            Self { dir, image }
+            let pid_file = dir.join("child.pid");
+            Self {
+                _dir: dir,
+                pid_file,
+            }
         }
 
-        /// 命令树：cmd（直接子进程）→ 重命名 powershell（孙进程，跑 30s）。
         fn command(&self) -> String {
+            let pid_file = self.pid_file.to_string_lossy().replace('\'', "''");
             format!(
-                "{} -NoProfile -Command Start-Sleep 30",
-                self.dir.join(&self.image).display()
+                "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('{pid_file}', [string]$PID); Start-Sleep -Seconds 60\""
             )
         }
 
         fn alive(&self) -> bool {
-            // CSV 输出不截断 Image Name（默认表格列宽 25 字符会截断）。
-            let output = Command::new("tasklist")
-                .arg("/FI")
-                .arg(format!("IMAGENAME eq {}", self.image))
-                .arg("/FO")
-                .arg("CSV")
-                .arg("/NH")
-                .output()
-                .expect("tasklist 执行失败");
-            String::from_utf8_lossy(&output.stdout).contains(self.image.as_str())
+            let Ok(pid) = std::fs::read_to_string(&self.pid_file) else {
+                return false;
+            };
+            let Ok(pid) = pid.trim().parse::<u32>() else {
+                return false;
+            };
+            use std::os::windows::io::{FromRawHandle, OwnedHandle, RawHandle};
+
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn OpenProcess(access: u32, inherit: i32, pid: u32) -> RawHandle;
+                fn WaitForSingleObject(handle: RawHandle, milliseconds: u32) -> u32;
+            }
+            const SYNCHRONIZE: u32 = 0x0010_0000;
+            const WAIT_TIMEOUT: u32 = 258;
+            // SAFETY: OpenProcess returns an owned handle or null.
+            let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return false;
+            }
+            // SAFETY: The handle is valid and stays open until the wait returns.
+            let _owned = unsafe { OwnedHandle::from_raw_handle(handle) };
+            unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
         }
 
         fn wait_until_alive(&self) {
@@ -2120,7 +2137,7 @@ mod tests {
                 assert!(
                     Instant::now() < deadline,
                     "等待孙进程启动超时（{}）",
-                    self.image
+                    self.pid_file.display()
                 );
                 thread::sleep(Duration::from_millis(20));
             }
@@ -2132,7 +2149,7 @@ mod tests {
                 assert!(
                     Instant::now() < deadline,
                     "进程树未被杀：孙进程仍存在（{}）",
-                    self.image
+                    self.pid_file.display()
                 );
                 thread::sleep(Duration::from_millis(20));
             }
@@ -2247,7 +2264,7 @@ mod tests {
             "if read line; then echo got-input; else echo eof; fi"
         };
         let mut child = spawn_shell(command).expect("启动命令失败");
-        let mut stdout = child.stdout.take().expect("stdout 已 piped");
+        let mut stdout = child.child.stdout.take().expect("stdout 已 piped");
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let mut out = String::new();
@@ -2257,11 +2274,11 @@ mod tests {
         let out = match receiver.recv_timeout(Duration::from_secs(5)) {
             Ok(out) => out,
             Err(_) => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 panic!("子进程仍在等待 stdin：继承未被切断（应为 Stdio::null）");
             }
         };
-        let _ = child.wait();
+        let _ = child.child.wait();
         assert!(
             out.to_ascii_lowercase().contains("eof"),
             "子进程 stdin 应为空（NUL//dev/null）：{out:?}"

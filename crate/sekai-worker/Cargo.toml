@@ -16,3 +16,21 @@ path = "src/bin/sekai-worker.rs"
 [dependencies]
 sekai = { path = "../sekai" }
 sekai-gpio = { path = "../sekai-gpio" }
+
+[features]
+uart-bridge = ["dep:serialport", "dep:getrandom"]
+
+[dependencies.serialport]
+version = "4"
+default-features = false
+optional = true
+
+[dependencies.getrandom]
+version = "0.3"
+features = ["std"]
+optional = true
+
+[[bin]]
+name = "stm32-bridge"
+path = "src/bin/stm32-bridge.rs"
+required-features = ["uart-bridge"]

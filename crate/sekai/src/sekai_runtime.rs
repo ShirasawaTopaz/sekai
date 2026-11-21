@@ -33,7 +33,7 @@ use crate::sekai_device_list::{DeviceList, Endpoint};
 use crate::sekai_stdin::{JumpBody, Kind, Stdin, TaskBody, ToolBody};
 use crate::sekai_stdout::{ActiveTask, ErrorPayload, Hello, JumpOutcome, Phase, Stdout};
 use crate::sekai_task::{TaskContext, TaskPoll, TaskRegistry};
-use crate::sekai_tool::{ToolContext, ToolRegistry};
+use crate::sekai_tool::ToolRegistry;
 use crate::sekai_wire::{
     CommandError, ErrorCode, MAX_ACTIVE_TASKS, MAX_DDL_MS, MAX_DELAY_MS, MAX_FIRMWARE_LEN,
     MAX_PAYLOAD, MAX_TASKS, MAX_TOOLS, ProtocolEncodeError, ProtocolError, validate_worker_id,
@@ -1202,16 +1202,7 @@ impl<C: Clock> Runtime<C> {
                     self.handle_builtin(&name, &args, now)
                         .unwrap_or_else(|| Err(CommandError::from(ErrorCode::UnknownTool)))
                 } else {
-                    let mut context = ToolContext {
-                        args: &args,
-                        now_mono_ms: now,
-                        now_unix_ms: now_unix,
-                        workers: &self.workers,
-                    };
-                    match self.tools.get_mut(&name) {
-                        Some(tool) => tool.call(&mut context),
-                        None => Err(CommandError::from(ErrorCode::UnknownTool)),
-                    }
+                    self.tools.call(&name, &args, now, now_unix, &self.workers)
                 };
                 let elapsed = self.clock.monotonic_ms().saturating_sub(now);
                 if elapsed >= u64::from(ddl_ms) {

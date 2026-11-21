@@ -53,14 +53,79 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # 覆盖 Windows 专属路径：Job 对象/taskkill 杀进程树、cmd /C 编码、
+      # 覆盖 Windows 专属路径：Job Object 清理进程树、cmd /C 参数解析、
       # crossterm TUI 编译。
       - name: Test（Windows 全量测试）
         run: cargo test --workspace
 
-  plugin:
-    name: DSH plugin smoke（无 Rust 依赖）
+  stm32:
+    name: STM32 ${{ matrix.board }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - board: blue-pill
+            target: thumbv7m-none-eabi
+          - board: discovery
+            target: thumbv7em-none-eabi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Link firmware and check board memory limits
+        run: |
+          cargo build --locked -p sekai-stm32 --profile stm32 --target ${{ matrix.target }} --features ${{ matrix.board }}
+          size -A target/${{ matrix.target }}/stm32/sekai-stm32
+
+  esp32:
+    name: ESP32 firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: esp32-1.97.0.0
+      - name: Install Xtensa toolchain
+        run: |
+          cargo install espup --locked --version 0.19.0
+          espup install --targets esp32 --toolchain-version 1.97.0.0 --export-file "$RUNNER_TEMP/export-esp.sh"
+      - name: Build release firmware
+        run: |
+          source "$RUNNER_TEMP/export-esp.sh"
+          cargo +esp build --locked --release -p sekai-build --bin sekai-fw \
+            --no-default-features --features esp32 --target xtensa-esp32-none-elf \
+            -Zbuild-std=core,alloc \
+            --config 'target."xtensa-esp32-none-elf".rustflags=["-C","link-arg=-Tlinkall.x"]'
+
+  gpio-loopback:
+    name: GPIO loopback CLI
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build serial bridge
+        run: cargo build --locked -p sekai-worker --features uart-bridge --bin stm32-bridge
+      - name: GPIO loopback CLI tests
+        run: node --test scripts/gpio-loopback.test.mjs
+      - name: GPIO loopback through Router MQTT
+        run: cargo test --locked -p sekai-router --test gateway_live gpio_loopback_cli_uses_real_router_mqtt_transport -- --ignored
+
+  plugin:
+    name: DSH plugin smoke (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: plugins/sekai-dsh

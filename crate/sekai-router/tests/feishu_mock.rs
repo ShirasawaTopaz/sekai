@@ -28,7 +28,7 @@ use sekai_router::control::CommandRequest;
 use sekai_router::feishu::{self, FeishuOptions};
 use sekai_router::gateway::{CommandReceipt, GatewayError, GatewayHandle, WorkerGateway};
 use sekai_router::json::Json;
-use sekai_router::llm::{ChatClient, ChatRequest, ChatResponse, LlmError, Role, Usage};
+use sekai_router::llm::{ChatClient, ChatRequest, ChatResponse, LlmError, Role, ToolCall, Usage};
 use sekai_router::pbbp::{Frame, METHOD_DATA};
 use sekai_router::prompt_server::PromptCore;
 use sekai_router::tools::Policy;
@@ -176,7 +176,7 @@ fn agent_config() -> AgentConfig {
 fn policy() -> Policy {
     Policy {
         allow_write: false,
-        allow_tasks: false,
+        tasks: sekai_router::tools::TaskAccess::Deny,
         allow_admin: false,
         worker_filter: None,
         deny_llm_relay: true,
@@ -444,6 +444,19 @@ fn handle_http(mut stream: TcpStream, context: Arc<HttpContext>) {
         respond_json(
             &mut stream,
             r#"{"code":0,"tenant_access_token":"t-test","expire_in":7200}"#,
+        );
+        return;
+    }
+    if path.starts_with("/open-apis/calendar/v4/calendars/cal-test/events?") {
+        assert_eq!(_method, "POST");
+        assert!(path.contains("idempotency_key="));
+        let _ = context.records.send(Recorded::Sent {
+            chat_id: String::from("__calendar_api__"),
+            text: String::from_utf8(body).unwrap(),
+        });
+        respond_json(
+            &mut stream,
+            r#"{"code":0,"data":{"event":{"event_id":"event-test","app_link":"https://example.test/calendar/event-test"}}}"#,
         );
         return;
     }
@@ -953,9 +966,26 @@ impl FeishuHandle {
     /// 以给定 chat/网关起 `feishu::run`（gateway 同时注入 PromptCore，供
     /// `run_prompt` 查 Worker 快照，并用于 `/status` 的在线列表）。
     fn start(chat: TestChat, options: FeishuOptions) -> Self {
+        Self::start_with_policy(chat, options, policy()).0
+    }
+
+    fn start_with_policy(
+        chat: TestChat,
+        options: FeishuOptions,
+        policy: Policy,
+    ) -> (Self, Arc<PromptCore<TestChat>>) {
+        Self::start_with_ingress(chat, options, policy, |_| {})
+    }
+
+    fn start_with_ingress(
+        chat: TestChat,
+        options: FeishuOptions,
+        policy: Policy,
+        start_ingress: impl FnOnce(Arc<PromptCore<TestChat>>) + Send + 'static,
+    ) -> (Self, Arc<PromptCore<TestChat>>) {
         let core = Arc::new(PromptCore::new(
             chat,
-            policy(),
+            policy,
             agent_config(),
             TraceWriter::disabled(),
         ));
@@ -963,11 +993,17 @@ impl FeishuHandle {
         core.set_gateway(Some(Arc::clone(&gateway)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let thread = thread::spawn(move || feishu::run(core, gateway, options, thread_stop));
-        Self {
-            stop,
-            thread: Some(thread),
-        }
+        let thread_core = Arc::clone(&core);
+        let thread = thread::spawn(move || {
+            feishu::run_with_ingress(thread_core, gateway, options, thread_stop, start_ingress)
+        });
+        (
+            Self {
+                stop,
+                thread: Some(thread),
+            },
+            core,
+        )
     }
 
     /// 置停止标志并等待退出，返回 `feishu::run` 的退出码。
@@ -995,6 +1031,7 @@ fn feishu_options(mock: &MockFeishu) -> FeishuOptions {
         domain: mock.domain.clone(),
         allow_users: Vec::new(),
         allow_chats: Vec::new(),
+        task_admin: None,
         ack: true,
         max_steps: Some(4),
         context_turns: 8,
@@ -1012,10 +1049,257 @@ fn start_allowed(mock: &MockFeishu, chat: TestChat) -> FeishuHandle {
     handle
 }
 
+#[test]
+fn task_admin_persists_grants_and_rejects_replays() {
+    let dir = std::env::temp_dir().join(format!(
+        "sekai-feishu-task-{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("policy.json");
+    let configure = |mock: &MockFeishu| {
+        let mut options = feishu_options(mock);
+        options.app_id = "cli_x".into();
+        options.allow_users = vec!["ou_1".into()];
+        options.task_admin = Some(sekai_router::config::FeishuTaskAdminConfig {
+            open_ids: vec!["ou_1".into()],
+            policy_file: path.clone(),
+        });
+        options
+    };
+    let base = Policy {
+        tasks: sekai_router::tools::TaskAccess::from_names(["static-task"]),
+        ..policy()
+    };
+    let command = |mock: &MockFeishu, id: &str, chat: &str, message_id: &str, text: &str| {
+        let payload = event_json(id, chat, "oc_1", message_id, "text", text, &["@_bot"]);
+        mock.push_event(data_frame(id, payload, 1, 0));
+        match mock.next_record(Duration::from_secs(3)) {
+            Recorded::Sent { text, .. } => text,
+            other => panic!("expected management reply, got {other:?}"),
+        }
+    };
+
+    let mock = MockFeishu::start();
+    let (handle, core) =
+        FeishuHandle::start_with_policy(TestChat::instant(), configure(&mock), base.clone());
+    mock.wait_connected(1, Duration::from_secs(3));
+    assert!(command(&mock, "e1", "group", "om_group", "@_bot /task grant echo").contains("未授权"));
+    for (index, (field, replacement)) in [
+        (r#""chat_type":"p2p","#, ""),
+        (r#""sender_type":"user""#, r#""sender_type":"app""#),
+        (r#""user_id":"u_1","open_id":"ou_1""#, r#""user_id":"ou_1""#),
+        (r#""app_id":"cli_x""#, r#""app_id":"cli_other""#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("e-denied-{index}");
+        let payload = event_json(&id, "p2p", "oc_1", &id, "text", "/task grant echo", &[]);
+        let payload = String::from_utf8(payload).unwrap();
+        assert!(payload.contains(field));
+        mock.push_event(data_frame(
+            &id,
+            payload.replace(field, replacement).into_bytes(),
+            1,
+            0,
+        ));
+        assert!(
+            matches!(mock.next_record(Duration::from_secs(3)), Recorded::Sent {text, ..} if text.contains("未授权"))
+        );
+    }
+    assert!(!path.exists());
+    assert!(command(&mock, "e2", "p2p", "om_grant", "/task grant echo").contains("已添加"));
+    assert!(core.policy().tasks.allows("echo"));
+    assert!(command(&mock, "e3", "p2p", "om_list", "/task list").contains("echo [D]"));
+    assert_eq!(handle.stop(), 0);
+    drop(mock);
+
+    let mock = MockFeishu::start();
+    let (addr_tx, addr_rx) = mpsc::channel();
+    let chat = TestChat::instant();
+    let requests = chat.request_log();
+    let (handle, core) =
+        FeishuHandle::start_with_ingress(chat, configure(&mock), base, move |core| {
+            assert!(
+                core.policy().tasks.allows("echo"),
+                "restore occurs before ingress startup"
+            );
+            let addr = sekai_router::prompt_server::start_ingress_with(
+                core,
+                "127.0.0.1:0",
+                Default::default(),
+            )
+            .unwrap();
+            addr_tx.send(addr).unwrap();
+        });
+    let addr = addr_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let ingress_summary = || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        writeln!(
+            stream,
+            r#"{{"id":1,"method":"prompt","params":{{"text":"状态"}}}}"#
+        )
+        .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert_eq!(
+            Json::parse(response.lines().next().unwrap())
+                .unwrap()
+                .get("ok")
+                .and_then(Json::as_bool),
+            Some(true)
+        );
+        requests.lock().unwrap().last().unwrap().messages[0]
+            .content
+            .clone()
+            .unwrap()
+    };
+    mock.wait_connected(1, Duration::from_secs(3));
+    assert!(core.policy().tasks.allows("echo"));
+    assert!(ingress_summary().contains("Task：只允许 echo、static-task"));
+    let reply = command(&mock, "e4", "p2p", "om_revoke", "/task revoke echo");
+    assert!(reply.contains("已撤销"));
+    assert!(!reply.contains("启动授权仍有效"));
+    assert!(ingress_summary().contains("Task：只允许 static-task"));
+    assert!(command(&mock, "e5", "p2p", "om_grant", "/task grant echo").contains("已处理"));
+    assert!(!core.policy().tasks.allows("echo"));
+    assert!(
+        command(&mock, "e6", "p2p", "om_static", "/task revoke static-task")
+            .contains("启动授权仍有效")
+    );
+    assert!(core.policy().tasks.allows("static-task"));
+
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(command(&mock, "e7", "p2p", "om_failure", "/task grant echo").contains("保存失败"));
+    assert!(!core.policy().tasks.allows("echo"));
+    assert_eq!(handle.stop(), 0);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"version":1,"app_id":"cli_other","allowed_tasks":["echo"],"applied_message_ids":[]}"#,
+    )
+    .unwrap();
+    drop(mock);
+    let mock = MockFeishu::start();
+    let (handle, core) = FeishuHandle::start_with_policy(
+        TestChat::instant(),
+        configure(&mock),
+        Policy {
+            tasks: sekai_router::tools::TaskAccess::from_names(["static-task"]),
+            ..policy()
+        },
+    );
+    mock.wait_connected(1, Duration::from_secs(3));
+    assert!(!core.policy().tasks.allows("echo"));
+    assert!(core.policy().tasks.allows("static-task"));
+    assert!(command(&mock, "e8", "p2p", "om_disabled", "/task grant echo").contains("未启用"));
+    assert_eq!(handle.stop(), 0);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
 /// 每次消息处理结束（回复 HTTP 已完成）后让出一点时间，等运行线程把
 /// per-chat 在途标记移除，避免下一条消息被误判为「上一条还在处理中」。
 fn wait_chat_idle() {
     thread::sleep(Duration::from_millis(20));
+}
+
+/// Proves the entire WS -> allowlist -> Agent -> REST -> reply path works
+/// without any discovered Worker, using the same token client as IM replies.
+#[derive(Clone)]
+struct CalendarChat;
+impl ChatClient for CalendarChat {
+    fn chat(&mut self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        assert!(
+            request
+                .tools
+                .iter()
+                .any(|tool| tool.name == "feishu_event_create")
+        );
+        let tool_result = request
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Tool);
+        let calls = if let Some(message) = tool_result {
+            let json = Json::parse(message.content.as_ref().unwrap()).unwrap();
+            assert_eq!(json.get("ok").and_then(Json::as_bool), Some(true));
+            assert!(json.to_compact_string().contains("event-test"));
+            Vec::new()
+        } else {
+            vec![ToolCall {
+                id: String::from("calendar-call"),
+                name: String::from("feishu_event_create"),
+                arguments: String::from(
+                    r#"{"calendar_id":"cal-test","summary":"周会","start_time":{"timestamp":"1800000000","timezone":"Asia/Shanghai"},"end_time":{"timestamp":"1800003600","timezone":"Asia/Shanghai"},"idempotency_key":"sekai-ws-create-event-000000000001"}"#,
+                ),
+            }]
+        };
+        Ok(ChatResponse {
+            model: String::from("test"),
+            content: Some(String::from("已创建 event-test")),
+            reasoning_content: None,
+            tool_calls: calls,
+            finish_reason: None,
+            usage: Usage::default(),
+        })
+    }
+}
+
+#[test]
+fn creates_calendar_event_over_rest_without_online_worker() {
+    let mock = MockFeishu::start();
+    let mut options = feishu_options(&mock);
+    options.allow_users = vec![String::from("ou_1")];
+    let core = Arc::new(PromptCore::new(
+        CalendarChat,
+        Policy {
+            allow_write: true,
+            ..policy()
+        },
+        agent_config(),
+        TraceWriter::disabled(),
+    ));
+    let gateway: GatewayHandle = Arc::new(Mutex::new(Box::new(MockGateway {
+        workers: Arc::new(Mutex::new(Vec::new())),
+    })));
+    core.set_gateway(Some(gateway.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let handle = FeishuHandle {
+        stop,
+        thread: Some(thread::spawn(move || {
+            feishu::run(core, gateway, options, thread_stop)
+        })),
+    };
+    mock.wait_connected(1, Duration::from_secs(3));
+    mock.push_event(text_event(
+        "ev-calendar",
+        "p2p",
+        "oc_1",
+        "om-calendar",
+        "创建周会",
+    ));
+    mock.expect_sent("oc_1", ACK_TEXT, Duration::from_secs(3));
+    let record = mock.wait_record(
+        Duration::from_secs(3),
+        |record| {
+            sent(record)
+                .map(|(id, _)| id == "__calendar_api__")
+                .unwrap_or(false)
+        },
+        "创建日程的 HTTP 请求",
+    );
+    let body = Json::parse(sent(&record).unwrap().1).unwrap();
+    assert_eq!(body.get("summary").and_then(Json::as_str), Some("周会"));
+    mock.expect_replied("om-calendar", "已创建 event-test", Duration::from_secs(3));
+    assert_eq!(handle.stop(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1473,6 +1757,7 @@ fn real_feishu_connect_smoke() {
         domain,
         allow_users: Vec::new(),
         allow_chats: Vec::new(),
+        task_admin: None,
         ack: true,
         max_steps: None,
         context_turns: 8,

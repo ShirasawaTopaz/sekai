@@ -62,15 +62,19 @@ import path from 'node:path'
 import readline from 'node:readline'
 import net from 'node:net'
 import { createRequire } from 'node:module'
+import { registerStatus } from './status.js'
 import {
   RESTART_BACKOFF_INITIAL_MS,
   RingBuffer,
+  childExited,
   describeError,
   describeExitInfo,
   nextBackoffMs,
+  registerHotUpdate,
   renderJson,
-  resolveBin,
+  resolveBinTarget,
   resolveDshHome,
+  stopChild,
 } from './shared.js'
 
 const require = createRequire(import.meta.url)
@@ -507,6 +511,7 @@ const STATUS_OUTPUT_SCHEMA = Object.freeze({
   properties: {
     running: { type: 'boolean', description: 'Whether the worker process is currently alive.' },
     pid: { type: 'integer', description: 'Worker process id; omitted while not running.' },
+    binaryGeneration: { type: 'string', description: 'Managed binary generation of the active Worker; omitted for unmanaged binaries.' },
     restarts: { type: 'integer', description: 'Unexpected-exit restarts since plugin start (disposal not counted).' },
     uptimeMs: { type: 'integer', description: 'Current process uptime in milliseconds; 0 while not running.' },
     lastStderr: {
@@ -546,6 +551,14 @@ export class SekaiWorkerPlugin {
     this.ctx = ctx
     this.config = resolveWorkerConfig(config)
     this.child = null
+    this.binaryTarget = null
+    this.retiringChild = null
+    this.retiringPromise = null
+    this.stopPromise = null
+    this.hotUpdate = null
+    this.disposeLifecycle = null
+    this.runningIntent = false
+    this.manualRevision = 0
     this.startedAt = null
     this.restarts = 0
     this.backoffMs = RESTART_BACKOFF_INITIAL_MS
@@ -574,8 +587,36 @@ export class SekaiWorkerPlugin {
         plugin.log('info', 'sekai-worker plugin is disabled (enabled:false); nothing spawned')
         return
       }
+      if (plugin.stopped) return
+      const update = registerHotUpdate(ctx, {
+        key: 'worker',
+        component: 'sekai-worker',
+        snapshot: () => ({
+          workerId: plugin.config.workerId,
+          routerAddr: plugin.routerAddr,
+          wantsRunning: plugin.wantsRunning(),
+        }),
+        restart: (generation) => plugin.restartForUpdate(generation),
+      })
+      plugin.hotUpdate = update
+      const handoff = update?.handoff
+      const restore = handoff?.workerId === plugin.config.workerId
+      if (restore && splitHostPort(handoff.routerAddr)) plugin.routerAddr = handoff.routerAddr
       const stopTools = plugin.registerToolsWhenAvailable()
-      if (plugin.config.autoConnect) {
+      const stopStatus = registerStatus('worker', () => ({ running: !childExited(plugin.child) }))
+      plugin.disposeLifecycle = () => {
+        const previous = plugin.child ?? plugin.retiringChild
+        try {
+          update?.dispose({ isAlive: () => !childExited(previous) })
+        } finally {
+          stopStatus()
+          stopTools()
+        }
+      }
+      if (restore) {
+        plugin.manualStopped = !handoff.wantsRunning
+        if (handoff.wantsRunning) plugin.startWorker()
+      } else if (plugin.config.autoConnect) {
         const remembered = plugin.lastRouterAddr !== null
         plugin.log(
           'info',
@@ -590,10 +631,7 @@ export class SekaiWorkerPlugin {
             ` (call sekai_worker_connect to start; next target ${plugin.routerAddr})`,
         )
       }
-      yield () => {
-        plugin.stop()
-        stopTools()
-      }
+      yield () => plugin.stop()
     }, 'sekai-worker lifecycle')
   }
 
@@ -616,21 +654,36 @@ export class SekaiWorkerPlugin {
     return { command: bin, args }
   }
 
-  /**
-   * spawn worker 并接线；重复调用安全。
-   * @param {string} [routerAddr] 连接目标 HOST:PORT；省略 = this.routerAddr。
-   * @returns {boolean} 是否真的 spawn（已有子进程/已 dispose 时 false）。
-   */
-  startWorker(routerAddr = this.routerAddr) {
-    if (this.stopped || this.child) return false
+  wantsRunning() {
+    return !this.stopped && !this.manualStopped
+      && (this.child !== null || this.restartTimer !== null || this.runningIntent)
+  }
+
+  resolveBinary(generation = this.hotUpdate?.generation?.()) {
+    return resolveBinTarget(this.config.workerBin, 'SEKAI_WORKER_BIN', WORKER_DEFAULTS.workerBin, {
+      profileContext: this.ctx?.root?.get?.('profileContext') ?? this.ctx?.get?.('profileContext'),
+      generation,
+    })
+  }
+
+  /** Spawn the worker for the current connection intent when its predecessor is gone. */
+  startWorker(routerAddr = this.routerAddr, binary) {
+    if (this.stopped || !this.config.enabled || this.manualStopped || this.child || this.retiringPromise) return false
+    this.runningIntent = true
     const target = typeof routerAddr === 'string' && routerAddr.trim() !== '' ? routerAddr.trim() : this.routerAddr
     this.routerAddr = target
-    const bin = resolveBin(this.config.workerBin, 'SEKAI_WORKER_BIN', WORKER_DEFAULTS.workerBin)
+    if (!childExited(this.retiringChild) || this.hotUpdate?.canStart?.() === false) {
+      this.scheduleRestart()
+      return false
+    }
+    this.retiringChild = null
+    this.cancelRestart()
+    this.binaryTarget = binary ?? this.resolveBinary()
     const argv = ['connect', target, '--worker-id', this.config.workerId, '--llm', this.config.llm]
     if (this.config.llm === 'router') argv.push('--prompt-addr', this.config.promptAddr)
     if (this.config.gpio) argv.push('--gpio', this.config.gpio)
     if (this.config.dshTools.enabled) argv.push('--dsh-tools')
-    const spawnTarget = this.workerSpawnTarget(bin, argv)
+    const spawnTarget = this.workerSpawnTarget(this.binaryTarget.command, argv)
     let child
     try {
       // stdin 是 dsh 中转的 prompt 响应回投通道（其他通道闲置不用）。
@@ -648,20 +701,23 @@ export class SekaiWorkerPlugin {
     this.startedAt = Date.now()
     this.log('info', `sekai-worker spawn: ${spawnTarget.command} ${spawnTarget.args.join(' ')} (pid ${child.pid ?? '?'})`)
 
-    // 'error' 与 'exit' 可能都到达（kill 竞态）：闭包 flag 保证恰好一次。
+    // A child error with an assigned PID may mean a failed kill, not an exit.
     let gone = false
     const onGone = (info) => {
       if (gone) return
       gone = true
       this.handleChildExit(child, info)
     }
-    child.on('error', (error) => onGone({ spawnError: error }))
+    child.on('error', (error) => {
+      if (childExited(child)) onGone({ spawnError: error })
+      else if (this.child === child) this.log('warn', `sekai-worker child error: ${describeError(error)}`)
+    })
     child.on('exit', (code, signal) => onGone({ code, signal }))
 
     // stdin：best-effort 回投 prompt 响应；EPIPE 等错误只记日志。
     if (child.stdin) {
       child.stdin.on('error', (error) => {
-        if (!this.stopped) this.log('warn', `sekai-worker stdin write failed: ${describeError(error)}`)
+        if (!this.stopped && this.child === child) this.log('warn', `sekai-worker stdin write failed: ${describeError(error)}`)
       })
     }
 
@@ -669,6 +725,7 @@ export class SekaiWorkerPlugin {
     if (child.stderr) {
       const stderrLines = readline.createInterface({ input: child.stderr })
       stderrLines.on('line', (line) => {
+        if (this.child !== child) return
         this.lastStderr.push(line)
         this.log('info', `[worker] ${line}`)
         this.observeWorkerProgress(line)
@@ -677,14 +734,41 @@ export class SekaiWorkerPlugin {
     // stdout：llm==='dsh' 时识别 prompt 请求行并中转；其余行只记日志。
     if (child.stdout) {
       const stdoutLines = readline.createInterface({ input: child.stdout })
-      stdoutLines.on('line', (line) => this.handleWorkerStdoutLine(line))
+      stdoutLines.on('line', (line) => {
+        if (this.child === child) this.handleWorkerStdoutLine(line)
+      })
     }
 
-    if (child.exitCode !== null || child.killed) {
-      // 极端时序：进程在接线前已退出。
-      onGone({ code: child.exitCode, signal: null })
+    if (child.exitCode != null || child.signalCode != null) {
+      onGone({ code: child.exitCode, signal: child.signalCode })
     }
     return true
+  }
+
+  async restartForUpdate(generation) {
+    if (!this.config.enabled || !this.wantsRunning()) return
+    const current = this.binaryTarget
+    const candidate = this.resolveBinary(generation)
+    if (!candidate.generation || candidate.generation !== generation) return
+    if (current?.source === 'config' || current?.source === 'env') return
+    const sameBinary = current?.hash && candidate.hash
+      ? current.hash === candidate.hash
+      : current?.command === candidate.command && current?.generation === candidate.generation
+    if (sameBinary) return
+
+    // A manual connect or disconnect issued while the old child exits owns the next action.
+    const revision = this.manualRevision
+    this.cancelRestart()
+    this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+    this.runningIntent = true
+    this.log('info', `sekai-worker switching to managed binary generation ${generation}`)
+    const exited = await this.retireChild('worker updating; pending prompt aborted')
+    if (this.manualRevision !== revision || !this.wantsRunning()) return
+    if (!exited) {
+      this.scheduleRestart()
+      throw new Error('sekai-worker previous process exit was not confirmed; replacement was deferred')
+    }
+    this.startWorker(this.routerAddr, candidate)
   }
 
   /**
@@ -727,9 +811,9 @@ export class SekaiWorkerPlugin {
    * 手动连接（sekai_worker_connect）：启动/切换 worker 到指定 Router。
    * 省略地址时优先上次连接的 Router，其次 config 的 routerAddr。
    * @param {unknown} [requestedAddr]
-   * @returns {{started: boolean, running: boolean, routerAddr?: string, lastRouterAddr?: string, error?: object}}
+   * @returns {Promise<{started: boolean, running: boolean, routerAddr?: string, lastRouterAddr?: string, error?: object}>}
    */
-  connectWorker(requestedAddr) {
+  async connectWorker(requestedAddr) {
     const requested = typeof requestedAddr === 'string' ? requestedAddr.trim() : ''
     const target = requested !== '' ? requested : (this.lastRouterAddr ?? this.config.routerAddr)
     if (!splitHostPort(target)) {
@@ -748,14 +832,27 @@ export class SekaiWorkerPlugin {
       // 已在连接同一目标：保持现状（幂等）。
       return this.connectionValue({ started: false, running: true })
     }
-    if (this.child !== null) {
-      // 切换 Router：先断旧连接（抑制自动重启），再连新目标。
-      this.disconnectWorker()
-    }
+    const revision = ++this.manualRevision
+    this.cancelRestart()
     this.manualStopped = false
+    this.runningIntent = true
+    this.routerAddr = target
     this.backoffMs = RESTART_BACKOFF_INITIAL_MS
+    if (this.child || this.retiringChild || this.retiringPromise) {
+      const exited = await this.retireChild('worker changing router; pending prompt aborted')
+      if (this.stopped || revision !== this.manualRevision) {
+        return this.connectionValue({ running: this.child !== null })
+      }
+      if (!exited) {
+        this.scheduleRestart()
+        return { ...this.connectionValue({ running: false }), error: {
+          code: 'exit_unconfirmed',
+          message: 'Previous worker exit was not confirmed. The new connection will wait for it to exit.',
+        } }
+      }
+    }
     const started = this.startWorker(target)
-    this.log('info', `sekai-worker manual connect: ${started ? 'spawned' : 'already running'} → ${target}`)
+    this.log('info', `sekai-worker manual connect: ${started ? 'spawned' : 'waiting to start'} → ${target}`)
     return this.connectionValue({ started, running: this.child !== null })
   }
 
@@ -765,23 +862,16 @@ export class SekaiWorkerPlugin {
    * @returns {{disconnected: boolean, running: boolean, routerAddr?: string, lastRouterAddr?: string}}
    */
   disconnectWorker() {
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer)
-      this.restartTimer = null
-    }
+    const disconnected = this.child !== null
+    this.manualRevision += 1
+    this.cancelRestart()
     this.manualStopped = true
-    const child = this.child
-    if (child === null) return this.connectionValue({ disconnected: false, running: false })
-    // 先摘引用：exit 事件到达时 handleChildExit 视作迟到事件，不再计重启。
-    this.child = null
-    this.startedAt = null
-    this.clearPendingPrompts('aborted', 'worker disconnected manually; pending prompt aborted', { write: false })
-    this.clearPendingDshTools('cancelled', { write: false })
-    if (!child.killed) {
-      try { child.kill() } catch { /* 已退出 */ }
+    this.runningIntent = false
+    void this.retireChild('worker disconnected manually; pending prompt aborted')
+    if (disconnected) {
+      this.log('info', 'sekai-worker disconnected manually; auto-restart suppressed until reconnected')
     }
-    this.log('info', 'sekai-worker disconnected manually; auto-restart suppressed until reconnected')
-    return this.connectionValue({ disconnected: true, running: false })
+    return this.connectionValue({ disconnected, running: false })
   }
 
   /**
@@ -963,6 +1053,9 @@ export class SekaiWorkerPlugin {
    * @param {{id: number}} request
    */
   async listDshTools(request) {
+    const child = this.child
+    const revision = this.manualRevision
+    const current = () => !this.stopped && this.child === child && this.manualRevision === revision
     try {
       const registry = this.ctx?.get?.('tools')
       if (!registry || typeof registry.execute !== 'function') {
@@ -970,7 +1063,9 @@ export class SekaiWorkerPlugin {
         return
       }
       const agent = await this.ensureBridgeAgent()
+      if (!current()) return
       const definitions = typeof registry.definitions === 'function' ? await registry.definitions(agent) : []
+      if (!current()) return
       const tools = (Array.isArray(definitions) ? definitions : [])
         .filter((definition) => this.dshToolPolicy(definition?.name) === null)
         .map((definition) => ({
@@ -980,6 +1075,7 @@ export class SekaiWorkerPlugin {
       this.writeDshResponse({ id: request.id, ok: true, result: { tools, count: tools.length } })
       this.log('info', `[dsh-tools] #${request.id} listed ${tools.length} tool(s)`)
     } catch (error) {
+      if (!current()) return
       const code = error?.code === 'no_agent' ? 'no_agent' : 'bridge_error'
       this.writeDshFailure(request.id, code, describeError(error))
       this.log('warn', `[dsh-tools] #${request.id} list failed: ${code}`)
@@ -1428,35 +1524,66 @@ export class SekaiWorkerPlugin {
   }
 
   scheduleRestart() {
-    if (this.stopped || this.restartTimer) return
+    if (this.stopped || this.manualStopped || this.restartTimer) return
     const delay = this.backoffMs
     this.backoffMs = nextBackoffMs(this.backoffMs, this.config.restartBackoffMaxMs)
     this.log('info', `sekai-worker restart scheduled in ${delay}ms`)
     const timer = setTimeout(() => {
+      if (this.restartTimer !== timer) return
       this.restartTimer = null
-      if (!this.stopped) this.startWorker()
+      this.startWorker()
     }, delay)
     timer.unref?.()
     this.restartTimer = timer
   }
 
-  /** 停止：清定时器 + 清挂起 prompt（回 aborted）+ kill。幂等。 */
-  stop() {
-    if (this.stopped) return
-    this.stopped = true
-    if (this.restartTimer) {
-      clearTimeout(this.restartTimer)
-      this.restartTimer = null
-    }
-    this.clearPendingPrompts('aborted', 'plugin disposed; pending prompt aborted')
-    this.clearPendingDshTools('cancelled')
-    const child = this.child
+  cancelRestart() {
+    clearTimeout(this.restartTimer)
+    this.restartTimer = null
+  }
+
+  retireChild(message, { write = false } = {}) {
+    if (this.retiringPromise) return this.retiringPromise
+    this.clearPendingPrompts('aborted', message, { write })
+    this.clearPendingDshTools('cancelled', { write })
+    const child = this.child ?? this.retiringChild
     this.child = null
     this.startedAt = null
-    if (child && !child.killed) {
-      try { child.kill() } catch { /* 已退出 */ }
+    if (childExited(child)) {
+      this.retiringChild = null
+      return Promise.resolve(true)
     }
+
+    this.retiringChild = child
+    this.retiringPromise = (async () => {
+      try {
+        if (await stopChild(child)) {
+          this.retiringChild = null
+          return true
+        }
+      } catch (error) {
+        this.log('warn', `sekai-worker stop failed: ${describeError(error)}`)
+      }
+      this.log('warn', `sekai-worker process ${child.pid ?? '?'} exit was not confirmed`)
+      return false
+    })().finally(() => { this.retiringPromise = null })
+    return this.retiringPromise
+  }
+
+  /** Clear synchronous state and join the child shutdown. */
+  stop() {
+    if (this.stopped) return this.stopPromise
+    const disposeLifecycle = this.disposeLifecycle
+    this.disposeLifecycle = null
+    try { disposeLifecycle?.() } catch (error) {
+      this.log('warn', `sekai-worker lifecycle cleanup failed: ${describeError(error)}`)
+    }
+    this.stopped = true
+    this.cancelRestart()
+    this.runningIntent = false
+    this.stopPromise = this.retireChild('plugin disposed; pending prompt aborted', { write: true })
     this.disposeBridgeAgent()
+    return this.stopPromise
   }
 
   /** 状态工具的值。 */
@@ -1478,6 +1605,7 @@ export class SekaiWorkerPlugin {
     }
     const pid = this.child?.pid
     if (typeof pid === 'number') value.pid = pid
+    if (this.child && this.binaryTarget?.generation) value.binaryGeneration = this.binaryTarget.generation
     return value
   }
 
@@ -1508,14 +1636,27 @@ export class SekaiWorkerPlugin {
    * 这里用 `ctx.inject(['tools'])` 在服务出现后注册——宿主没有工具注册表时
    * 回调不会运行，插件的 spawn/prompt 中转照常工作；没有 `inject` 的宿主
    * （冒烟用的假 ctx）退回一次性注册。
-   * @returns {() => void} 清理函数；inject 路径随 fiber 卸载自动注销。
+   * @returns {() => void} Unregister synchronously when the lifecycle is disposed.
    */
   registerToolsWhenAvailable() {
-    if (typeof this.ctx?.inject === 'function') {
-      this.ctx.inject(['tools'], () => this.registerTools())
-      return () => {}
+    if (typeof this.ctx?.inject !== 'function') return this.registerTools()
+
+    let active = true
+    let stopTools = null
+    this.ctx.inject(['tools'], () => {
+      if (!active) return
+      const unregister = this.registerTools()
+      stopTools = unregister
+      return () => {
+        unregister()
+        if (stopTools === unregister) stopTools = null
+      }
+    })
+    return () => {
+      active = false
+      stopTools?.()
+      stopTools = null
     }
-    return this.registerTools()
   }
 
   /** 状态工具注册（防御式：registry 缺失只 warn）。 */

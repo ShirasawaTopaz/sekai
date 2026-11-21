@@ -46,7 +46,7 @@ You ─────────────▶ sekai-router ──────�
   two Tasks, `dsh.tools` and `dsh.call`, which call local DSH tools over JSONL next
   to the prompt channel (executed by the DSH worker plugin); the plugin's
   `dshTools` config is off by default, defaults to a read-only allowlist, and the
-  Router still gates both Tasks behind `--allow-tasks`. V1 frames unchanged.
+  Router authorizes both Tasks individually with `--allow-task NAME`.
 - **Built-in HTTPS**: the Router talks to the DeepSeek API with `native-tls`
   (Windows schannel / system OpenSSL) by default — no node or curl needed
   (`SEKAI_HTTPS_MODE=helper` falls back to the old helper).
@@ -95,11 +95,11 @@ install the bundle → self-check):
 node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-Restart the DSH session afterwards and the `sekai_*` tools appear (7 in total: 4 from the
-router plugin and 3 from the worker plugin); the plugin targets **DSH 0.2.2-rc.3**
-(`engines.dsh = ">=0.2.2-rc.3 <0.3.0"`, tool registration waits for the `tools` service).
-See [docs/sekai-dsh-plugin.md](docs/sekai-dsh-plugin.md) §1 for `--dry-run`/`--uninstall`,
-profile auto-selection and the binary resolution order.
+Run the same command to update Sekai. With DSH hot reload enabled, the host loads
+updated plugin code and restarts the managed Router and any running Worker when their
+versions change. When migrating from an older release, load the new plugin once to
+activate automatic updates. The plugin targets **DSH 0.2.2-rc.3**. See the
+[Sekai × DSH guide](docs/sekai-dsh-plugin.md#1-安装与配置) for options and verification.
 
 ### Run the loop in two terminals
 
@@ -119,12 +119,11 @@ sekai> show me this machine's system info   # → pc.info (read-only, allowed by
 sekai> list the files in the current dir    # → pc.ls (read-only, allowed by default)
 ```
 
-Going further (unlock as needed via `--allow-write`/`--allow-tasks` startup flags
-or REPL `/policy`):
+Use `/policy tasks only pc.ask` in the REPL or start the Router with `--allow-task pc.ask` to authorize that Task. Use `--allow-write` or `/policy allow-write on` to authorize writes.
 
 ```bash
 sekai> run cargo --version          # → pc.exec (needs allow-write; shell execution)
-sekai> ask the LLM: what is Rust's Deref?   # → pc.ask (needs allow-tasks; answered
+sekai> ask the LLM: what is Rust's Deref?   # → pc.ask (requires pc.ask authorization; answered
                                     #   via the Router prompt ingress, recursion-guarded)
 ```
 
@@ -145,7 +144,7 @@ cross-goal context is retained).
 | Spawn subprocess | `sekai-router --link stdio` (or `/link stdio` in REPL) | Router spawns `sekai-worker`; stdin/stdout are the link — single-process demo |
 | Full-screen TUI | `sekai-router --tui` | ratatui UI: status bar + scrolling output + input line; falls back to line REPL when not a TTY |
 | Headless service | `sekai-router --serve` | JSONL over stdio (link operations need no LLM/API key; the `prompt` method invokes the built-in LLM loop) for the [DSH plugin](plugins/sekai-dsh) |
-| Feishu chat entry | `sekai-router --feishu` | Receives IM events over a WebSocket long connection and replies via REST; injects per-chat session metadata and the last N turns (in-memory, `SEKAI_FEISHU_CONTEXT_TURNS`, default 8). Needs `SEKAI_FEISHU_APP_ID`/`_APP_SECRET`; link defaults to tcp; see [docs/sekai-feishu.md](docs/sekai-feishu.md) and the [setup skill](skills/feishu-setup/SKILL.md) |
+| Feishu chat entry | `sekai-router --feishu` | WebSocket IM, REST replies and the last N turns (`SEKAI_FEISHU_CONTEXT_TURNS`, default 8). Includes calendar discovery and event create/read/update/delete; writes require `--allow-write`, no online Worker required. Needs `SEKAI_FEISHU_APP_ID`/`_APP_SECRET` and a message allowlist; calendars use the app identity. See [calendar API setup](docs/sekai-feishu.md#43-日历与日程工具) and the [setup skill](skills/feishu-setup/SKILL.md) |
 | MQTT link | `SEKAI_MQTT_ADDR=127.0.0.1:1883 sekai-router --goal "…"` | Embedded-style link (default `--link mqtt`); needs an MQTT 5 broker |
 | Link check only | `sekai-router --dry-run` | Connect and list Workers without calling the LLM |
 
@@ -177,21 +176,23 @@ Full list in `sekai-router --help`.
 
 ## Security model
 
-- **Read-only by default**: `pc.exec` / `pc.write` and GPIO writes
-  (`gpio.config`/`gpio.write`), Task dispatch (`pc.job` / `pc.ask` / `echo` /
-  `sleep`), and admin/other tools require `--allow-write` / `--allow-tasks` /
-  `--allow-admin` (or REPL `/policy`, or serve-side `policy.set`) to unlock;
-  `pc.read` / `pc.ls` / `pc.info` are read-only whitelisted and allowed by
-  default.
+- **Read-only by default.** Enable writes with `--allow-write` and admin tools with `--allow-admin`.
+  Repeat `--allow-task NAME` to authorize individual Tasks. The existing `--allow-tasks` flag
+  authorizes all Tasks and is mutually exclusive with `--allow-task`. The REPL, serve API,
+  and DSH plugin also support exact Task lists.
+- **Feishu administration.** A configured administrator can send `/task grant echo`,
+  `/task revoke echo`, or `/task list` in a direct message to the bot. Grants persist across
+  restarts and apply to the same Router instance, including its TCP prompt ingress when enabled.
+  See [Feishu permission management](docs/sekai-feishu.md#62-策略与防递归).
 - **Denied means not published**: policy is checked before the Router frames and
   publishes a Stdin; rejected commands never reach the Worker. `pc.exec` /
   `pc.job` run arbitrary shell commands on the Worker host — the largest
   permission surface; unlock only in controlled environments.
-- **Prompt recursion guard**: any LLM run arriving via the prompt ingress or the
-  serve `prompt` method refuses to dispatch `pc.ask` again
+- **Prompt recursion guard**. Any LLM run arriving via the prompt ingress,
+  Feishu, or the serve `prompt` method refuses to dispatch `pc.ask` again
   (`policy_denied`, "nested prompt (pc.ask)"), regardless of switches.
 - **DSH tool bridge**: the Worker's `dsh.tools` / `dsh.call` are ordinary Tasks gated
-  by `--allow-tasks`; the plugin-side `dshTools` config is off by default, defaults to
+  by the Router Task policy. The plugin-side `dshTools` config is off by default. When enabled, it defaults to
   a read-only allowlist (`read`/`glob`/`grep`), and always rejects `run_code` and
   `sekai_worker_*`; both layers must pass.
 - **`--worker <ID>`** (or `policy.worker_filter`): locks operations to a single

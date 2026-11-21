@@ -32,3 +32,5 @@ native-tls = { version = "0.2", optional = true }
 
 [dev-dependencies]
 sekai-gpio = { path = "../sekai-gpio" }
+sekai-stm32 = { path = "../sekai-stm32" }
+sekai-worker = { path = "../sekai-worker", features = ["uart-bridge"] }

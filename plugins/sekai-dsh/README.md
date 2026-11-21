@@ -39,15 +39,15 @@ DSH Host
 node scripts/install-dsh-plugin.mjs [--profile <name>]
 ```
 
-脚本做四件事：`cargo build --release -p sekai-router -p sekai-worker`（`--no-build`
-跳过；`--bin-dir <dir>` 用已有构建）→ 把两个二进制原子部署到 `<DSH_HOME>/sekai/bin/`
-（`DSH_HOME` 未设置 = `~/.dsh`）→ `dsh plugin --profile <p> add
-file:<repo>/plugins/sekai-dsh`（DSH 自动把包名写进 profile 的 `dsh.profile.bundles`）→
-自检（部署文件 / 依赖与 bundles / 从 profile import 并 `resolveBin` 闭环 /
-`--dump-config` 两行）。
+脚本构建 Router 和 Worker，将二进制部署到 `<DSH_HOME>/sekai/bin/profiles/<profile>/generations/`，
+安装并校验 bundle，随后原子发布新版本。`--no-build` 可跳过构建，`--bin-dir <dir>` 可指定已有产物。
 
-**重启 DSH 会话**后出现 `sekai_*` 工具（运行中的会话不会热加载 bundle）；升级 =
-`git pull` 后重跑同一条命令。其他选项：`--dry-run` 只看计划、`--uninstall` 卸载
+升级时重跑同一条命令。启用 HMR 的 DSH 自动加载新版插件，并有序切换托管子进程。
+正在运行的 Worker 会重连，已手动断开的 Worker 保持停止。切换期间会短暂断连。
+首次从旧版本迁移时，需要让 DSH 加载新版插件一次。使用 `sekai_status` 和 `sekai_worker_status`
+可查看 PID 与托管二进制的 `binaryGeneration`。
+
+`--dry-run` 只看计划、`--uninstall` 卸载
 （保留二进制与 worker 状态文件）、`--strict` 让 `--dump-config` 校验失败也算失败；
 profile 自动选择 `--profile` > `$DSH_PROFILE` > 唯一 profile > `desktop` > 报错列出，
 `--help` 查看全部。完整说明见 [docs/sekai-dsh-plugin.md §1](../../docs/sekai-dsh-plugin.md)。
@@ -109,23 +109,18 @@ bundle 自带的 `cordis.patch.yml` 会插入两行组件（默认 config），�
 
 ### 二进制解析顺序（零配置）
 
-两个插件一致（`lib/shared.js::resolveBin`）：**config `routerBin`/`workerBin` >
-`SEKAI_ROUTER_BIN`/`SEKAI_WORKER_BIN` > `$DSH_HOME/sekai/bin/<name>(.exe)` >
-`<repo>/target/release/<name>(.exe)` > PATH**。
+两个插件一致。优先使用显式 config `routerBin` / `workerBin`，其次是环境变量
+`SEKAI_ROUTER_BIN` / `SEKAI_WORKER_BIN`，然后是当前 profile 发布的托管二进制。
+剩余回退顺序为 `$DSH_HOME/sekai/bin/<name>(.exe)`、`<repo>/target/release/<name>(.exe)`、PATH。
 
-- router：`routerBin` config 键 > `SEKAI_ROUTER_BIN` > `$DSH_HOME/sekai/bin/sekai-router(.exe)`
-  > `<repo>/target/release/sekai-router(.exe)` > PATH 上的 `sekai-router`
-- worker：同理 `workerBin` > `SEKAI_WORKER_BIN` > `$DSH_HOME/sekai/bin/sekai-worker(.exe)`
-  > `<repo>/target/release/sekai-worker(.exe)` > PATH 上的 `sekai-worker`
-
-第 3 项由一键安装脚本负责部署，所以安装后默认零配置。config 值与默认二进制同名时视为
+一键安装脚本部署托管二进制，无需配置路径。config 值与默认二进制同名时视为
 「未显式配置」（此时环境变量优先）；需要覆盖时可在 profile 行级 config 写
 `routerBin` / `workerBin`。
 
 ### 备选：不用安装脚本
 
 `dsh plugin --profile <p> add <仓库目录>` 是 `link:` 安装，`cargo build` 后插件自动命中
-`<repo>/target/release`（解析顺序第 4 项），通常仍零配置；只有 `file:` 拷贝安装或二进制
+`<repo>/target/release`，通常仍零配置；只有手动 `file:` 拷贝安装或二进制
 不在仓库内时，才需要手动放二进制/设路径：
 
 ```bash
@@ -147,13 +142,27 @@ cargo build --release -p sekai-router -p sekai-worker
 | `link` | `'tcp'\|'stdio'\|'mqtt'` | `'tcp'` | 链路模式，同时作为 `--link` 旗标与 `link` 请求参数 |
 | `listenAddr` | string | `'127.0.0.1:7421'` | tcp 模式作 `listen_addr`、mqtt 模式作 `mqtt_addr` 传给 `link` |
 | `routerBin` | string | `'sekai-router'` | serve 二进制（解析顺序见上） |
-| `extraArgs` | string[] | `[]` | 追加在 `--serve --link <mode>` 之后的额外 CLI 参数 |
-| `autoLink` | boolean | `true` | ready 后自动发 `link` 请求与 `policy.set`（每次重启重放） |
+| `extraArgs` | string[] | `[]` | 追加额外 CLI 参数；非空 `policy.allowedTasks` 不能与这里的 `--allow-task` / `--allow-tasks` 同用 |
+| `autoLink` | boolean | `true` | ready 后自动发 `link` 请求与 `policy.set`（每次重启重放）；精确 Task 名单不受此开关影响，始终通过 CLI 传入 |
 | `policy.allowWrite` | boolean | `false` | GPIO 写（`gpio.write` / `gpio.config`） |
-| `policy.allowTasks` | boolean | `false` | Task 下发 |
+| `policy.allowTasks` | boolean | `false` | `true` 允许所有 Task，与非空 `policy.allowedTasks` 互斥 |
+| `policy.allowedTasks` | string[] | `[]` | 只启用名单中的精确 Task 名称。去掉首尾空白后只接受 `[a-z0-9._-]{1,48}`；拒绝空项、通配符等无效名称；去重后最多 64 项 |
 | `policy.allowAdmin` | boolean | `false` | 管理/其他用户工具 |
 | `policy.workerFilter` | string | 空 | 只允许操作该 worker id；空 = 不限制 |
 | `requestTimeoutMs` | integer ≥1000 | `120000` | 单个 JSONL 请求的本地超时 |
+
+要只允许 `blink`，在 `sekai-router` 行的 `config` 中写入：
+
+```yaml
+policy:
+  allowedTasks: [blink]
+```
+
+插件在每次启动 Router 时为名单中的每个名称传入 `--allow-task NAME`。开启 `autoLink`
+时还会通过 `policy.set` 重放名单。插件在 Router 确认名单之前会拒绝 Worker 请求，返回
+`policy_unverified`。非空名单要求 Router 支持 `--allow-task` 和 JSONL `allowed_tasks`。
+名单为空时，插件仍使用原有的 `allow_tasks` 布尔字段，旧版 Router 可继续运行。
+`sekai_status.policy` 优先显示 Router 的实际策略，包括 `allowedTasks`。
 
 > **agent 步数**：默认 `link:'tcp'` 即直连 **PC Worker**，Router 的 agent 默认**不设
 > 步数上限**（只由完成 / 取消 / LLM 错误终止）；`link:'mqtt'`（嵌入式）仍为 12。
@@ -260,7 +269,7 @@ worker stdin ◀── dsh_tool：{"id":N,"ok":true,"result":{"text":...,"value"
   日志只记 id/工具名/错误码，不记参数与结果正文。
 - **状态**：`sekai_worker_status` 追加 `dshTools: {enabled, allow, inFlight}`（在途请求数）。
 - **与 Router 的关系**：桥不经过 Router；Router 只看到 `dsh.tools`/`dsh.call` 两个普通
-  Task，仍由 `policy.allowTasks`（`--allow-tasks`）门控。两层都通过才执行。
+  Task，由 `policy.allowedTasks`（`--allow-task NAME`）或 `policy.allowTasks`（`--allow-tasks`）授权。两层都通过才执行。
 - **Router 版本**：远端 Router 需升级到包含 `dsh.*` 提示的版本（`prompt.rs` 会在 Worker
   通告时追加 args 用法）；旧 Router 仍能路由这两个 Task，但模型不知道 args 形状。
 
@@ -334,9 +343,11 @@ router 插件与 `sekai-router --serve` 之间的协议（与 Rust 侧任务冻�
   `{"event":"worker_online","worker_id":"..","worker":{...}}`、`{"event":"worker_offline","worker_id":".."}`
 - 方法：`link{mode,listen_addr?,worker_bin?,worker_args?,mqtt_addr?}`、`link_off`、`workers`、
   `tool_call{worker_id,tool,args,ddl_ms?}`、`task{worker_id,task,args,ddl_ms?}`、`policy.get`、
-  `policy.set{allow_write?,allow_tasks?,allow_admin?,worker_filter?}`、`status`、`shutdown`、
+  `policy.set{allow_write?,allow_tasks?,allowed_tasks?,allow_admin?,worker_filter?}`、`status`、`shutdown`、
   `prompt{text,max_steps?}`（**v1.1 追加，additive**：把 prompt 交给 Router 内置 LLM 回路，
   响应 `result:{answer,status,steps,usage}`，需 API key）
+- 支持精确授权的 Router 在 `policy.get` / `policy.set` 的结果中返回 `allowed_tasks`。
+  `allow_tasks: false` 配合非空 `allowed_tasks` 表示只授权名单；`allow_tasks: true` 配合非空名单会报错。
 - 客户端对无法匹配 id、也无 event 的行丢弃并 `logger.warn`；人类日志走 stderr。
 - `link` 响应的实际地址在 `result.addr`（插件优先读取，兼容旧版 `listen_addr`/`mqtt_addr`
   字段）；`link_state` 只在 `link`/`link_off` 时由 serve 主动发。
@@ -389,8 +400,8 @@ JSON 行与非 JSON 行一样只记宿主日志。
   无记录回退 `routerAddr`）；stderr 逐行进 40 行环形缓冲并写宿主日志，同时观察
   `TCP 已连接` / `切换到新端点` 行更新「上次连接的 Router」状态文件；意外退出按 500ms 起步
   指数退避重启（封顶 `restartBackoffMaxMs`），稳定运行 ≥5s 后的退出把退避复位；手动
-  `disconnect` 后的退出不再重启（直到再次 `connect`）；dispose 直接 kill（connect 模式无
-  优雅协议），挂起的 prompt 中转请求回 `aborted` 并销毁连接。
+  `disconnect` 后保持停止，直到再次 `connect`。退出时清理挂起的 prompt 请求及连接，确认旧进程
+  退出后才允许启动替代进程。
 
 ## 本地冒烟（无 Rust）
 
@@ -476,17 +487,20 @@ per `workerId` in `$DSH_HOME/sekai/worker-state.json` (from the worker's stderr 
 suppresses backoff restarts until the next connect; the state file path is overridable
 via `stateFile`). It exposes `sekai_worker_status` (including the `llm` channel,
 `autoConnect`, current `routerAddr` and the remembered `lastRouterAddr`). Install
-everything from the repo root with `node scripts/install-dsh-plugin.mjs` — it builds both
-binaries, atomically deploys them
-to `$DSH_HOME/sekai/bin`, installs the bundle via
-`dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`, and self-checks the result
-(including that `resolveBin` resolves the deployed paths). Restart the DSH session
-afterwards (`--dry-run` / `--uninstall` / profile auto-selection are documented in
-[docs/sekai-dsh-plugin.md §1](../../docs/sekai-dsh-plugin.md)). Binaries resolve as
-explicit `routerBin`/`workerBin` config > `SEKAI_ROUTER_BIN` / `SEKAI_WORKER_BIN` >
-`$DSH_HOME/sekai/bin` > `<repo>/target/release` > PATH, so a default install needs no
-PATH, env-var or profile edits. No build step, no runtime npm
+everything from the repo root with `node scripts/install-dsh-plugin.mjs`. The script
+installs and verifies the bundle, then publishes both binaries in a per-profile generation.
+Run the same command for updates. With HMR enabled, the loaded plugin applies updates
+while the host stays running. When migrating from an older version, load the new plugin
+once to enable automatic updates. See the [install guide](../../docs/sekai-dsh-plugin.md)
+for options. Explicit binary config and environment variables take precedence over managed
+binaries, followed by the legacy global bin directory, repo build directory, and PATH.
+The JavaScript bundle has no build step or runtime npm
 deps; schemastery is an optional peer. All tool failures return a structured
 `{error:{code,message,hint}}` envelope (`spawn_error` / `not_ready` / `timeout` /
-`aborted` or the router-side protocol code) and never throw at DSH. Run
-`node scripts/smoke.mjs` for the Rust-free smoke suite.
+`aborted` or the router-side protocol code) and never throw at DSH.
+
+Set `policy.allowedTasks` to authorize selected Task names. Names are exact and
+case-sensitive. A nonempty list requires a Router with `--allow-task` support and
+conflicts with `policy.allowTasks: true`, which authorizes all Tasks. The plugin passes
+the exact list at process startup even with `autoLink: false`. With an empty list,
+older Router binaries remain compatible. Run `node scripts/smoke.mjs` for the Rust-free smoke suite.

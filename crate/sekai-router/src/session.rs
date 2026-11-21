@@ -16,7 +16,8 @@
 //! /workers                           列出已发现 Worker
 //! /wait [MS]                         阻塞等待 Worker 上线
 //! /cancel [id|last]                  取消当前后台目标（或指定 cmd_id 的在途命令）
-//! /policy [NAME on|off]              查看/切换 allow-write|allow-tasks|allow-admin
+//! /policy [NAME on|off]              查看/切换 allow-write|allow-admin
+//! /policy tasks [only NAME...|on|off] 查看/切换 Task 授权（精确名单/全开/全关）
 //! /exit / /quit                      退出会话
 //! <非 / 开头输入>                     自然语言目标 → Agent 回路
 //! ```
@@ -40,7 +41,7 @@ use crate::link_builder::{self, LinkOptions};
 use crate::llm::ChatClient;
 use crate::prompt::worker_summary;
 use crate::prompt_server::PromptCore;
-use crate::tools::Policy;
+use crate::tools::{Policy, normalize_task_names};
 use crate::topic::TopicRoot;
 use crate::trace::TraceWriter;
 
@@ -356,7 +357,9 @@ impl<C: ChatClient + Clone> Session<C> {
   /workers                     列出已发现的 Worker
   /wait [MS]                   等待 Worker 上线（默认 {wait}ms）
   /cancel [id|last]            取消当前后台目标；带 cmd_id 时取消该在途命令
-  /policy [NAME on|off]        查看/切换权限（allow-write/allow-tasks/allow-admin）
+  /policy [NAME on|off]        查看/切换权限（allow-write/allow-admin）
+  /policy tasks [only NAME...|on|off]
+                               Task 授权：精确名单 / 全开 / 全部拒绝
   /exit                        退出会话
 其它任何输入都会作为自然语言目标交给 Agent 执行（后台线程，可 /cancel 取消）。"
             .replace("{listen}", &self.config.listen_addr)
@@ -691,22 +694,24 @@ impl<C: ChatClient + Clone> Session<C> {
     fn policy_command(&mut self, tokens: &[&str]) -> Vec<SessionMessage> {
         if tokens.is_empty() {
             let text = format!(
-                "策略：allow_write={} allow_tasks={} allow_admin={} worker={:?}",
+                "策略：allow_write={} task={} allow_admin={} worker={:?}",
                 self.policy.allow_write,
-                self.policy.allow_tasks,
+                self.policy.tasks.describe(),
                 self.policy.allow_admin,
                 self.policy.worker_filter.clone().unwrap_or_default()
             );
             return vec![SessionMessage::Line(text)];
         }
         let name = tokens[0];
+        if matches!(name, "tasks" | "task" | "allow-tasks" | "allow_tasks") {
+            return self.policy_tasks_command(&tokens[1..]);
+        }
         let field = match name {
             "allow-write" | "allow_write" => &mut self.policy.allow_write,
-            "allow-tasks" | "allow_tasks" => &mut self.policy.allow_tasks,
             "allow-admin" | "allow_admin" => &mut self.policy.allow_admin,
             other => {
                 return vec![SessionMessage::Line(format!(
-                    "未知策略 {other}（可选 allow-write/allow-tasks/allow-admin）"
+                    "未知策略 {other}（可选 allow-write/allow-admin/tasks）"
                 ))];
             }
         };
@@ -721,6 +726,38 @@ impl<C: ChatClient + Clone> Session<C> {
         }
         self.sync_hub();
         vec![SessionMessage::Line(format!("{name} 已更新"))]
+    }
+
+    /// `/policy tasks ...`：Task 授权（精确名单整体替换；互斥三态）。
+    fn policy_tasks_command(&mut self, rest: &[&str]) -> Vec<SessionMessage> {
+        let message = match rest {
+            [] => format!(
+                "Task 授权：{}（/policy tasks only NAME... 精确授权；/policy tasks on 全开；/policy tasks off 全部拒绝）",
+                self.policy.tasks.describe()
+            ),
+            ["on"] | ["true"] => {
+                self.policy.set_allow_tasks(true);
+                String::from("Task 授权已全开（allow_tasks=true）")
+            }
+            ["off"] | ["false"] => {
+                self.policy.set_allow_tasks(false);
+                String::from("Task 授权已全部拒绝")
+            }
+            ["only", names @ ..] if !names.is_empty() => {
+                match normalize_task_names(names.iter().copied()) {
+                    Ok(names) => {
+                        self.policy.set_allowed_tasks(names);
+                        format!("Task 授权已更新：{}", self.policy.tasks.describe())
+                    }
+                    Err(message) => format!("Task 名称非法：{message}"),
+                }
+            }
+            _ => String::from(
+                "用法：/policy tasks [only NAME...|on|off]（名称限 [a-z0-9._-]{1,48}）",
+            ),
+        };
+        self.sync_hub();
+        vec![SessionMessage::Line(message)]
     }
 
     // ---- 建连向导（/start）----

@@ -228,8 +228,18 @@ fn policy_show_and_toggle() {
     session.execute("/policy allow-tasks on");
     let out = lines(&session.execute("/policy"));
     assert!(out[0].contains("allow_write=true"));
-    assert!(out[0].contains("allow_tasks=true"));
+    assert!(out[0].contains("task=允许（全开）"), "out={out:?}");
     assert!(session.policy().allow_write);
+
+    // /policy tasks only ...：精确名单整体替换；非法名不改变现状。
+    let out = lines(&session.execute("/policy tasks only echo pc.ask"));
+    assert!(out[0].contains("只允许 echo、pc.ask"), "out={out:?}");
+    assert!(!session.policy().allow_tasks());
+    let out = lines(&session.execute("/policy tasks only *"));
+    assert!(out[0].contains("非法"), "out={out:?}");
+    assert!(session.policy().tasks.allows("echo"));
+    session.execute("/policy tasks off");
+    assert!(!session.policy().tasks.allows("echo"));
 
     let out = lines(&session.execute("/policy nope on"));
     assert!(out[0].contains("未知策略"));

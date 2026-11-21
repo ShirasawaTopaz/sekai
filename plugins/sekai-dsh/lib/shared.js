@@ -16,7 +16,7 @@
  * @module @sekai/dsh-plugin/shared
  */
 import { spawn } from 'node:child_process'
-import { existsSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, watchFile, unwatchFile } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -158,8 +158,37 @@ export function repoLocalBin(defaultBin, options = {}) {
   )
 }
 
+const GENERATION_PATTERN = /^[a-f0-9]{64}$/
+
+/** Per-profile deployment root; never treat an arbitrary marker value as a path. */
+function managedBinDir(options = {}) {
+  const env = options.env ?? process.env
+  const profile = options.profileContext?.name ?? env.DSH_PROFILE
+  if (typeof profile !== 'string' || !profile || /[\\/:\u0000-\u001f]/.test(profile) || profile === '.' || profile === '..') return null
+  const home = options.profileContext?.home ?? resolveDshHome(env, options.home)
+  return path.resolve(home, 'sekai', 'bin', 'profiles', profile)
+}
+
+function readJson(file) {
+  try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return null }
+}
+
+function isGeneration(value) {
+  return typeof value === 'string' && value.length === 64 && GENERATION_PATTERN.test(value)
+}
+
+function readGeneration(file) {
+  const marker = readJson(file)
+  return marker?.version === 1 && isGeneration(marker.generation) ? marker.generation : null
+}
+
+function generationManifest(dir, generation) {
+  const manifest = readJson(path.join(dir, 'generations', generation, 'manifest.json'))
+  return manifest?.version === 1 ? manifest : null
+}
+
 /**
- * 二进制解析：显式 config（非空且 ≠ 默认名）> 环境变量 >
+ * 二进制解析：显式 config（非空且 ≠ 默认名）> 环境变量 > 当前 profile 的发布代 >
  * `$DSH_HOME/sekai/bin/<bin><.exe>`（存在则用）> `<仓库根>/target/release/
  * <bin><.exe>`（存在则用）> 默认名（PATH 查找）。
  *
@@ -175,21 +204,200 @@ export function repoLocalBin(defaultBin, options = {}) {
  * @returns {string} 实际使用的命令（绝对路径或 PATH 上的名字）。
  */
 export function resolveBin(configured, envKey, defaultBin, options = {}) {
+  return resolveBinTarget(configured, envKey, defaultBin, options).command
+}
+
+export function resolveBinTarget(configured, envKey, defaultBin, options = {}) {
   if (typeof configured === 'string' && configured.trim() !== '' && configured !== defaultBin) {
-    return configured
+    return { command: configured, source: 'config' }
   }
   const env = options.env ?? process.env
-  const fromEnv = env?.[envKey]
-  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return fromEnv
+  const fromEnv = env[envKey]
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return { command: fromEnv, source: 'env' }
 
   const platform = options.platform ?? process.platform
-  const home = options.home ?? os.homedir()
   const exists = options.exists ?? existsSync
-  const discovered = path.join(dshBinDir({ env, home }), binFileName(defaultBin, platform))
-  if (exists(discovered)) return discovered
+  const filename = binFileName(defaultBin, platform)
+  const dir = managedBinDir(options)
+  if (dir) {
+    const generation = options.generation === undefined ? readGeneration(path.join(dir, 'current.json')) : options.generation
+    if (isGeneration(generation)) {
+      const command = path.join(dir, 'generations', generation, filename)
+      const manifest = generationManifest(dir, generation)
+      const hash = manifest?.binaries?.[defaultBin]
+      if (isGeneration(manifest?.bundle) && isGeneration(hash) && exists(command)) {
+        return { command, generation, source: 'managed', hash }
+      }
+    }
+  }
+  const legacyDir = options.profileContext?.home
+    ? path.join(options.profileContext.home, 'sekai', 'bin')
+    : dshBinDir(options)
+  const discovered = path.join(legacyDir, filename)
+  if (exists(discovered)) return { command: discovered, source: 'legacy' }
   const local = repoLocalBin(defaultBin, { moduleUrl: options.moduleUrl, platform })
-  if (exists(local)) return local
-  return defaultBin
+  if (exists(local)) return { command: local, source: 'local' }
+  return { command: defaultBin, source: 'path' }
+}
+
+// HMR can evict this module along with both components. Keep the process-local
+// transaction and exit barriers keyed by the original Host root across imports.
+const updateHostsKey = Symbol.for('@sekai/dsh-plugin/update-hosts-v1')
+const updateHosts = globalThis[updateHostsKey] ??= new WeakMap()
+
+function updateCoordinator(root, dir) {
+  const marker = path.join(dir, 'current.json')
+  const participants = new Map()
+  const barriers = new Map()
+  let observed = readGeneration(marker)
+  let bundle = observed && generationManifest(dir, observed)?.bundle
+  let active = null
+  let updating = false
+  let stopWatch = null
+  let stopWaitingForReady = null
+  const appReady = root.get?.('appReady')
+  let ready = typeof appReady?.onReady !== 'function'
+
+  function log(level, message) {
+    try { root.logger?.[level]?.(`[sekai update] ${message}`) } catch { /* diagnostics only */ }
+  }
+
+  function updateWatch() {
+    if (!participants.size && stopWaitingForReady) {
+      stopWaitingForReady()
+      stopWaitingForReady = null
+    }
+    if (participants.size && !ready) {
+      // Worker can start before the optional HMR service is installed.
+      stopWaitingForReady ??= appReady.onReady(() => {
+        ready = true
+        stopWaitingForReady = null
+        updateWatch()
+      })
+      return
+    }
+    if (participants.size && !stopWatch) {
+      const hmr = root.get?.('hmr')
+      if (typeof hmr?.watchConfig === 'function' && typeof hmr.reconcileProfile === 'function') {
+        let disposed = false
+        const watch = hmr.watchConfig(marker, () => check(hmr)).catch((error) => {
+          if (disposed) return
+          log('warn', `could not watch with Host HMR: ${describeError(error)}`)
+          watchFile(marker, { persistent: false, interval: 500 }, poll)
+          void poll()
+        })
+        stopWatch = () => {
+          disposed = true
+          unwatchFile(marker, poll)
+          void watch.then((dispose) => dispose?.()).catch((error) => log('warn', describeError(error)))
+        }
+      } else {
+        watchFile(marker, { persistent: false, interval: 500 }, poll)
+        stopWatch = () => unwatchFile(marker, poll)
+        void poll()
+      }
+    } else if (!participants.size && !updating && stopWatch) {
+      stopWatch()
+      stopWatch = null
+    }
+  }
+
+  function poll() { return check() }
+
+  async function check(hmr) {
+    if (updating || !participants.size || readGeneration(marker) === observed) return
+    updating = true
+    try { await applyUpdates(hmr) } finally {
+      updating = false
+      updateWatch()
+    }
+  }
+
+  async function applyUpdates(hmr) {
+    while (participants.size) {
+      const generation = readGeneration(marker)
+      if (!generation || generation === observed) break
+      observed = generation
+      const nextBundle = generationManifest(dir, generation)?.bundle
+      if (!isGeneration(nextBundle)) {
+        log('warn', `ignoring generation ${generation}: invalid deployment manifest`)
+        continue
+      }
+      try {
+        const reconcile = hmr && nextBundle !== bundle
+        active = { generation, handoffs: new Map(), reconciling: Boolean(reconcile) }
+        if (reconcile) {
+          // watchConfig invokes the callback inside DSH's serialized HMR queue.
+          const result = await hmr.reconcileProfile()
+          const pending = result?.pending?.some(({ url }) => /[/\\]@sekai[/\\]|[/\\]sekai-dsh[/\\]/.test(decodeURI(url)))
+          if (result?.restartReason || pending) {
+            throw new Error(`DSH could not reload the Sekai bundle (${result.restartReason ?? 'pending modules'}); it will load on Host restart`)
+          }
+          for (const warning of result?.warnings ?? []) log('warn', warning)
+          bundle = nextBundle
+          active.reconciling = false
+        } else if (!hmr && nextBundle !== bundle) {
+          log('warn', 'Host HMR is unavailable; updated Sekai plugin code takes effect on the next Host start')
+        }
+        if (readGeneration(marker) === generation) await restartRemaining(generation)
+      } catch (error) {
+        log('warn', `generation ${generation} not fully applied: ${describeError(error)}`)
+      } finally {
+        active = null
+      }
+    }
+  }
+
+  async function restartRemaining(generation) {
+    // Router first, then Worker. Replaced plugin fibers already spawned from the pinned generation.
+    for (const key of ['router', 'worker']) {
+      const participant = participants.get(key)
+      if (!participant) continue
+      try { await participant.restart(generation) } catch (error) {
+        log('warn', `${key} did not switch to generation ${generation}: ${describeError(error)}`)
+      }
+    }
+  }
+
+  return {
+    add(participant) {
+      const { key } = participant
+      const handoff = active?.handoffs.get(key)
+      active?.handoffs.delete(key)
+      participants.set(key, participant)
+      updateWatch()
+      return {
+        handoff,
+        generation: () => active?.generation,
+        canStart() {
+          const isAlive = barriers.get(key)
+          if (!isAlive) return true
+          if (isAlive()) return false
+          barriers.delete(key)
+          return true
+        },
+        dispose({ isAlive } = {}) {
+          if (typeof isAlive === 'function' && isAlive()) barriers.set(key, isAlive)
+          if (participants.get(key) !== participant) return
+          if (active?.reconciling && participant.snapshot) active.handoffs.set(key, participant.snapshot())
+          participants.delete(key)
+          updateWatch()
+        },
+      }
+    },
+  }
+}
+
+/** Register an enabled component for updates from the installer targeting this profile. */
+export function registerHotUpdate(ctx, participant) {
+  const root = ctx?.root ?? ctx
+  const dir = managedBinDir({ profileContext: root?.get?.('profileContext') })
+  if (!root || !dir) return { dispose() {}, canStart: () => true, generation: () => undefined }
+  let profiles = updateHosts.get(root)
+  if (!profiles) updateHosts.set(root, profiles = new Map())
+  let coordinator = profiles.get(dir)
+  if (!coordinator) profiles.set(dir, coordinator = updateCoordinator(root, dir))
+  return coordinator.add(participant)
 }
 
 /**
@@ -230,12 +438,32 @@ export function renderJson(_args, value) {
   return [{ type: 'text', text: JSON.stringify(value ?? {}, null, 2) }]
 }
 
-/** 不保持事件循环存活的 sleep（dispose 宽限等待用）。 */
-function sleep(ms) {
+/** `killed` means a signal was sent, not that the process has exited. */
+export function childExited(child) {
+  return !child?.pid || child.exitCode != null || child.signalCode != null
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (childExited(child)) return Promise.resolve(true)
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms)
-    timer.unref?.()
+    const timer = setTimeout(() => finish(childExited(child)), timeoutMs)
+    function finish(exited) {
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      resolve(exited)
+    }
+    function onExit() { finish(true) }
+    child.once('exit', onExit)
   })
+}
+
+/** Terminate a child and confirm that its PID no longer owns the process. */
+export async function stopChild(child, graceMs = 1000) {
+  if (childExited(child)) return true
+  try { child.kill() } catch { /* still require exit confirmation */ }
+  if (await waitForChildExit(child, graceMs)) return true
+  try { child.kill('SIGKILL') } catch { /* still require exit confirmation */ }
+  return waitForChildExit(child, 500)
 }
 
 /**
@@ -303,8 +531,8 @@ export class JsonlProcess {
     }
 
     child.on('error', (error) => {
-      // spawn 失败（ENOENT 等）在这里到达。
-      this.markExited({ spawnError: error })
+      if (childExited(child)) this.markExited({ spawnError: error })
+      else this.warnLog(`child process operation failed: ${describeError(error)}`)
     })
     child.on('exit', (code, signal) => {
       this.markExited({ code, signal })
@@ -426,27 +654,19 @@ export class JsonlProcess {
    * 优雅停止：shutdown 请求（短超时）→ 宽限 → kill → 再等 → 强杀。幂等。
    * @param {{method?: string, params?: object, requestTimeoutMs?: number, graceMs?: number}} [options]
    */
-  async dispose({ method = 'shutdown', params = {}, requestTimeoutMs = 1500, graceMs = 1000 } = {}) {
-    if (this.disposed) return
+  dispose({ method = 'shutdown', params = {}, requestTimeoutMs = 1500, graceMs = 1000 } = {}) {
+    return this.disposal ??= this.shutdown(method, params, requestTimeoutMs, graceMs)
+  }
+
+  async shutdown(method, params, requestTimeoutMs, graceMs) {
     this.disposed = true
-    if (!this.exited && this.child) {
-      try {
-        await this.request(method, params, { timeoutMs: requestTimeoutMs, internal: true })
-      } catch {
-        // shutdown 无响应/失败：走宽限→kill 兜底。
-      }
-      if (!this.exited) await Promise.race([this.exitedPromise(), sleep(graceMs)])
-      if (!this.exited) {
-        try { this.child.kill() } catch { /* 已退出 */ }
-        await Promise.race([this.exitedPromise(), sleep(graceMs)])
-      }
-      if (!this.exited) {
-        try { this.child.kill('SIGKILL') } catch { /* 已退出 */ }
-        await Promise.race([this.exitedPromise(), sleep(500)])
-      }
+    if (this.exited) return true
+    try {
+      await this.request(method, params, { timeoutMs: requestTimeoutMs, internal: true })
+    } catch {
+      // shutdown 无响应/失败：走宽限→kill 兜底。
     }
-    // 即便没有子进程也等一小撮 exit 事件，保证调用方观察一致。
-    if (!this.exited) await Promise.race([this.exitedPromise(), sleep(200)])
+    return await waitForChildExit(this.child, graceMs) || await stopChild(this.child, graceMs)
   }
 
   /** 直接杀进程（不发包）；一般调用方用 dispose 即可。 */

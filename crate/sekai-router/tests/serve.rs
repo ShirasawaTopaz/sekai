@@ -1293,8 +1293,72 @@ fn status_exposes_diagnostics_fields() {
     assert!(late.is_empty());
 }
 
-/// D5 自动路由：名字在 Worker 通告的 tasks 列表里时，`tool_call` 按 Task 下发
-/// （策略仍按名字分类，需要 allow_tasks）。
+#[test]
+fn task_policy_patch_is_atomic_and_preserves_legacy_switch() {
+    let mut state = state();
+    let hub = prompt_hub_with_chat_body("{}");
+    state.set_prompt_hub(hub.clone());
+
+    let update = request(
+        &mut state,
+        r#"{"id":1,"method":"policy.set","params":{"allowed_tasks":["pc.ask","echo","echo"],"worker_filter":"pc-1"}}"#,
+    );
+    let current = update[0].get("result").unwrap().clone();
+    assert_eq!(
+        current.get("allow_tasks").and_then(Json::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        current.get("allowed_tasks").unwrap().to_compact_string(),
+        r#"["echo","pc.ask"]"#
+    );
+    assert!(hub.policy().tasks.allows("echo"));
+    for invalid in [
+        r#"{"id":2,"method":"policy.set","params":{"allow_write":true,"allow_tasks":true,"allowed_tasks":["echo"]}}"#,
+        r#"{"id":2,"method":"policy.set","params":{"allow_write":true,"allowed_tasks":[],"worker_filter":"bad worker"}}"#,
+        r#"{"id":2,"method":"policy.set","params":{"allow_admin":true,"allowed_tasks":["echo",7]}}"#,
+    ] {
+        let response = request(&mut state, invalid);
+        assert_eq!(
+            response[0]
+                .get_path(&["error", "code"])
+                .and_then(Json::as_str),
+            Some("invalid_arguments")
+        );
+        let snapshot = request(&mut state, r#"{"id":3,"method":"policy.get","params":{}}"#);
+        assert_eq!(snapshot[0].get("result"), Some(&current));
+        assert!(!hub.policy().allow_write);
+        assert!(!hub.policy().allow_admin);
+        assert!(hub.policy().tasks.allows("echo"));
+    }
+
+    for (params, all, names) in [
+        (r#"{"allow_admin":true}"#, false, r#"["echo","pc.ask"]"#),
+        (
+            r#"{"allow_tasks":false,"allowed_tasks":["sleep"]}"#,
+            false,
+            r#"["sleep"]"#,
+        ),
+        (r#"{"allow_tasks":true,"allowed_tasks":[]}"#, true, "[]"),
+        (r#"{"allowed_tasks":[]}"#, false, "[]"),
+        (r#"{"allow_tasks":true}"#, true, "[]"),
+        (r#"{"allow_tasks":false}"#, false, "[]"),
+    ] {
+        let updated = request(
+            &mut state,
+            &format!(r#"{{"id":4,"method":"policy.set","params":{params}}}"#),
+        );
+        let policy = updated[0].get("result").unwrap();
+        assert_eq!(policy.get("allow_tasks").and_then(Json::as_bool), Some(all));
+        assert_eq!(
+            policy.get("allowed_tasks").unwrap().to_compact_string(),
+            names
+        );
+        assert_eq!(hub.policy().allow_tasks(), all);
+    }
+}
+
+/// D5 自动路由：Worker 通告的 Task 在两个入口使用同一份精确名单。
 #[test]
 fn tool_call_routes_advertised_task_names_as_task() {
     let (mut state, calls, _cancelled) = linked_state();
@@ -1317,8 +1381,20 @@ fn tool_call_routes_advertised_task_names_as_task() {
 
     let _ = request(
         &mut state,
-        r#"{"id":2,"method":"policy.set","params":{"allow_tasks":true}}"#,
+        r#"{"id":2,"method":"policy.set","params":{"allowed_tasks":["echo"],"allow_admin":true}}"#,
     );
+    let (denied, _, deferred) = state.step(
+        r#"{"id":5,"method":"task","params":{"worker_id":"pc-1","task":"pc.job","args":"","async":true}}"#,
+    );
+    assert!(deferred.is_none());
+    assert_eq!(
+        denied[0]
+            .get_path(&["result", "error", "code"])
+            .and_then(Json::as_str),
+        Some("policy_denied")
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
     let messages = request(
         &mut state,
         r#"{"id":3,"method":"tool_call","params":{"worker_id":"pc-1","tool":"echo","args":"hi"}}"#,

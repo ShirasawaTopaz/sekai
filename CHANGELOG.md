@@ -7,6 +7,10 @@
 
 ### 新增
 
+- DSH Web 侧栏显示 Router 和 Worker 状态。新增按 tag 构建 Windows/Linux
+  二进制的 GitHub Release 草稿流程，以及手动触发的 DSH npm 发布流程。
+- ESP32 release 固件加入 CI。飞书日历增加指定测试日历的真租户增删改查验收用例。
+
 - **上下文治理（工具结果滚动压缩 + 上下文预算）**：agent 循环只保留最近
   `SEKAI_CONTEXT_RETAIN_STEPS`（默认 4，`0` 关闭）轮工具结果原文，更早的 `tool`
   消息替换为带成功/失败、命令名与 160 字符摘要头的紧凑占位（`{"compacted":true,...}`）；
@@ -99,6 +103,8 @@
   `docs/sekai-feishu.md` 同步更新。
 
 ### 修复
+
+- Windows `pc.exec` 和 `pc.job` 使用 Job Object 清理进程树，修复了超时和任务取消后可能残留孙进程的问题。
 
 - **适配 DSH 0.2.2-rc.3**：`plugins/sekai-dsh/package.json` 新增
   `engines.dsh = ">=0.2.2-rc.3 <0.3.0"`；工具 `output.schema` 按宿主 JSON Schema

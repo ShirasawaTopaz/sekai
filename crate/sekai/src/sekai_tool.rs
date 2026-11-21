@@ -114,6 +114,25 @@ impl ToolRegistry {
         Ok(())
     }
 
+    pub(crate) fn call(
+        &mut self,
+        name: &str,
+        args: &[u8],
+        now_mono_ms: u64,
+        now_unix_ms: Option<u64>,
+        workers: &DeviceList,
+    ) -> Result<Vec<u8>, CommandError> {
+        let tool = self
+            .get_mut(name)
+            .ok_or(crate::sekai_wire::ErrorCode::UnknownTool)?;
+        tool.call(&mut ToolContext {
+            args,
+            now_mono_ms,
+            now_unix_ms,
+            workers,
+        })
+    }
+
     /// 查找工具处理器。
     pub fn get_mut(&mut self, name: &str) -> Option<&mut BoxedTool> {
         self.tools.get_mut(name)

@@ -53,21 +53,23 @@ node scripts/install-dsh-plugin.mjs
 1. **构建**：`cargo build --release -p sekai-router -p sekai-worker`
    （`--no-build` 跳过，改用 `target/release` 现有产物；`--bin-dir <dir>` 改用该目录里
    已构建的两个二进制，隐含不构建）。
-2. **部署二进制**：把两个二进制原子复制（临时文件 + rename）到 `<DSH_HOME>/sekai/bin/`
-   （`DSH_HOME` 未设置时 = `~/.dsh`）。插件从这里**零配置**发现，不需要改 PATH、
-   环境变量或 profile YAML。
-3. **安装插件**：`dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh`
-   （`file:` = pnpm 真实拷贝，peer 依赖可从 profile 解析；DSH 会自动把包名追加进
-   profile `package.json` 的 `dsh.profile.bundles`，重复执行幂等）。所有 `dsh`
-   子进程都注入 `DSH_HOME`。
-4. **自检**：部署文件存在且非空；profile 的 `dependencies` 与 `dsh.profile.bundles`
-   已登记；从 profile 解析并 import 已安装插件、调用其 `resolveBin`，**必须命中刚部署
-   的两个绝对路径**（零配置闭环）；`dsh --profile <p> --dump-config` 输出含
-   `sekai-router` / `sekai-worker` 两行（默认只告警，`--strict` 时失败）。
+2. **部署二进制**：按内容标识将两个二进制写入
+   `<DSH_HOME>/sekai/bin/profiles/<profile>/generations/<generation>/`。每次变更使用独立目录，
+   因此 Windows 上旧进程仍在运行时也能准备新版。
+3. **安装与校验**：用 `dsh plugin --profile <p> add file:<repo>/plugins/sekai-dsh` 安装 bundle，
+   核对已安装的包内容、profile 登记和可执行文件。`--strict` 另外要求 `--dump-config` 自检通过。
+4. **发布**：校验通过后原子更新该 profile 的 `current.json`。相同内容重复安装不重新发布。
 
-装完**重启 DSH 会话**（重启桌面端或重新运行 `dsh web`）——运行中的会话不会热加载
-bundle；重启后会话里出现 `sekai_*` 工具。默认 router 监听 `127.0.0.1:7421`，
-worker `autoConnect` 自动连接。
+重跑同一命令可更新插件。启用 HMR 的 DSH 会加载更新后的插件代码，依次交接 Router 和
+正在运行的 Worker。Router 恢复原监听和策略，Worker 连接更新前的目标。已手动断开的
+Worker 保持停止，`autoConnect:false` 下已经手动连接的 Worker 会恢复连接。切换期间有短暂
+断连，已中断的请求需要重新发起。
+
+首次从未提供更新监听的旧版迁移时，需要让宿主加载新版一次。关闭 HMR 时，托管二进制仍可切换，
+插件代码在宿主下次启动时加载。安装器报告的是磁盘发布状态。可用 `sekai_status` 与
+`sekai_worker_status` 查看进程 PID 和可选的 `binaryGeneration`。未变更的二进制可能继续运行在
+原发布代。安装器保留旧代，因为仍在运行的进程可能继续使用它们。若安装校验失败，发布标记仍指向
+旧代。DSH CLI 已安装的 bundle 文件会保留在磁盘上。
 
 | 选项 | 作用 |
 | --- | --- |
@@ -90,8 +92,7 @@ worker `autoConnect` 自动连接。
 > **运行环境提示**：脚本要调用 `cargo` / `dsh` 子进程并写 `<DSH_HOME>/sekai`，请在
 > 普通系统终端运行。在 DSH 受限沙箱会话（workspace-write）里 Node 子进程会被拒绝
 > （`spawn EPERM`）；若确实要在 DSH 会话里执行，需要给该命令申请更宽的沙箱权限
-> （会放弃该次命令的会话隔离），否则请到终端跑。升级插件 = `git pull` 后重跑同一条
-> 命令；重启 DSH 才会加载新 bundle（运行中的会话不热加载）。
+> （会放弃该次命令的会话隔离），否则请到终端跑。升级插件时，`git pull` 后重跑同一条安装命令。
 
 ### DSH 版本兼容（0.2.2-rc.3）
 
@@ -146,13 +147,12 @@ DSH 的「插件」页会分别读取 **bundle** 与**每一行**的本地化元
 | --- | --- | --- |
 | 1 | 显式 config：`routerBin` / `workerBin` | 非空且不等于默认名时生效；最高优先级，用于覆盖 |
 | 2 | 环境变量：`SEKAI_ROUTER_BIN` / `SEKAI_WORKER_BIN` | 非空即生效 |
-| 3 | `$DSH_HOME/sekai/bin/<name>(.exe)` | **一键脚本的部署位置**，默认零配置走这里 |
-| 4 | `<repo>/target/release/<name>(.exe)` | 从仓库 checkout 加载插件时本地开发免配置 |
-| 5 | PATH 上的默认名 | 最后回退（`sekai-router` / `sekai-worker`） |
+| 3 | 当前 profile 已发布的二进制 | 一键安装脚本自动部署，支持热切换 |
+| 4 | `$DSH_HOME/sekai/bin/<name>(.exe)` | 旧版或手动部署路径 |
+| 5 | `<repo>/target/release/<name>(.exe)` | 从仓库 checkout 加载插件时自动查找 |
+| 6 | PATH 上的默认名 | 最后回退（`sekai-router` / `sekai-worker`） |
 
-即：**config > 环境变量 > `$DSH_HOME/sekai/bin` > `<repo>/target/release` > PATH**。
-第 3 项由一键安装脚本负责写入，所以装完默认零配置；第 4 项让 `link:` 安装的源码
-checkout 场景不做任何配置也能直接用 `cargo build` 产物。
+显式配置或环境变量选择的二进制由用户管理。热发布只替换托管二进制版本。
 
 ### 备选：不用安装脚本
 
@@ -246,8 +246,8 @@ bundle 默认值）：
       # maxResponseBytes: 65536
 ```
 
-改完重启 DSH 会话生效（运行中的会话不热加载 bundle/config）。`enabled: true` 只影响
-**新 spawn** 的 worker：插件给它追加 `--dsh-tools`，Worker 的 `tasks` 列表随后出现
+启用 HMR 的 DSH 会应用配置并重新挂载 Worker 插件。关闭 HMR 时在下次启动应用配置。
+插件启动 Worker 时追加 `--dsh-tools`，Worker 的 `tasks` 列表随后出现
 `dsh.tools`/`dsh.call`（`sekai_list_workers`/`sekai_worker_status` 可确认）。
 
 ## 2. serve 模式与 JSONL 协议 v1（冻结；v1.1 `prompt`、v1.2 异步/取消/管理）
@@ -483,10 +483,25 @@ worker stdin ◀── dsh_tool：{"id":N,"ok":true,"result":{text,value?,is_err
   （详见 §验收清单）；kill worker 后插件按退避自动重启。
 - 工作区测试：`cargo test --workspace` 全绿；bundle 冒烟 `node scripts/smoke.mjs` 14/14。
 
-## 6. 非目标与后续
+## 6. Web 状态与发行
 
-- Web UI 状态面板（Client Slots）——下轮。
-- bundle 内嵌预编译二进制 / npm 发布；嵌入式 Worker（MQTT 链路仅保留 `link mqtt` 通道）。
+DSH Web 的侧栏底部显示 Router 是否就绪、已连接的 Worker 数量和本地 Worker
+进程状态。面板通过 DSH 的认证连接读取状态，约每 3 秒刷新一次。已在
+DSH 0.2.2-rc.5 与 Chromium 验证面板展示已连接的 Worker。
+
+GitHub Release 的 Windows/Linux x64 压缩包提供 `sekai-router`、`sekai-worker`
+和 `stm32-bridge`。解压后可用安装器的 `--bin-dir <dir>` 安装，或把二进制目录
+加入 PATH。npm 插件包与平台二进制分别发布。
+
+发布者先更新 CHANGELOG 和版本号，再推送与 workspace 版本匹配的 `vX.Y.Z` tag。
+Release workflow 测试、构建并创建附带 SHA-256 校验的草稿。检查草稿后可发布。
+从匹配插件版本的 tag 手动运行 Publish DSH plugin workflow。npm 侧可将
+`npm-publish.yml` 配置为此包的受信任发布者。首次发布可使用有包发布权限的
+`NPM_TOKEN` 仓库 secret。
+
+## 7. 集成边界
+
+- 嵌入式 Worker 通过 Router 的 `link mqtt` 通道接入。
 - ~~暴露 Router 自带 LLM agent 回路给 DSH（刻意不做，避免双重大脑）~~ → v1.1 起以
   **受限问答形态**暴露：serve `prompt` 方法 / ingress 只返回单轮回答（带防递归闸），
   DSH 主会话仍是唯一的控制大脑。

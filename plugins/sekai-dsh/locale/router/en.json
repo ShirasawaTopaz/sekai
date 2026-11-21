@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Sekai router",
-    "description": "Runs `sekai-router --serve` and publishes the four sekai_* forwarding tools. Writes, Tasks, and admin operations follow the policy settings and default to denied."
+    "description": "Runs `sekai-router --serve` and publishes the four sekai_* forwarding tools. Writes, Tasks, and admin operations default to denied. Set policy.allowedTasks to authorize exact Task names. This requires a Router that supports --allow-task and cannot be combined with policy.allowTasks."
   }
 }

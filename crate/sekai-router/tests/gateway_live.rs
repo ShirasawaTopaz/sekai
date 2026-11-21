@@ -399,6 +399,7 @@ fn topic_matches(filter: &str, topic: &str) -> bool {
 enum WorkerMode {
     /// 正常回 Accepted + Completed。
     Respond,
+    GpioLoopback,
     /// 只发 Hello，不回应 Stdin（用于 gateway 超时）。
     Silent,
     /// 回 Accepted + Failed(InvalidArgument)。
@@ -551,6 +552,7 @@ fn fake_worker_main(port: u16, mode: WorkerMode) {
         return;
     }
 
+    let mut output_level = "0";
     let mut seq = 2u32;
     let mut packet_id = 3u16;
     loop {
@@ -591,6 +593,44 @@ fn fake_worker_main(port: u16, mode: WorkerMode) {
                             b"pin=IO4 mode=unconfigured".to_vec(),
                         )
                         .expect("Completed 帧"),
+                        WorkerMode::GpioLoopback => {
+                            let call =
+                                sekai::sekai_stdin::ToolBody::decode(&stdin.payload).unwrap();
+                            let args = std::str::from_utf8(&call.args).unwrap();
+                            let payload = match (call.name.as_str(), args) {
+                                ("gpio.info", "") => "chip=esp32\nbackend=hardware".into(),
+                                ("gpio.info", "IO25") => "pin=IO25\ncaps=in,out,pu,pd,od".into(),
+                                ("gpio.info", "IO26") => "pin=IO26\ncaps=in,out,pu,pd,od".into(),
+                                ("gpio.config", "IO26 in pull=down") => {
+                                    "pin=IO26 mode=input pull=down".into()
+                                }
+                                ("gpio.config", "IO25 out level=0 pull=none open_drain=0") => {
+                                    output_level = "0";
+                                    "pin=IO25 mode=output level=0 pull=none open_drain=0".into()
+                                }
+                                ("gpio.write", "IO25 0") => {
+                                    output_level = "0";
+                                    "pin=IO25 level=0".into()
+                                }
+                                ("gpio.write", "IO25 1") => {
+                                    output_level = "1";
+                                    "pin=IO25 level=1".into()
+                                }
+                                ("gpio.read", "IO26") => format!("pin=IO26 level={output_level}"),
+                                unexpected => {
+                                    panic!("unexpected GPIO loopback request: {unexpected:?}")
+                                }
+                            };
+                            Stdout::new(
+                                1,
+                                stdin.id,
+                                seq,
+                                Phase::Completed,
+                                unix_ms(),
+                                payload.into_bytes(),
+                            )
+                            .unwrap()
+                        }
                         WorkerMode::Reject => {
                             let error = ErrorPayload::new(ErrorCode::InvalidArgument, "bad pin");
                             Stdout::new(
@@ -871,4 +911,43 @@ fn gateway_cancel_finished_command_reports_unknown_command() {
 
     drop(gateway);
     broker.shutdown();
+}
+
+#[test]
+#[ignore = "requires Node.js for the loopback CLI"]
+fn gpio_loopback_cli_uses_real_router_mqtt_transport() {
+    let broker = MiniBroker::start();
+    let fake_worker = spawn_fake_worker(broker.port, WorkerMode::GpioLoopback);
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/gpio-loopback.mjs");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .args(["--board", "esp32", "--worker", WORKER_ID, "--broker"])
+        .arg(format!("127.0.0.1:{}", broker.port))
+        .args([
+            "--router",
+            env!("CARGO_BIN_EXE_sekai-router"),
+            "--wait-ms",
+            "5000",
+        ])
+        .env("SEKAI_TOPIC_ROOT", TOPIC_ROOT)
+        .output()
+        .unwrap();
+    drop(broker);
+    fake_worker.join().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("\"tool\":\"gpio.read\""))
+            .count(),
+        3
+    );
+    assert!(stdout.contains("\"cleanup\":\"confirmed\""));
 }

@@ -28,7 +28,7 @@ use sekai_router::prompt::worker_summary;
 use sekai_router::prompt_server::{self, PromptCore};
 use sekai_router::serve::{self, ServeConfig};
 use sekai_router::session::{Session, SessionConfig};
-use sekai_router::tools::{Policy, workers_json};
+use sekai_router::tools::{Policy, TaskAccess, workers_json};
 use sekai_router::trace::TraceWriter;
 
 fn main() {
@@ -98,10 +98,16 @@ fn run_config(config: Config) -> i32 {
 /// CLI 旗标 → 服务端策略（批处理 / 交互 / serve 共用）。
 ///
 /// `deny_llm_relay` 是 prompt 通道运行时内部位，CLI 不暴露、恒为 false。
+/// Task 授权由 `--allow-tasks`（全开）或 `--allow-task`（精确名单，二者互斥，
+/// 已在 config 层拦截）决定。
 fn policy_from(config: &Config) -> Policy {
     Policy {
         allow_write: config.allow_write,
-        allow_tasks: config.allow_tasks,
+        tasks: if config.allow_tasks {
+            TaskAccess::All
+        } else {
+            TaskAccess::from_names(config.allowed_tasks.iter().cloned())
+        },
         allow_admin: config.allow_admin,
         worker_filter: config.worker_filter.clone(),
         deny_llm_relay: false,
@@ -229,8 +235,11 @@ fn run_batch(config: Config, trace: &mut TraceWriter) -> i32 {
     let llm = LlmClient::new(Box::new(http), llm_config);
     let policy = policy_from(&config);
     eprintln!(
-        "sekai-router: 策略 allow_write={} allow_tasks={} allow_admin={} worker={:?}",
-        policy.allow_write, policy.allow_tasks, policy.allow_admin, policy.worker_filter
+        "sekai-router: 策略 allow_write={} task={} allow_admin={} worker={:?}",
+        policy.allow_write,
+        policy.tasks.describe(),
+        policy.allow_admin,
+        policy.worker_filter
     );
     let agent_config = build_agent_config(&config);
     let mut agent = Agent::new(llm, gateway, policy, agent_config, trace.clone());
@@ -529,8 +538,8 @@ fn run_feishu(config: Config, trace: TraceWriter) -> i32 {
             return 3;
         }
     };
-    // 不等 Worker 上线：feishu 是常驻前端，Worker 可后到；无 Worker 时消息
-    // 回「暂无 Worker 在线」（run_prompt 的 no_workers），链路断开回 not_linked。
+    // 不等 Worker 上线：飞书日历 API 由 Router 直接执行；Worker 可后到，
+    // 仅 pc.* / gpio.* 等操作需要在线 Worker。
     // 监听/连接失败已在 build_gateway 内报错退出。
     trace.event(
         "link_ready",
@@ -559,15 +568,13 @@ fn run_feishu(config: Config, trace: TraceWriter) -> i32 {
     ));
     core.set_gateway(Some(Arc::clone(&gateway)));
 
-    // prompt ingress 在 feishu 形态默认 off；显式 --prompt-addr 才开启
-    // （默认值差异已由 config 处理）。
-    start_prompt_ingress(&config, Arc::clone(&core));
-
+    // 先加载动态 Task 授权，随后才启动显式开启的 prompt ingress。
     let stop = Arc::new(AtomicBool::new(false));
-    sekai_router::feishu::run(
+    sekai_router::feishu::run_with_ingress(
         core,
         gateway,
         sekai_router::feishu::FeishuOptions::from_config(&config),
         stop,
+        |core| start_prompt_ingress(&config, core),
     )
 }

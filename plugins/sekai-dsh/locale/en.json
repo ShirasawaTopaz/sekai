@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Sekai bridge",
-    "description": "Bridges DSH to a Sekai world. The router plugin runs `sekai-router --serve` and publishes sekai_status, sekai_list_workers, sekai_worker_tool, and sekai_worker_task. The worker plugin runs `sekai-worker connect`, reconnects to the last router through autoConnect, relays pc.ask prompts, and publishes sekai_worker_status plus the manual connect/disconnect tools. Enable it in Plugins, then restart the session so the tools appear. Both binaries are spawned on this machine; writes and Tasks stay denied until policy.allowWrite or policy.allowTasks is enabled in the plugin settings.",
+    "description": "Bridges DSH to a Sekai world. The router plugin runs `sekai-router --serve` and publishes sekai_status, sekai_list_workers, sekai_worker_tool, and sekai_worker_task. The worker plugin runs `sekai-worker connect`, reconnects to the last router through autoConnect, relays pc.ask prompts, and publishes sekai_worker_status plus the manual connect/disconnect tools. Enable it in Plugins, then restart the session so the tools appear. Both binaries run on this machine. In the router settings, policy.allowWrite enables writes, policy.allowedTasks authorizes selected Task names, and policy.allowTasks authorizes every Task. Writes and Tasks default to denied.",
     "detail": "docs/DETAIL.md"
   }
 }

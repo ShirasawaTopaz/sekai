@@ -845,21 +845,23 @@ impl ServeState {
             .list_workers()
             .into_iter()
             .find(|worker| worker.worker_id == worker_id);
-        if let Err(denied) = tools::check_policy_for_worker(&self.policy, &parsed, worker.as_ref())
-        {
-            return immediate(vec![ok_response(
-                id,
-                tools::failure_result_json(
-                    &worker_id,
-                    Some(requested_kind),
-                    &name,
-                    tools::CODE_POLICY_DENIED,
-                    &denied.to_string(),
-                    false,
-                ),
-            )]);
-        }
-        let kind = tools::route_command_kind(worker.as_ref(), &name, requested_kind);
+        let kind = match tools::authorize_worker_call(&self.policy, &parsed, worker.as_ref()) {
+            Ok(Some(kind)) => kind,
+            Ok(None) => unreachable!("method_command parses only Worker commands"),
+            Err(denied) => {
+                return immediate(vec![ok_response(
+                    id,
+                    tools::failure_result_json(
+                        &worker_id,
+                        Some(requested_kind),
+                        &name,
+                        tools::CODE_POLICY_DENIED,
+                        &denied.to_string(),
+                        false,
+                    ),
+                )]);
+            }
+        };
         let request = CommandRequest {
             timeout_ms: if is_tool {
                 self.config.tool_timeout_ms
@@ -1229,7 +1231,7 @@ impl ServeState {
                         )]);
                     }
                 };
-                return immediate(self.cancel_quiet(id, cmd_id));
+                immediate(self.cancel_quiet(id, cmd_id))
             }
             "set_time" => {
                 let worker_id = match params.get("worker_id").and_then(Json::as_str) {
@@ -1395,10 +1397,21 @@ impl ServeState {
     // ---- policy ----
 
     /// 策略对象（policy.get 结果 / policy.set 返回值共用形状）。
+    ///
+    /// `allow_tasks` 只在全开时为 true；精确名单在 `allowed_tasks`（升序数组），
+    /// 两字段合起来表达三态：拒绝全部 / 只允许名单 / 全开。
     fn policy_json(&self) -> Json {
+        let allowed_tasks: Vec<Json> = self
+            .policy
+            .tasks
+            .names()
+            .into_iter()
+            .map(Json::string)
+            .collect();
         Json::object(vec![
             ("allow_write", Json::Bool(self.policy.allow_write)),
-            ("allow_tasks", Json::Bool(self.policy.allow_tasks)),
+            ("allow_tasks", Json::Bool(self.policy.allow_tasks())),
+            ("allowed_tasks", Json::Array(allowed_tasks)),
             ("allow_admin", Json::Bool(self.policy.allow_admin)),
             (
                 "worker_filter",
@@ -1411,8 +1424,23 @@ impl ServeState {
     }
 
     /// policy.set 方法：只改给出的字段，返回更新后的完整策略。
+    ///
+    /// Task 授权三态（同一请求内的字段组合）：
+    /// - 只给 `allowed_tasks`：整体替换精确名单（空数组 = 全部拒绝）；
+    /// - 只给 `allow_tasks:false`：全部拒绝；只给 `true`：全开；
+    /// - `false` + 非空名单：精确授权；`true` + 非空名单：`invalid_arguments`；
+    /// - 两者都不给：保持当前模式。
+    ///
+    /// 所有字段先解析成候选策略，全部合法才一次性写回并同步 prompt hub，
+    /// 避免「前面的字段已生效、后面的字段才报错」的部分更新。
     fn method_policy_set(&mut self, id: i64, params: &Json) -> Vec<Json> {
-        const ALLOWED: &[&str] = &["allow_write", "allow_tasks", "allow_admin", "worker_filter"];
+        const ALLOWED: &[&str] = &[
+            "allow_write",
+            "allow_tasks",
+            "allowed_tasks",
+            "allow_admin",
+            "worker_filter",
+        ];
         if let Err(error) = tools::check_fields(params, ALLOWED) {
             return vec![error_response(
                 id,
@@ -1420,10 +1448,10 @@ impl ServeState {
                 &error.to_string(),
             )];
         }
+        let mut candidate = self.policy.clone();
         for (key, slot) in [
-            ("allow_write", &mut self.policy.allow_write),
-            ("allow_tasks", &mut self.policy.allow_tasks),
-            ("allow_admin", &mut self.policy.allow_admin),
+            ("allow_write", &mut candidate.allow_write),
+            ("allow_admin", &mut candidate.allow_admin),
         ] {
             match params.get(key) {
                 None => {}
@@ -1439,7 +1467,7 @@ impl ServeState {
         }
         match params.get("worker_filter") {
             None => {}
-            Some(Json::Null) => self.policy.worker_filter = None,
+            Some(Json::Null) => candidate.worker_filter = None,
             Some(Json::String(text)) => {
                 if let Err(message) = validate_worker_id(text) {
                     return vec![error_response(
@@ -1448,7 +1476,7 @@ impl ServeState {
                         &format!("worker_filter 非法：{message}"),
                     )];
                 }
-                self.policy.worker_filter = Some(text.clone());
+                candidate.worker_filter = Some(text.clone());
             }
             Some(_) => {
                 return vec![error_response(
@@ -1458,6 +1486,67 @@ impl ServeState {
                 )];
             }
         }
+        let allow_tasks = match params.get("allow_tasks") {
+            None => None,
+            Some(Json::Bool(value)) => Some(*value),
+            Some(_) => {
+                return vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "参数 allow_tasks 必须是布尔值",
+                )];
+            }
+        };
+        let allowed_tasks = match params.get("allowed_tasks") {
+            None => None,
+            Some(Json::Array(items)) => {
+                let mut names = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(text) => names.push(String::from(text)),
+                        None => {
+                            return vec![error_response(
+                                id,
+                                tools::CODE_INVALID_ARGUMENTS,
+                                "参数 allowed_tasks 必须是字符串数组",
+                            )];
+                        }
+                    }
+                }
+                match tools::normalize_task_names(names) {
+                    Ok(names) => Some(names),
+                    Err(message) => {
+                        return vec![error_response(
+                            id,
+                            tools::CODE_INVALID_ARGUMENTS,
+                            &format!("allowed_tasks 非法：{message}"),
+                        )];
+                    }
+                }
+            }
+            Some(_) => {
+                return vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "参数 allowed_tasks 必须是字符串数组",
+                )];
+            }
+        };
+        match (allow_tasks, allowed_tasks) {
+            (None, None) => {}
+            (Some(true), Some(names)) if !names.is_empty() => {
+                return vec![error_response(
+                    id,
+                    tools::CODE_INVALID_ARGUMENTS,
+                    "allow_tasks=true 与 allowed_tasks 互斥：全开或精确授权，二选一",
+                )];
+            }
+            (Some(true), _) => candidate.set_allow_tasks(true),
+            (Some(false), Some(names)) => candidate.set_allowed_tasks(names),
+            (Some(false), None) => candidate.set_allow_tasks(false),
+            (None, Some(names)) => candidate.set_allowed_tasks(names),
+        }
+        self.policy = candidate;
         self.sync_prompt_hub();
         vec![ok_response(id, self.policy_json())]
     }

@@ -39,3 +39,6 @@ pub use llm_channel::{
 
 /// crate 版本。
 pub const VERSION: &str = "0.1.0";
+
+#[cfg(feature = "uart-bridge")]
+pub mod uart_bridge;

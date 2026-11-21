@@ -1,0 +1,32 @@
+name: Publish DSH plugin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  npm:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/sekai-dsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify version and package
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(node -p "require('./package.json').version")"
+          npm run check
+          npm run smoke
+          npm pack --dry-run
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

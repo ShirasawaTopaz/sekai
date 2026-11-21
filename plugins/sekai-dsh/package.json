@@ -1,13 +1,19 @@
 {
   "name": "@sekai/dsh-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sekai bridge plugins for dsh (DeepSeek Harness): drives `sekai-router --serve` (JSONL over stdio) and the `sekai-worker connect` lifecycle (with the autoConnect switch that resumes the last connected router, manual connect/disconnect tools, prompt relaying and opt-in virtual GPIO), publishing sekai_* tools.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShirasawaTopaz/sekai.git",
+    "directory": "plugins/sekai-dsh"
+  },
   "type": "module",
   "main": "./lib/index.js",
   "icon": "./icon.svg",
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./router": "./lib/router.js",
     "./worker": "./lib/worker.js",
     "./router/locale/*.json": "./locale/router/*.json",
@@ -29,7 +35,7 @@
     "icon.svg"
   ],
   "scripts": {
-    "check": "node --check lib/index.js && node --check lib/shared.js && node --check lib/router.js && node --check lib/worker.js",
+    "check": "node --check lib/index.js && node --check lib/shared.js && node --check lib/router.js && node --check lib/worker.js && node --check lib/status.js && node --check lib/client.js",
     "smoke": "node scripts/smoke.mjs"
   },
   "keywords": [
@@ -56,6 +62,11 @@
     "dsh": ">=0.2.2-rc.3 <0.3.0"
   },
   "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": ["@deepseek-ai/dsh-client-ui-sidebar", "@deepseek-ai/dsh-api-gateway"]
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     }

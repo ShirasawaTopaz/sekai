@@ -6,6 +6,8 @@
 //! 策略在**发布 Stdin 之前**强制执行：模型即使忽略 system prompt，也无法
 //! 绕过 --allow-write / --allow-tasks / --allow-admin / --worker 过滤。
 
+use std::collections::BTreeSet;
+
 use sekai::sekai_stdout::JumpOutcome;
 use sekai::sekai_wire::{MAX_DDL_MS, truncate_utf8, validate_name, validate_worker_id};
 
@@ -39,8 +41,12 @@ pub const WRITE_TOOLS: &[&str] = &["gpio.config", "gpio.write", "pc.write", "pc.
 /// 在 prompt 通道发起的 Agent 运行里被 [`Policy::deny_llm_relay`] 拒绝，
 /// 防止 worker → router → worker 的递归派工死循环。
 pub const NESTED_PROMPT_TOOL: &str = "pc.ask";
-/// 嵌套 prompt 拒绝时的能力描述（PolicyDenied::Forbidden 的 what）。
-pub const DENIED_NESTED_PROMPT_WHAT: &str = "嵌套 prompt（pc.ask）";
+/// 嵌套 prompt 拒绝时的完整说明（PolicyDenied::Forbidden 的 what）。
+pub const DENIED_NESTED_PROMPT_WHAT: &str =
+    "嵌套 prompt（pc.ask）已拒绝：prompt 通道（ingress / serve prompt / 飞书）不允许递归派工";
+
+/// Task 精确授权名单上限（`--allow-tasks` 全开不受此限）。
+pub const MAX_ALLOWED_TASKS: usize = 64;
 
 /// 长任务类工具名：即使模型用 `worker_tool` 调用，也按 Task 下发（D5），
 /// 策略上要求 `allow_tasks`（不因为走了 WorkerTool 分支而变成 admin 工具）。
@@ -199,30 +205,170 @@ fn object_schema(properties: Vec<(&str, Json)>, required: &[&str]) -> Json {
     value
 }
 
+/// Task 授权模式（互斥三态）。
+///
+/// [`TaskAccess::Deny`] 是默认值：不配置任何 Task 开关时，Worker 通告的
+/// Task 与 `pc.ask`/`pc.job` 一律拒绝。[`TaskAccess::Only`] 只放行名单内的
+/// 完整名称（大小写敏感），[`TaskAccess::All`] 保留 `--allow-tasks` 的全开语义。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TaskAccess {
+    /// 拒绝全部 Task。
+    #[default]
+    Deny,
+    /// 只允许名单内的完整 Task 名。
+    Only(BTreeSet<String>),
+    /// 允许任意 Task（含 Worker 以后新通告的）。
+    All,
+}
+
+impl TaskAccess {
+    /// 按名称构造：空名单等价于 [`TaskAccess::Deny`]。
+    ///
+    /// 名称应先用 [`normalize_task_names`] 校验；本方法不做校验。
+    pub fn from_names<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let set: BTreeSet<String> = names.into_iter().map(Into::into).collect();
+        if set.is_empty() {
+            Self::Deny
+        } else {
+            Self::Only(set)
+        }
+    }
+
+    /// 是否允许该名称。
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::Deny => false,
+            Self::All => true,
+            Self::Only(names) => names.contains(name),
+        }
+    }
+
+    /// 是否全开。
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    /// 精确授权的名称（升序）；`All` 与 `Deny` 返回空。
+    pub fn names(&self) -> Vec<String> {
+        match self {
+            Self::Only(names) => names.iter().cloned().collect(),
+            Self::Deny | Self::All => Vec::new(),
+        }
+    }
+
+    /// 摘要（prompt、CLI、serve 输出共用）。
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Deny => String::from("拒绝"),
+            Self::All => String::from("允许（全开）"),
+            Self::Only(names) => format!(
+                "只允许 {}",
+                names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            ),
+        }
+    }
+}
+
+/// 校验并规范化 Task 授权名单：trim、拒绝空项、去重、升序。
+///
+/// 名称沿用协议校验（`[a-z0-9._-]{1,48}`），禁止通配符 `*`；超过
+/// [`MAX_ALLOWED_TASKS`] 报错。返回的错误文本可直接展示给用户。
+pub fn normalize_task_names<I, S>(names: I) -> Result<Vec<String>, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut set = BTreeSet::new();
+    for raw in names {
+        let name = raw.as_ref().trim();
+        if name.is_empty() {
+            return Err(String::from("Task 名称不能为空"));
+        }
+        if name.contains('*') {
+            return Err(format!("Task 名称禁止通配符 *：{name}"));
+        }
+        if let Err(message) = validate_name(name) {
+            return Err(format!("Task 名称非法（{message}）：{name}"));
+        }
+        set.insert(String::from(name));
+    }
+    if set.len() > MAX_ALLOWED_TASKS {
+        return Err(format!(
+            "Task 授权名单最多 {MAX_ALLOWED_TASKS} 项（当前 {} 项）",
+            set.len()
+        ));
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// 名称集合 → 展示文本（最多列 5 个，其余计数）。
+fn join_names(names: &BTreeSet<String>) -> String {
+    let shown: Vec<&str> = names.iter().take(5).map(String::as_str).collect();
+    let more = names.len() - shown.len();
+    if more > 0 {
+        format!("{} … 等 {} 项", shown.join("、"), names.len())
+    } else {
+        shown.join("、")
+    }
+}
+
 /// 服务端策略。
 #[derive(Debug, Clone, Default)]
 pub struct Policy {
     /// 允许写操作（gpio.config/gpio.write/pc.write/pc.exec）。
     pub allow_write: bool,
-    /// 允许 Task。
-    pub allow_tasks: bool,
+    /// Task 授权模式（默认拒绝；`--allow-task` 精确授权 / `--allow-tasks` 全开）。
+    pub tasks: TaskAccess,
     /// 允许管理工具与其他用户工具。
     pub allow_admin: bool,
     /// Worker过滤器：只允许操作该Worker。
     pub worker_filter: Option<String>,
     /// 内部位：拒绝嵌套 prompt 中继（`pc.ask`）。
     ///
-    /// 仅由 prompt 通道（ingress / serve `prompt` 方法）发起的 Agent 运行
-    /// 置位，防止递归派工；不出现在 CLI 旗标与 serve policy.get/policy.set
-    /// 的现有四键语义里（[`Policy::summary`] 在 true 时追加说明）。
+    /// 仅由 prompt 通道（ingress / serve `prompt` 方法 / 飞书）发起的 Agent
+    /// 运行置位，防止递归派工；不出现在 CLI 旗标与 serve policy.get/policy.set
+    /// 的现有键语义里（[`Policy::summary`] 在 true 时追加说明）。
     pub deny_llm_relay: bool,
 }
 
 impl Policy {
+    /// 是否全开 Task（兼容旧 `--allow-tasks` 语义与 serve `allow_tasks` 字段）。
+    pub fn allow_tasks(&self) -> bool {
+        self.tasks.is_all()
+    }
+
+    /// 设置 Task 全开/全关（旧布尔开关语义）。
+    pub fn set_allow_tasks(&mut self, allow: bool) {
+        self.tasks = if allow {
+            TaskAccess::All
+        } else {
+            TaskAccess::Deny
+        };
+    }
+
+    /// 用精确名单替换 Task 授权（空名单 → 拒绝全部）。
+    ///
+    /// 名称需已由 [`normalize_task_names`] 校验；本方法不做校验。
+    pub fn set_allowed_tasks<I, S>(&mut self, names: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tasks = TaskAccess::from_names(names);
+    }
+
     /// 策略摘要（prompt 与 CLI 输出共用）。
     pub fn summary(&self) -> String {
         let write = if self.allow_write { "允许" } else { "拒绝" };
-        let tasks = if self.allow_tasks { "允许" } else { "拒绝" };
+        let tasks = self.tasks.describe();
         let admin = if self.allow_admin { "允许" } else { "拒绝" };
         let filter = match &self.worker_filter {
             Some(worker_id) => format!("只允许操作Worker {worker_id}"),
@@ -256,7 +402,8 @@ impl std::fmt::Display for PolicyDenied {
             Self::WorkerFiltered(worker_id) => {
                 write!(f, "Worker {worker_id} 不在 --worker 过滤范围内")
             }
-            Self::Forbidden { what } => write!(f, "{what} 未授权（需要显式 CLI 开关）"),
+            // `what` 自带所需授权说明（各判定分支组装），不再追加通用后缀。
+            Self::Forbidden { what } => write!(f, "{what}"),
         }
     }
 }
@@ -481,31 +628,37 @@ pub fn check_policy(policy: &Policy, call: &ParsedCall) -> Result<(), PolicyDeni
     check_policy_for_worker(policy, call, None)
 }
 
-/// 带 Worker 能力快照的策略检查（D5 动态路由用）。
-///
-/// 分类优先级按**名字**（与最终线类型解耦）：
-/// 1. `deny_llm_relay` 下的 `pc.ask` 一律拒绝（防递归）；
-/// 2. 写工具（gpio.config/gpio.write/pc.write/pc.exec）→ `allow_write`；
-/// 3. Task 类（显式 worker_task / pc.ask / pc.job / Worker 通告的 task 名）
-///    → `allow_tasks`；
-/// 4. 只读工具 → 允许；
-/// 5. 其余用户工具 → `allow_admin`。
+/// 带 Worker 能力快照的策略检查。
 pub fn check_policy_for_worker(
     policy: &Policy,
     call: &ParsedCall,
     worker: Option<&WorkerInfo>,
 ) -> Result<(), PolicyDenied> {
-    if let Some(worker_id) = call.worker_id()
-        && let Some(filter) = &policy.worker_filter
+    authorize_worker_call(policy, call, worker).map(|_| ())
+}
+
+/// 用同一份 Worker 快照路由并鉴权。返回获准下发的线类型，或列表调用的 `None`。
+/// Worker 范围、嵌套 prompt 禁令及写权限优先于 Task 名单。
+pub fn authorize_worker_call(
+    policy: &Policy,
+    call: &ParsedCall,
+    worker: Option<&WorkerInfo>,
+) -> Result<Option<CommandKind>, PolicyDenied> {
+    let (worker_id, name, requested) = match call {
+        ParsedCall::ListWorkers => return Ok(None),
+        ParsedCall::WorkerTask {
+            worker_id, name, ..
+        } => (worker_id, name, CommandKind::Task),
+        ParsedCall::WorkerTool {
+            worker_id, name, ..
+        } => (worker_id, name, CommandKind::Tool),
+    };
+    if let Some(filter) = &policy.worker_filter
         && filter != worker_id
     {
-        return Err(PolicyDenied::WorkerFiltered(String::from(worker_id)));
+        return Err(PolicyDenied::WorkerFiltered(worker_id.clone()));
     }
-    let (name, is_task_function) = match call {
-        ParsedCall::ListWorkers => return Ok(()),
-        ParsedCall::WorkerTask { name, .. } => (name, true),
-        ParsedCall::WorkerTool { name, .. } => (name, false),
-    };
+    let kind = route_command_kind(worker, name, requested);
     // 嵌套 prompt 中继：即使其余策略全开也拒绝（防递归优先）。
     if policy.deny_llm_relay && name == NESTED_PROMPT_TOOL {
         return Err(PolicyDenied::Forbidden {
@@ -515,35 +668,43 @@ pub fn check_policy_for_worker(
     // pc.exec 等写操作：无论用 worker_tool 还是 worker_task 下发都按写分类。
     if is_write_tool(name) {
         return if policy.allow_write {
-            Ok(())
+            Ok(Some(kind))
         } else {
             Err(PolicyDenied::Forbidden {
-                what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
+                what: format!("写操作 {name} 未授权（需要 --allow-write）"),
             })
         };
     }
-    // Task 类：显式 worker_task、pc.ask/pc.job、或 Worker 通告的 task 名。
-    let task_like = is_task_function
-        || is_task_class_name(name)
-        || worker.map(|worker| worker.has_task(name)).unwrap_or(false);
-    if task_like {
-        return if policy.allow_tasks {
-            Ok(())
+    if kind == CommandKind::Task {
+        return if policy.tasks.allows(name) {
+            Ok(Some(kind))
         } else {
             Err(PolicyDenied::Forbidden {
-                what: format!("Task {name}"),
+                what: task_denied_message(&policy.tasks, name),
             })
         };
     }
-    if is_read_only_tool(name) {
-        return Ok(());
-    }
-    if policy.allow_admin {
-        Ok(())
+    if is_read_only_tool(name) || policy.allow_admin {
+        Ok(Some(kind))
     } else {
         Err(PolicyDenied::Forbidden {
-            what: format!("工具 {name}"),
+            what: format!("工具 {name} 未授权（需要 --allow-admin）"),
         })
+    }
+}
+
+/// Task 拒绝文本：说明需要的授权方式，便于模型与用户按提示申请。
+fn task_denied_message(tasks: &TaskAccess, name: &str) -> String {
+    match tasks {
+        TaskAccess::Deny => {
+            format!("Task {name} 未授权（需要 --allow-task {name} 或 --allow-tasks）")
+        }
+        TaskAccess::Only(names) => format!(
+            "Task {name} 未授权（当前只允许 {}；需要 --allow-task {name}）",
+            join_names(names)
+        ),
+        // 全开时上面已放行，不会走到这里；保留分支避免漏写。
+        TaskAccess::All => format!("Task {name} 未授权"),
     }
 }
 
@@ -731,6 +892,10 @@ pub fn worker_json(worker: &WorkerInfo) -> Json {
         ("worker_id", Json::string(worker.worker_id.as_str())),
         ("online", Json::Bool(worker.online)),
         ("boot_id", Json::num(saturating_i64(worker.boot_id))),
+        (
+            "boot_id_hex",
+            Json::string(format!("{:016x}", worker.boot_id)),
+        ),
         ("firmware", Json::string(worker.firmware.as_str())),
         ("uptime_ms", Json::num(saturating_i64(worker.uptime_ms))),
         ("unix_ms", Json::num(saturating_i64(worker.unix_ms))),
@@ -1064,7 +1229,7 @@ mod tests {
     fn policy_switches_unlock_capabilities() {
         let mut policy = policy();
         policy.allow_write = true;
-        policy.allow_tasks = true;
+        policy.set_allow_tasks(true);
         policy.allow_admin = true;
         for name in ["gpio.config", "gpio.write", "sekai.set_time", "echo"] {
             let call = ParsedCall::WorkerTool {
@@ -1135,7 +1300,7 @@ mod tests {
             assert_eq!(
                 check_policy(&policy, &call),
                 Err(PolicyDenied::Forbidden {
-                    what: format!("写操作 {name}（gpio.config/gpio.write/pc.write/pc.exec）"),
+                    what: format!("写操作 {name} 未授权（需要 --allow-write）"),
                 }),
                 "写工具 {name}"
             );
@@ -1166,7 +1331,9 @@ mod tests {
         assert_eq!(
             check_policy(&policy, &ask),
             Err(PolicyDenied::Forbidden {
-                what: String::from("Task pc.ask"),
+                what: String::from(
+                    "Task pc.ask 未授权（需要 --allow-task pc.ask 或 --allow-tasks）"
+                ),
             })
         );
         let mut admin = policy.clone();
@@ -1176,7 +1343,7 @@ mod tests {
             "allow_admin 不能绕过 allow_tasks"
         );
         let mut tasks = policy;
-        tasks.allow_tasks = true;
+        tasks.set_allow_tasks(true);
         assert!(check_policy(&tasks, &ask).is_ok());
     }
 
@@ -1186,7 +1353,7 @@ mod tests {
         // 仍被拒，其余工具不受影响。
         let mut policy = policy();
         policy.allow_write = true;
-        policy.allow_tasks = true;
+        policy.set_allow_tasks(true);
         policy.allow_admin = true;
         policy.deny_llm_relay = true;
         let tool = ParsedCall::WorkerTool {
@@ -1536,7 +1703,7 @@ mod tests {
         // 有快照：名字在 Worker tasks 列表 → Task 类，需要 allow_tasks。
         assert!(check_policy_for_worker(&admin, &echo_as_tool, Some(&worker)).is_err());
         let tasks = Policy {
-            allow_tasks: true,
+            tasks: TaskAccess::All,
             ..Policy::default()
         };
         assert!(check_policy_for_worker(&tasks, &echo_as_tool, Some(&worker)).is_ok());
@@ -1574,7 +1741,7 @@ mod tests {
             "admin 不能绕过 allow_tasks"
         );
         let tasks = Policy {
-            allow_tasks: true,
+            tasks: TaskAccess::All,
             ..Policy::default()
         };
         assert!(check_policy(&tasks, &call).is_ok());
@@ -1589,6 +1756,119 @@ mod tests {
             check_policy(&tasks, &exec_call).is_err(),
             "pc.exec 需要 allow_write"
         );
+    }
+
+    #[test]
+    fn task_access_only_grants_listed_names() {
+        let mut policy = Policy::default();
+        policy.set_allowed_tasks(vec!["echo", "pc.ask"]);
+        let worker = sample_worker("host-gpio", true);
+        for (name, allowed) in [
+            ("echo", true),
+            ("pc.ask", true),
+            ("pc.job", false),
+            ("sleep", false),
+        ] {
+            let call = ParsedCall::WorkerTool {
+                worker_id: String::from("host-gpio"),
+                name: String::from(name),
+                args: String::from("hi"),
+                ddl_ms: None,
+            };
+            assert_eq!(
+                check_policy_for_worker(&policy, &call, Some(&worker)).is_ok(),
+                allowed,
+                "task {name}"
+            );
+        }
+        // 显式 worker_task 与 Worker 通告的 task 名走同一份名单。
+        let echo = ParsedCall::WorkerTask {
+            worker_id: String::from("host-gpio"),
+            name: String::from("echo"),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert!(check_policy_for_worker(&policy, &echo, Some(&worker)).is_ok());
+        // allow_admin 不能绕过精确名单。
+        let mut admin = policy.clone();
+        admin.allow_admin = true;
+        let job = ParsedCall::WorkerTask {
+            worker_id: String::from("pc-1"),
+            name: String::from("pc.job"),
+            args: String::new(),
+            ddl_ms: None,
+        };
+        assert!(check_policy_for_worker(&admin, &job, None).is_err());
+        // pc.exec 属写类：即使出现在名单里也仍需 allow_write。
+        let mut with_exec = Policy::default();
+        with_exec.set_allowed_tasks(vec!["pc.exec"]);
+        let exec = ParsedCall::WorkerTool {
+            worker_id: String::from("pc-1"),
+            name: String::from("pc.exec"),
+            args: String::from("echo hi"),
+            ddl_ms: None,
+        };
+        assert!(
+            check_policy(&with_exec, &exec).is_err(),
+            "pc.exec 需要 allow_write"
+        );
+        with_exec.allow_write = true;
+        assert!(check_policy(&with_exec, &exec).is_ok());
+        // 拒绝文本说明需要哪种授权。
+        let denied = check_policy(&Policy::default(), &echo).unwrap_err();
+        assert!(denied.to_string().contains("--allow-task echo"), "{denied}");
+    }
+
+    #[test]
+    fn task_name_normalization_rejects_invalid_and_dedups() {
+        assert_eq!(
+            normalize_task_names(vec![" echo ", "echo", "pc.ask"]).unwrap(),
+            vec![String::from("echo"), String::from("pc.ask")]
+        );
+        assert!(
+            normalize_task_names(Vec::<String>::new())
+                .unwrap()
+                .is_empty()
+        );
+        for bad in ["", "   ", "*", "echo*", "ECHO", "bad name", "sekai.cancel!"] {
+            assert!(
+                normalize_task_names(vec![bad]).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        let too_many: Vec<String> = (0..MAX_ALLOWED_TASKS + 1)
+            .map(|index| format!("t{index}"))
+            .collect();
+        assert!(normalize_task_names(too_many).is_err());
+    }
+
+    #[test]
+    fn task_access_summary_covers_three_modes() {
+        let mut policy = Policy::default();
+        assert!(!policy.allow_tasks());
+        assert!(
+            policy.summary().contains("Task：拒绝"),
+            "{}",
+            policy.summary()
+        );
+        policy.set_allowed_tasks(vec!["echo"]);
+        assert!(!policy.allow_tasks());
+        assert_eq!(policy.tasks.names(), vec![String::from("echo")]);
+        assert!(
+            policy.summary().contains("Task：只允许 echo"),
+            "{}",
+            policy.summary()
+        );
+        policy.set_allow_tasks(true);
+        assert!(policy.allow_tasks());
+        assert!(policy.tasks.names().is_empty());
+        assert!(
+            policy.summary().contains("Task：允许（全开）"),
+            "{}",
+            policy.summary()
+        );
+        policy.set_allow_tasks(false);
+        assert_eq!(policy.tasks, TaskAccess::Deny);
     }
 
     #[test]

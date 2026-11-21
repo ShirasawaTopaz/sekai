@@ -34,7 +34,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::agent::{CancelToken, ConversationContext, ConversationTurn};
-use crate::config::{Config, FeishuConfig, LinkMode};
+use crate::config::{Config, FeishuConfig, FeishuTaskAdminConfig, LinkMode};
+use crate::feishu_task_policy::{Mutation, MutationResult};
 use crate::gateway::{GatewayHandle, WorkerGateway};
 use crate::http::{HttpClient, HttpRequest, ReadWrite, StdHttpClient, connect_tls_stream};
 use crate::json::Json;
@@ -128,6 +129,8 @@ pub struct FeishuOptions {
     pub allow_users: Vec<String>,
     /// 允许的会话 id（chat_id；空 = 全拒）。
     pub allow_chats: Vec<String>,
+    /// 可选的飞书动态 Task 管理配置。
+    pub task_admin: Option<FeishuTaskAdminConfig>,
     /// 收到消息先回「正在处理」。
     pub ack: bool,
     /// 每消息 agent 步数上限（None = 随全局）。
@@ -148,6 +151,7 @@ impl std::fmt::Debug for FeishuOptions {
             .field("domain", &self.domain)
             .field("allow_users", &self.allow_users)
             .field("allow_chats", &self.allow_chats)
+            .field("task_admin_configured", &self.task_admin.is_some())
             .field("ack", &self.ack)
             .field("max_steps", &self.max_steps)
             .field("context_turns", &self.context_turns)
@@ -167,6 +171,7 @@ impl FeishuOptions {
             domain: feishu.domain.trim_end_matches('/').to_string(),
             allow_users: feishu.allow_users.clone(),
             allow_chats: feishu.allow_chats.clone(),
+            task_admin: feishu.task_admin.clone(),
             ack: feishu.ack,
             max_steps: feishu.max_steps,
             context_turns: feishu.context_turns,
@@ -191,6 +196,17 @@ pub fn run<C: ChatClient + Clone + Send + 'static>(
     options: FeishuOptions,
     stop: Arc<AtomicBool>,
 ) -> i32 {
+    run_with_ingress(core, gateway, options, stop, |_| {})
+}
+
+/// 启动飞书入口；加载持久化 Task 策略后才经回调启动同进程的 TCP ingress。
+pub fn run_with_ingress<C: ChatClient + Clone + Send + 'static>(
+    core: Arc<PromptCore<C>>,
+    gateway: GatewayHandle,
+    options: FeishuOptions,
+    stop: Arc<AtomicBool>,
+    start_ingress: impl FnOnce(Arc<PromptCore<C>>),
+) -> i32 {
     eprintln!(
         "sekai-router: 飞书入口 domain={} allow_users={} allow_chats={}",
         options.domain,
@@ -209,6 +225,13 @@ pub fn run<C: ChatClient + Clone + Send + 'static>(
         );
         return 4;
     }
+
+    if let Some(admin) = &options.task_admin
+        && let Err(error) = core.load_feishu_tasks(&admin.policy_file, &options.app_id)
+    {
+        eprintln!("sekai-router: 警告：飞书动态 Task 授权已停用：{error}");
+    }
+    start_ingress(Arc::clone(&core));
 
     let rest = Arc::new(RestClient::new(&options));
     let chat_runs: Arc<Mutex<HashMap<String, CancelToken>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -783,7 +806,7 @@ impl FragmentSet {
 enum RestError {
     /// 网络层失败（连接/超时/读写）。
     Network(String),
-    /// 非 2xx 状态（已重试 429/5xx）。
+    /// 非 2xx 状态。
     Http { status: u16 },
     /// 飞书业务错误码。
     Api { code: i64, message: String },
@@ -802,17 +825,24 @@ impl std::fmt::Display for RestError {
     }
 }
 
-/// token 缓存（内存，不落盘；`expire_in - 300s` 前视为过期）。
-#[derive(Debug, Clone)]
+/// token 缓存（内存，不落盘；短 token 不超过服务端声明的有效期）。
+#[derive(Clone)]
 struct TokenCache {
     value: String,
     expires_at: Instant,
 }
 
+impl TokenCache {
+    fn ttl(expire: u64) -> Duration {
+        // 长 token 提前 300s 更新；短 token 提前约 10%，不人为延长寿命。
+        Duration::from_secs(expire.saturating_sub(300.min(expire.div_ceil(10))))
+    }
+}
+
 /// 飞书 REST 客户端（endpoint/token/发送/回复）。
 ///
-/// `Mutex<StdHttpClient>`：REST 调用串行（消息频率低，串行足够且省去连接
-/// 池）；token 缓存独立加锁，刷新时不持有 HTTP 锁。
+/// HTTP 请求串行；刷新持有 token 锁直到结束，锁顺序统一为 token → HTTP。
+/// 普通 API 请求拿到 token 后释放缓存锁，再获取 HTTP 锁。
 struct RestClient {
     http: Mutex<StdHttpClient>,
     domain: String,
@@ -864,19 +894,22 @@ impl RestClient {
             Err(crate::http::HttpError::Timeout) => {
                 Err(RestError::Network(String::from("请求超时")))
             }
-            Err(error) => Err(RestError::Network(error.to_string())),
+            // 传输错误可携带 URL/query 或 helper 输出，不能向调用方透传。
+            Err(_) => Err(RestError::Network(String::from("连接或读写失败"))),
         }
     }
-    /// 取 tenant_access_token（`force` 时强制刷新，§4.1）。
-    fn token(&self, force: bool) -> Result<String, RestError> {
-        if !force {
-            let cache = self.token.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(cache) = cache.as_ref()
-                && Instant::now() < cache.expires_at
-            {
-                return Ok(cache.value.clone());
-            }
+    /// 取 tenant_access_token；被拒 token 仅由一个线程刷新，其他线程复用新值。
+    fn token(&self, rejected: Option<&str>) -> Result<String, RestError> {
+        let mut cache = self.token.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(cached) = cache.as_ref()
+            && Instant::now() < cached.expires_at
+            && rejected != Some(cached.value.as_str())
+        {
+            return Ok(cached.value.clone());
         }
+        // 刷新失败后不得继续复用已失效 token。
+        let previous = cache.take();
+        let started = Instant::now();
         let url = format!(
             "{}/open-apis/auth/v3/tenant_access_token/internal",
             self.domain
@@ -891,7 +924,7 @@ impl RestClient {
             String::from("application/json"),
         )];
         let (status, text) = self.http_post(&url, &headers, body.as_bytes())?;
-        if status != 200 {
+        if !(200..300).contains(&status) {
             return Err(RestError::Http { status });
         }
         let json = Json::parse(&text)
@@ -903,7 +936,20 @@ impl RestClient {
         if code != 0 {
             return Err(RestError::Api {
                 code,
-                message: api_message(&json),
+                message: api_message_redacted(
+                    &json,
+                    &[
+                        &self.app_secret,
+                        previous
+                            .as_ref()
+                            .map(|cache| cache.value.as_str())
+                            .unwrap_or_default(),
+                        rejected.unwrap_or_default(),
+                        json.get("tenant_access_token")
+                            .and_then(Json::as_str)
+                            .unwrap_or_default(),
+                    ],
+                ),
             });
         }
         let value = json
@@ -912,91 +958,118 @@ impl RestClient {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| RestError::Protocol(String::from("token 响应缺少 tenant_access_token")))?
             .to_string();
-        let expire_in = json
-            .get("expire_in")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(7_200);
-        // 提前 300s 过期，且至少缓存 60s（防止异常小值导致每次请求都刷新）。
-        let ttl = Duration::from_secs(expire_in.saturating_sub(300).max(60));
-        let mut cache = self.token.lock().unwrap_or_else(|p| p.into_inner());
+        let expire = json
+            .get("expire")
+            .or_else(|| json.get("expire_in"))
+            .and_then(Json::as_u64)
+            .ok_or_else(|| RestError::Protocol(String::from("token 响应缺少有效 expire")))?;
+        let expires_at = started
+            .checked_add(TokenCache::ttl(expire))
+            .ok_or_else(|| RestError::Protocol(String::from("token 有效期超出范围")))?;
         *cache = Some(TokenCache {
             value: value.clone(),
-            expires_at: Instant::now() + ttl,
+            expires_at,
         });
         Ok(value)
     }
 
-    /// 带鉴权的 API 调用：429/5xx 指数退避重试（1s、2s）各一次；token 失效
-    /// 强制刷新后重试一次；其余 4xx 不重试。
+    /// IM 保留原有瞬态失败重试；鉴权失败只刷新一次且传播刷新错误。
     fn api_call(&self, method: &str, path: &str, body: &Json) -> Result<Json, RestError> {
+        self.execute_api(method, path, body, true)
+    }
+
+    /// 工具写请求遇到结果不确定的失败时不重发，避免重复创建日程。
+    /// 仅明确的 token 失效允许刷新并重发一次；GET 与 IM 最多退避重试两次。
+    fn execute_api(
+        &self,
+        method: &str,
+        path: &str,
+        body: &Json,
+        im_retry: bool,
+    ) -> Result<Json, RestError> {
+        let method = method.to_ascii_uppercase();
+        let retry_transient = im_retry || method == "GET";
         let url = format!("{}{}", self.domain, path);
-        let payload = body.to_compact_string();
-        let mut last_error = RestError::Network(String::from("请求失败"));
+        let payload = if method == "GET" || method == "DELETE" {
+            String::new()
+        } else {
+            body.to_compact_string()
+        };
+        let mut token = self.token(None)?;
         let mut refreshed = false;
-        let mut attempt = 0u32;
+        let mut retries = 0u64;
         loop {
-            attempt += 1;
-            if attempt > 3 {
-                return Err(last_error);
-            }
-            if attempt > 1 {
-                thread::sleep(Duration::from_secs(u64::from(attempt - 1)));
-            }
-            let token = match self.token(false) {
-                Ok(token) => token,
-                Err(error) => {
-                    last_error = error;
-                    continue;
-                }
-            };
-            let headers = vec![
-                (
+            let mut headers = vec![(String::from("Authorization"), format!("Bearer {token}"))];
+            if !payload.is_empty() {
+                headers.push((
                     String::from("Content-Type"),
                     String::from("application/json"),
-                ),
-                (String::from("Authorization"), format!("Bearer {token}")),
-            ];
-            match self.http_send(method, &url, &headers, payload.as_bytes()) {
-                Ok((200, text)) => {
-                    let json = match Json::parse(&text) {
-                        Ok(json) => json,
-                        Err(_) => {
-                            last_error = RestError::Protocol(String::from("响应不是合法 JSON"));
-                            continue;
-                        }
-                    };
-                    let code = json
-                        .get("code")
-                        .and_then(|value| value.as_i64())
-                        .unwrap_or(-1);
-                    if code == 0 {
-                        return Ok(json);
+                ));
+            }
+            let error = match self.http_send(&method, &url, &headers, payload.as_bytes()) {
+                Ok((status, text)) if (200..300).contains(&status) => {
+                    let json = Json::parse(&text)
+                        .map_err(|_| RestError::Protocol(String::from("响应不是合法 JSON")));
+                    match json {
+                        Ok(json) => match json.get("code").and_then(Json::as_i64) {
+                            Some(0) => return Ok(json),
+                            Some(code) if TOKEN_INVALID_CODES.contains(&code) && !refreshed => {
+                                refreshed = true;
+                                token = self.token(Some(&token))?;
+                                continue;
+                            }
+                            Some(code) => {
+                                return Err(RestError::Api {
+                                    code,
+                                    message: api_message_redacted(
+                                        &json,
+                                        &[
+                                            &self.app_secret,
+                                            &token,
+                                            self.token
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner())
+                                                .as_ref()
+                                                .map(|cache| cache.value.as_str())
+                                                .unwrap_or_default(),
+                                        ],
+                                    ),
+                                });
+                            }
+                            None => RestError::Protocol(String::from("响应缺少有效 code")),
+                        },
+                        Err(error) => error,
                     }
-                    if TOKEN_INVALID_CODES.contains(&code) && !refreshed {
-                        refreshed = true;
-                        let _ = self.token(true);
-                        continue;
-                    }
-                    return Err(RestError::Api {
-                        code,
-                        message: api_message(&json),
-                    });
-                }
-                Ok((status, _)) if status == 429 || (500..=599).contains(&status) => {
-                    last_error = RestError::Http { status };
-                    continue;
                 }
                 Ok((401, _)) if !refreshed => {
                     refreshed = true;
-                    let _ = self.token(true);
+                    token = self.token(Some(&token))?;
                     continue;
                 }
-                Ok((status, _)) => return Err(RestError::Http { status }),
-                Err(error) => {
-                    last_error = error;
-                    continue;
+                Ok((status, _)) if status == 429 || (500..=599).contains(&status) => {
+                    RestError::Http { status }
                 }
+                Ok((status, text)) => {
+                    // 飞书权限错误通常使用 HTTP 400/403；保留业务码便于定位，
+                    // 同时不把响应里回显的凭据交给模型或日志。
+                    if let Ok(json) = Json::parse(&text)
+                        && let Some(code) = json.get("code").and_then(Json::as_i64)
+                        && code != 0
+                    {
+                        return Err(RestError::Api {
+                            code,
+                            message: api_message_redacted(&json, &[&self.app_secret, &token]),
+                        });
+                    }
+                    return Err(RestError::Http { status });
+                }
+                Err(error) => error,
+            };
+            if !retry_transient || retries == 2 {
+                return Err(error);
             }
+            retries += 1;
+            thread::sleep(Duration::from_secs(retries));
         }
     }
 
@@ -1033,7 +1106,18 @@ impl RestClient {
             other => {
                 return Err(EndpointError::Fatal(format!(
                     "code={other}：{}",
-                    api_message(&json)
+                    api_message_redacted(
+                        &json,
+                        &[
+                            &self.app_secret,
+                            self.token
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .as_ref()
+                                .map(|cache| cache.value.as_str())
+                                .unwrap_or_default(),
+                        ]
+                    )
                 )));
             }
         }
@@ -1094,19 +1178,42 @@ impl RestClient {
     }
 }
 
+impl crate::feishu_api::FeishuApi for RestClient {
+    fn request(&self, method: &str, path: &str, body: &Json) -> Result<Json, String> {
+        self.execute_api(method, path, body, false)
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// `content` 字段是 JSON 字符串（二次编码，§5.1）。
 fn text_content(text: &str) -> String {
     Json::object(vec![("text", Json::string(text))]).to_compact_string()
 }
 
-/// 飞书错误响应的 `msg` 文本（截断到 200 字符，不含凭据）。
+/// 飞书错误响应的 `msg` 文本（截断到 200 字符）。
+#[cfg(test)]
 fn api_message(json: &Json) -> String {
-    json.get("msg")
-        .and_then(|value| value.as_str())
+    api_message_redacted(json, &[])
+}
+
+/// 先替换完整凭据再截断，防止截断暴露凭据前缀。
+fn api_message_redacted(json: &Json, secrets: &[&str]) -> String {
+    let mut message = json
+        .get("msg")
+        .and_then(Json::as_str)
         .unwrap_or_default()
-        .chars()
-        .take(200)
-        .collect()
+        .to_string();
+    // 优先较长凭据，避免一个凭据是另一个的子串时残留后缀。
+    let mut secrets: Vec<_> = secrets
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+    for secret in secrets {
+        message = message.replace(secret, "<redacted>");
+    }
+    message.chars().take(200).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1231,11 @@ struct FeishuEvent {
     chat_id: String,
     /// `p2p` / `group`。
     chat_type: String,
+    /// Only an explicitly supplied `p2p` is trusted for administration.
+    explicit_p2p: bool,
+    app_id: Option<String>,
+    sender_type: Option<String>,
+    sender_open_id: Option<String>,
     /// 消息 id（回复锚点）。
     message_id: String,
     /// 消息所属话题 id（非话题消息为空）。
@@ -1163,8 +1275,16 @@ impl FeishuEvent {
                 let fallback = message_id.clone();
                 (!fallback.is_empty()).then_some(fallback)
             })?;
-        let chat_type =
-            json_string(message.get("chat_type")).unwrap_or_else(|| String::from("p2p"));
+        let chat_type = json_string(message.get("chat_type"));
+        let explicit_p2p = chat_type.as_deref() == Some("p2p");
+        let app_id = json_string(header.get("app_id"));
+        let sender = event.get("sender");
+        let sender_type = json_string(sender.and_then(|s| s.get("sender_type")));
+        let sender_open_id = json_optional_string(
+            sender
+                .and_then(|s| s.get("sender_id"))
+                .and_then(|id| id.get("open_id")),
+        );
         let thread_id = json_optional_string(message.get("thread_id"));
         let root_id = json_optional_string(message.get("root_id"));
         let parent_id = json_optional_string(message.get("parent_id"));
@@ -1207,7 +1327,11 @@ impl FeishuEvent {
             event_id,
             event_type,
             chat_id,
-            chat_type,
+            chat_type: chat_type.unwrap_or_else(|| String::from("p2p")),
+            explicit_p2p,
+            app_id,
+            sender_type,
+            sender_open_id,
             message_id,
             thread_id,
             root_id,
@@ -1254,6 +1378,19 @@ impl FeishuEvent {
             || options.allow_chats.iter().any(|id| id == &self.chat_id)
     }
 
+    /// 管理权限独立于普通 allowlist，仅承认真实事件字段。
+    fn task_admin(&self, options: &FeishuOptions) -> bool {
+        self.explicit_p2p
+            && self.app_id.as_deref() == Some(options.app_id.as_str())
+            && self.sender_type.as_deref() == Some("user")
+            && self.sender_open_id.as_ref().is_some_and(|open_id| {
+                options
+                    .task_admin
+                    .as_ref()
+                    .is_some_and(|admin| admin.open_ids.contains(open_id))
+            })
+    }
+
     /// 群聊是否 @ 了本机器人：收到 `group_at_msg` 事件即说明是，静态可见
     /// 的判据是 `mentions` 非空（未 @ 的群消息不触发）。
     fn triggered(&self) -> bool {
@@ -1272,6 +1409,7 @@ enum Command {
     Cancel,
     /// `/status`：一行状态。
     Status,
+    Task,
     /// 未知 `/` 命令：回可用命令清单。
     Unknown,
 }
@@ -1283,6 +1421,7 @@ fn command_of(text: &str) -> Option<Command> {
     Some(match name {
         "cancel" => Command::Cancel,
         "status" => Command::Status,
+        "task" => Command::Task,
         _ => Command::Unknown,
     })
 }
@@ -1629,6 +1768,7 @@ impl<C: ChatClient + Clone + Send + 'static> Dispatcher<C> {
                 let text = self.status_text(&event.chat_id);
                 ("status", self.notify(event, &text))
             }
+            Command::Task => return self.handle_task_command(event, started),
             Command::Unknown => ("-", self.notify(event, COMMANDS_TEXT)),
         };
         audit_line(
@@ -1639,6 +1779,118 @@ impl<C: ChatClient + Clone + Send + 'static> Dispatcher<C> {
             if ok { "ok" } else { "reply_failed" },
             started,
         );
+    }
+
+    /// `/task` enters neither the Agent nor the conversation history.
+    fn handle_task_command(&self, event: &FeishuEvent, started: Instant) {
+        let mut fields = event.text.split_whitespace();
+        let _ = fields.next();
+        let operation = fields.next();
+        let name = fields.next();
+        let extra = fields.next();
+        let audit_command = match operation {
+            Some("list") => "task.list",
+            Some("grant") => "task.grant",
+            Some("revoke") => "task.revoke",
+            _ => "task",
+        };
+        let (text, outcome) = if self.options.task_admin.is_none() {
+            (String::from("飞书动态 Task 管理未启用"), "disabled")
+        } else if !event.task_admin(&self.options) {
+            (String::from("未授权：/task 仅限管理员私聊"), "denied")
+        } else {
+            match (operation, name, extra) {
+                (Some("list"), None, None) => match self.core.feishu_task_list() {
+                    Some((base, dynamic)) => (task_list_text(&base, &dynamic), "ok"),
+                    None => (String::from("飞书动态 Task 管理未启用"), "disabled"),
+                },
+                (Some(op @ ("grant" | "revoke")), Some(name), None) => {
+                    self.apply_task_command(event, op, name)
+                }
+                _ => (
+                    String::from("用法：/task grant NAME、/task revoke NAME、/task list"),
+                    "invalid",
+                ),
+            }
+        };
+        let outcome = if self.notify(event, &text) {
+            String::from(outcome)
+        } else {
+            format!("{outcome}:reply_failed")
+        };
+        let task = name.filter(|name| {
+            matches!(operation, Some("grant" | "revoke"))
+                && extra.is_none()
+                && event.task_admin(&self.options)
+                && crate::tools::normalize_task_names([*name]).is_ok()
+        });
+        let audit_command = match task {
+            Some(task) => format!("{audit_command} task={task}"),
+            None => audit_command.to_string(),
+        };
+        audit_line(
+            &event.chat_id,
+            &event.sender,
+            &audit_command,
+            event.text.len(),
+            &outcome,
+            started,
+        );
+    }
+
+    fn apply_task_command(
+        &self,
+        event: &FeishuEvent,
+        operation: &str,
+        name: &str,
+    ) -> (String, &'static str) {
+        if crate::tools::normalize_task_names([name]).is_err() {
+            return (
+                String::from("Task 名称须为 1..=48 字节的小写字母、数字或 ._-"),
+                "invalid",
+            );
+        }
+        let mutation = if operation == "grant" {
+            Mutation::Grant(name)
+        } else {
+            Mutation::Revoke(name)
+        };
+        match self.core.mutate_feishu_tasks(&event.message_id, mutation) {
+            Ok(Some(MutationResult::Changed)) => match mutation {
+                Mutation::Grant(_) => (format!("已添加动态 Task 授权：{name}"), "changed"),
+                Mutation::Revoke(_) => {
+                    let suffix = if self.core.policy().tasks.allows(name) {
+                        "（启动授权仍有效）"
+                    } else {
+                        ""
+                    };
+                    (format!("已撤销动态 Task 授权：{name}{suffix}"), "changed")
+                }
+            },
+            Ok(Some(MutationResult::Unchanged)) => {
+                let suffix = if operation == "revoke" && self.core.policy().tasks.allows(name) {
+                    "（启动授权仍有效）"
+                } else {
+                    ""
+                };
+                (format!("动态 Task 授权未变更：{name}{suffix}"), "unchanged")
+            }
+            Ok(Some(MutationResult::Duplicate)) => {
+                (String::from("此 Task 管理消息已处理"), "duplicate")
+            }
+            Ok(Some(MutationResult::Limit)) => (
+                format!("Task 授权名单最多 {} 项", crate::tools::MAX_ALLOWED_TASKS),
+                "limit",
+            ),
+            Ok(Some(MutationResult::InvalidMessageId)) => {
+                (String::from("缺少有效消息 ID，未修改 Task 授权"), "invalid")
+            }
+            Ok(None) => (String::from("飞书动态 Task 管理未启用"), "disabled"),
+            Err(error) => {
+                eprintln!("sekai-router: 飞书动态 Task 策略保存失败：{error}");
+                (String::from("Task 授权保存失败，策略未变更"), "save_failed")
+            }
+        }
     }
 
     /// `/status` 一行状态：链路类型与连接态、在线 Worker（前 5）、本会话
@@ -1726,7 +1978,8 @@ impl<C: ChatClient + Clone + Send + 'static> Dispatcher<C> {
             .name(String::from("sekai-feishu-run"))
             .spawn(move || {
                 let task_started = Instant::now();
-                let result = core.run_prompt_with_context(&prompt, max_steps, cancel, context);
+                let tools = Arc::new(crate::feishu_api::FeishuTools::new(rest.clone()));
+                let result = core.run_feishu_prompt(&prompt, max_steps, cancel, context, tools);
                 let record_turn = result.is_ok();
                 let (text, outcome_label) = reply_for(result);
                 let text = truncate_reply(&text);
@@ -1763,6 +2016,36 @@ impl<C: ChatClient + Clone + Send + 'static> Dispatcher<C> {
             );
         }
     }
+}
+
+fn task_list_text(base: &crate::tools::TaskAccess, dynamic: &[String]) -> String {
+    let startup: std::collections::BTreeSet<_> = base.names().into_iter().collect();
+    let dynamic: std::collections::BTreeSet<_> = dynamic.iter().cloned().collect();
+    let startup_label = if base.is_all() {
+        "全开"
+    } else if startup.is_empty() {
+        "拒绝"
+    } else {
+        "精确名单"
+    };
+    // Each exact name is printed once to keep all 64 entries within the IM reply cap.
+    let entries: Vec<_> = startup
+        .union(&dynamic)
+        .map(|name| {
+            let source = match (startup.contains(name), dynamic.contains(name)) {
+                (true, true) => "S+D",
+                (true, false) => "S",
+                _ => "D",
+            };
+            format!("{name} [{source}]")
+        })
+        .collect();
+    let exact = if entries.is_empty() {
+        String::from("（空）")
+    } else {
+        entries.join("\n")
+    };
+    format!("Task 启动策略：{startup_label}（S = 启动，D = 动态）\n{exact}")
 }
 
 /// 审计行（stderr，每消息一行；不记内容，§6.5）。
@@ -1867,6 +2150,7 @@ mod tests {
             domain: String::from("https://open.feishu.cn"),
             allow_users: Vec::new(),
             allow_chats: Vec::new(),
+            task_admin: None,
             ack: true,
             max_steps: None,
             context_turns: 8,
@@ -1892,6 +2176,82 @@ mod tests {
         let rendered = format!("{options:?}");
         assert!(!rendered.contains("s3cr3t-value"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    #[test]
+    #[ignore = "needs a real Feishu app and an explicitly selected writable test calendar"]
+    fn real_feishu_calendar_round_trip() {
+        assert_eq!(std::env::var("SEKAI_REAL_FEISHU").as_deref(), Ok("1"));
+        let calendar = std::env::var("SEKAI_FEISHU_TEST_CALENDAR_ID")
+            .expect("SEKAI_FEISHU_TEST_CALENDAR_ID must name a writable test calendar");
+        let mut options = options();
+        options.app_id = std::env::var("SEKAI_FEISHU_APP_ID").expect("missing Feishu App ID");
+        options.app_secret =
+            std::env::var("SEKAI_FEISHU_APP_SECRET").expect("missing Feishu App Secret");
+        let tools =
+            crate::feishu_api::FeishuTools::new(std::sync::Arc::new(RestClient::new(&options)));
+        let call =
+            |name: &str, args: Json, write| tools.execute(name, &args.to_compact_string(), write);
+        let assert_ok = |name: &str, result: Json| {
+            assert_eq!(
+                result.get("ok"),
+                Some(&Json::Bool(true)),
+                "{name}: {result}"
+            );
+        };
+        assert_ok(
+            "calendar_list",
+            call("feishu_calendar_list", crate::json!({}), false),
+        );
+        assert_ok(
+            "event_list",
+            call(
+                "feishu_event_list",
+                crate::json!({"calendar_id": calendar.as_str()}),
+                false,
+            ),
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let start = (now.as_secs() + 3600).to_string();
+        let end = (now.as_secs() + 3900).to_string();
+        let key = format!("sekai-smoke-{:032x}", now.as_nanos());
+        let created = call(
+            "feishu_event_create",
+            crate::json!({
+                "calendar_id": calendar.as_str(),
+                "summary": "Sekai calendar smoke test",
+                "start_time": crate::json!({ "timestamp": start.as_str() }),
+                "end_time": crate::json!({ "timestamp": end.as_str() }),
+                "idempotency_key": key.as_str()
+            }),
+            true,
+        );
+        let event_id = created
+            .get_path(&["data", "event", "event_id"])
+            .and_then(Json::as_str)
+            .unwrap_or_else(|| panic!("event_create: {created}"));
+        let mut event = crate::json!({"calendar_id": calendar.as_str(), "event_id": event_id});
+        let original = call("feishu_event_get", event.clone(), false);
+        let mut update = event.clone();
+        let summary = "Sekai calendar smoke test (updated)";
+        update.set("summary", Json::string(summary));
+        let updated = call("feishu_event_update", update, true);
+        let fetched = call("feishu_event_get", event.clone(), false);
+        event.set("need_notification", Json::Bool(false));
+        // Attempt cleanup before asserting the read and update results.
+        let deleted = call("feishu_event_delete", event, true);
+        assert_ok(&format!("event_delete ({event_id})"), deleted);
+        assert_ok("event_get (created)", original);
+        assert_ok("event_update", updated);
+        assert_eq!(
+            fetched
+                .get_path(&["data", "event", "summary"])
+                .and_then(Json::as_str),
+            Some(summary),
+            "event_get (updated): {fetched}"
+        );
     }
 
     #[test]
@@ -2304,15 +2664,6 @@ mod tests {
     }
 
     #[test]
-    fn token_cache_ttl_minimum() {
-        // expire_in 小于 300s 时至少缓存 60s（防止异常值导致每请求刷新）。
-        let ttl = Duration::from_secs(100u64.saturating_sub(300).max(60));
-        assert_eq!(ttl, Duration::from_secs(60));
-        let ttl = Duration::from_secs(7200u64.saturating_sub(300).max(60));
-        assert_eq!(ttl, Duration::from_secs(6900));
-    }
-
-    #[test]
     fn reconnect_exhaustion() {
         let mut info = EndpointInfo {
             reconnect_count: -1,
@@ -2337,5 +2688,521 @@ mod tests {
         let json = Json::object(vec![("msg", Json::string("x".repeat(500)))]);
         assert_eq!(api_message(&json).chars().count(), 200);
         assert_eq!(api_message(&Json::Null), "");
+    }
+}
+
+#[cfg(test)]
+mod rest_tests {
+    use super::*;
+    use crate::feishu_api::FeishuApi;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Barrier;
+
+    const TOKEN_PATH: &str = "/open-apis/auth/v3/tenant_access_token/internal";
+    const CALENDAR_PATH: &str = "/open-apis/calendar/v4/calendars/test/events";
+    const SECRET: &str = "test-app-secret";
+
+    #[derive(Clone, Debug)]
+    struct Request {
+        method: String,
+        path: String,
+        headers: String,
+        body: Vec<u8>,
+    }
+
+    enum Response {
+        Json(u16, String),
+        Disconnect,
+    }
+
+    fn response(status: u16, text: &str) -> Response {
+        Response::Json(status, text.to_string())
+    }
+
+    fn token_response(value: &str, expire: u64) -> Response {
+        response(
+            200,
+            &format!(r#"{{"code":0,"tenant_access_token":"{value}","expire":{expire}}}"#),
+        )
+    }
+
+    struct Server {
+        domain: String,
+        requests: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Server {
+        fn new(mut handler: impl FnMut(&Request) -> Response + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let domain = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let recorded = Arc::clone(&requests);
+            let stopped = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    let (mut stream, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                            continue;
+                        }
+                        Err(error) => panic!("mock accept: {error}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let header_end = loop {
+                        let mut buffer = [0; 1024];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert_ne!(n, 0, "request ended before headers");
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                        assert!(bytes.len() < 64 * 1024);
+                    };
+                    let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(key, _)| key.eq_ignore_ascii_case("Content-Length"))
+                        .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                        .unwrap_or(0);
+                    while bytes.len() < header_end + content_length {
+                        let mut buffer = [0; 1024];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert_ne!(n, 0, "request ended before body");
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    let mut first = headers.lines().next().unwrap().split_whitespace();
+                    let request = Request {
+                        method: first.next().unwrap().to_string(),
+                        path: first.next().unwrap().to_string(),
+                        headers,
+                        body: bytes[header_end..header_end + content_length].to_vec(),
+                    };
+                    recorded.lock().unwrap().push(request.clone());
+                    if let Response::Json(status, body) = handler(&request) {
+                        write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    }
+                }
+            });
+            Self {
+                domain,
+                requests,
+                stop,
+                worker: Some(worker),
+            }
+        }
+
+        fn client(&self) -> RestClient {
+            RestClient {
+                http: Mutex::new(StdHttpClient::new()),
+                domain: self.domain.clone(),
+                app_id: "test-app-id".to_string(),
+                app_secret: SECRET.to_string(),
+                token: Mutex::new(None),
+                timeout: Duration::from_secs(2),
+            }
+        }
+
+        fn count(&self, path: &str) -> usize {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.path == path)
+                .count()
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap();
+        }
+    }
+
+    #[test]
+    fn token_reuse_and_official_expire_precedence() {
+        let server = Server::new(|request| {
+            if request.path == TOKEN_PATH {
+                response(
+                    201,
+                    r#"{"code":0,"tenant_access_token":"token-one","expire":7200,"expire_in":0}"#,
+                )
+            } else {
+                response(201, r#"{"code":0,"data":{}}"#)
+            }
+        });
+        let client = server.client();
+        for _ in 0..2 {
+            client.request("GET", CALENDAR_PATH, &Json::Null).unwrap();
+        }
+        assert_eq!(server.count(TOKEN_PATH), 1);
+        assert_eq!(server.count(CALENDAR_PATH), 2);
+    }
+
+    #[test]
+    fn concurrent_token_refresh_is_single_flight() {
+        let server = Server::new(|request| {
+            if request.path == TOKEN_PATH {
+                thread::sleep(Duration::from_millis(30));
+                token_response("shared-token", 7200)
+            } else {
+                response(200, r#"{"code":0}"#)
+            }
+        });
+        let client = Arc::new(server.client());
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    client.request("GET", CALENDAR_PATH, &Json::Null).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(server.count(TOKEN_PATH), 1);
+        assert_eq!(server.count(CALENDAR_PATH), 8);
+    }
+
+    #[test]
+    fn concurrent_rejected_token_refresh_is_single_flight() {
+        let server = Server::new(|_| {
+            thread::sleep(Duration::from_millis(30));
+            token_response("replacement-token", 7200)
+        });
+        let client = Arc::new(server.client());
+        *client.token.lock().unwrap() = Some(TokenCache {
+            value: "rejected-token".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(7200),
+        });
+        let barrier = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    assert_eq!(
+                        client.token(Some("rejected-token")).unwrap(),
+                        "replacement-token"
+                    );
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(server.count(TOKEN_PATH), 1);
+    }
+
+    #[test]
+    fn token_ttl_boundaries_never_extend_server_lifetime() {
+        for expire in [0, 1, 2, 59, 60, 299, 300, 301, 7200, u64::MAX] {
+            assert!(TokenCache::ttl(expire) <= Duration::from_secs(expire));
+        }
+        assert_eq!(TokenCache::ttl(0), Duration::ZERO);
+        assert_eq!(TokenCache::ttl(1), Duration::ZERO);
+        assert_eq!(TokenCache::ttl(2), Duration::from_secs(1));
+        assert_eq!(TokenCache::ttl(300), Duration::from_secs(270));
+        assert_eq!(TokenCache::ttl(7200), Duration::from_secs(6900));
+    }
+
+    #[test]
+    fn short_token_expires_and_legacy_expire_in_is_supported() {
+        let server = Server::new(|request| {
+            if request.path == TOKEN_PATH {
+                response(
+                    200,
+                    r#"{"code":0,"tenant_access_token":"short-token","expire_in":2}"#,
+                )
+            } else {
+                response(200, r#"{"code":0}"#)
+            }
+        });
+        let client = server.client();
+        let started = Instant::now();
+        client.request("GET", CALENDAR_PATH, &Json::Null).unwrap();
+        let expires_at = client.token.lock().unwrap().as_ref().unwrap().expires_at;
+        assert!(expires_at <= started + Duration::from_secs(2));
+        thread::sleep(Duration::from_millis(2050));
+        client.request("GET", CALENDAR_PATH, &Json::Null).unwrap();
+        assert_eq!(server.count(TOKEN_PATH), 2);
+    }
+
+    #[test]
+    fn calendar_writes_never_retry_uncertain_results() {
+        for method in ["POST", "PATCH", "DELETE"] {
+            for failure in 0..4 {
+                let server = Server::new(move |request| {
+                    if request.path == TOKEN_PATH {
+                        return token_response("write-token", 7200);
+                    }
+                    match failure {
+                        0 => response(503, r#"{"code":1}"#),
+                        1 => Response::Disconnect,
+                        2 => response(201, "not-json"),
+                        _ => response(200, r#"{"data":{}}"#),
+                    }
+                });
+                let client = server.client();
+                assert!(
+                    client
+                        .request(
+                            method,
+                            CALENDAR_PATH,
+                            &Json::object(vec![("summary", Json::string("event"))])
+                        )
+                        .is_err()
+                );
+                assert_eq!(
+                    server.count(CALENDAR_PATH),
+                    1,
+                    "{method}, failure={failure}"
+                );
+                assert_eq!(server.count(TOKEN_PATH), 1);
+                let requests = server.requests.lock().unwrap();
+                let request = requests
+                    .iter()
+                    .find(|request| request.path == CALENDAR_PATH)
+                    .unwrap();
+                assert_eq!(request.method, method);
+                if method == "DELETE" {
+                    assert!(request.body.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn im_post_retains_transient_retry_behavior() {
+        let mut calls = 0;
+        let server = Server::new(move |request| {
+            if request.path == TOKEN_PATH {
+                return token_response("im-token", 7200);
+            }
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.body.as_slice(), b"{\"text\":\"hello\"}");
+            calls += 1;
+            if calls == 1 {
+                response(503, "")
+            } else {
+                response(200, r#"{"code":0}"#)
+            }
+        });
+        server
+            .client()
+            .api_call(
+                "POST",
+                "/open-apis/im/v1/messages",
+                &Json::object(vec![("text", Json::string("hello"))]),
+            )
+            .unwrap();
+        assert_eq!(server.count("/open-apis/im/v1/messages"), 2);
+        assert_eq!(server.count(TOKEN_PATH), 1);
+    }
+
+    #[test]
+    fn token_invalid_refreshes_once_and_uses_new_token() {
+        for http_401 in [false, true] {
+            let mut tokens = 0;
+            let mut calls = 0;
+            let server = Server::new(move |request| {
+                if request.path == TOKEN_PATH {
+                    tokens += 1;
+                    return token_response(&format!("token-{tokens}"), 7200);
+                }
+                calls += 1;
+                if calls == 1 {
+                    if http_401 {
+                        response(401, "")
+                    } else {
+                        response(200, r#"{"code":99991663,"msg":"expired"}"#)
+                    }
+                } else {
+                    assert!(request.headers.contains("Bearer token-2"));
+                    response(201, r#"{"code":0}"#)
+                }
+            });
+            server
+                .client()
+                .request("POST", CALENDAR_PATH, &Json::Null)
+                .unwrap();
+            assert_eq!(server.count(TOKEN_PATH), 2);
+            assert_eq!(server.count(CALENDAR_PATH), 2);
+        }
+    }
+
+    #[test]
+    fn repeated_token_invalid_does_not_refresh_again() {
+        let server = Server::new(|request| {
+            if request.path == TOKEN_PATH {
+                token_response("invalid-token", 7200)
+            } else {
+                response(200, r#"{"code":99991661,"msg":"expired"}"#)
+            }
+        });
+        let error = server
+            .client()
+            .request("POST", CALENDAR_PATH, &Json::Null)
+            .unwrap_err();
+        assert!(error.contains("99991661"));
+        assert_eq!(server.count(TOKEN_PATH), 2);
+        assert_eq!(server.count(CALENDAR_PATH), 2);
+    }
+
+    #[test]
+    fn refresh_failure_is_propagated_without_retry() {
+        for im in [false, true] {
+            let mut tokens = 0;
+            let server = Server::new(move |request| {
+                if request.path == TOKEN_PATH {
+                    tokens += 1;
+                    if tokens == 1 {
+                        token_response("old-token", 7200)
+                    } else {
+                        response(503, "")
+                    }
+                } else {
+                    response(200, r#"{"code":99991663}"#)
+                }
+            });
+            let client = server.client();
+            let error = if im {
+                client
+                    .api_call("POST", CALENDAR_PATH, &Json::Null)
+                    .unwrap_err()
+                    .to_string()
+            } else {
+                client
+                    .request("POST", CALENDAR_PATH, &Json::Null)
+                    .unwrap_err()
+            };
+            assert_eq!(error, "HTTP 503");
+            assert!(client.token.lock().unwrap().is_none());
+            assert_eq!(server.count(TOKEN_PATH), 2);
+            assert_eq!(server.count(CALENDAR_PATH), 1);
+        }
+    }
+
+    #[test]
+    fn get_has_empty_body_retries_transient_failures_and_accepts_201() {
+        let mut calls = 0;
+        let server = Server::new(move |request| {
+            if request.path == TOKEN_PATH {
+                return token_response("get-token", 7200);
+            }
+            assert_eq!(request.method, "GET");
+            assert!(request.body.is_empty());
+            calls += 1;
+            match calls {
+                1 => response(503, ""),
+                2 => Response::Disconnect,
+                _ => response(201, r#"{"code":0,"data":{"ok":true}}"#),
+            }
+        });
+        let json = server
+            .client()
+            .request(
+                "GET",
+                CALENDAR_PATH,
+                &Json::object(vec![("ignored", Json::Bool(true))]),
+            )
+            .unwrap();
+        assert_eq!(json.get_path(&["data", "ok"]), Some(&Json::Bool(true)));
+        assert_eq!(server.count(CALENDAR_PATH), 3);
+        assert_eq!(server.count(TOKEN_PATH), 1);
+    }
+
+    #[test]
+    fn api_and_refresh_errors_redact_credentials_before_truncation() {
+        let mut tokens = 0;
+        let server = Server::new(move |request| {
+            if request.path == TOKEN_PATH {
+                tokens += 1;
+                if tokens == 1 {
+                    token_response("current-token", 7200)
+                } else {
+                    response(
+                        200,
+                        &format!(r#"{{"code":42,"msg":"{SECRET} current-token"}}"#),
+                    )
+                }
+            } else {
+                response(
+                    200,
+                    &format!(r#"{{"code":42,"msg":"{SECRET} current-token"}}"#),
+                )
+            }
+        });
+        let client = server.client();
+        let api_error = client
+            .request("POST", CALENDAR_PATH, &Json::Null)
+            .unwrap_err();
+        let refresh_error = client.token(Some("current-token")).unwrap_err().to_string();
+        for error in [api_error, refresh_error] {
+            assert!(error.contains("42"));
+            assert!(!error.contains(SECRET));
+            assert!(!error.contains("current-token"));
+        }
+        let json = Json::object(vec![(
+            "msg",
+            Json::string(format!("{}{SECRET}", "x".repeat(195))),
+        )]);
+        assert!(!api_message_redacted(&json, &[SECRET]).contains("test-"));
+    }
+
+    #[test]
+    fn permission_denied_preserves_business_code_and_redacts_secret() {
+        let server = Server::new(|request| {
+            if request.path == TOKEN_PATH {
+                token_response("current-token", 7200)
+            } else {
+                response(
+                    403,
+                    &format!(r#"{{"code":193002,"msg":"no permission {SECRET} current-token"}}"#),
+                )
+            }
+        });
+        let client = server.client();
+        let error = client
+            .request("POST", CALENDAR_PATH, &Json::object(vec![]))
+            .unwrap_err();
+        assert!(error.contains("193002"));
+        assert!(error.contains("no permission"));
+        assert!(!error.contains(SECRET));
+        assert!(!error.contains("current-token"));
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn transport_errors_do_not_expose_urls_or_query_secrets() {
+        let server = Server::new(|_| Response::Disconnect);
+        let client = server.client();
+        let url = format!("{}/?secret={SECRET}", server.domain);
+        let error = client
+            .http_send("GET", &url, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(SECRET));
+        assert!(!error.contains(&server.domain));
+        assert!(error.contains("网络错误"));
     }
 }

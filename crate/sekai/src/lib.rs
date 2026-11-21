@@ -11,6 +11,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod direct;
 pub mod mqtt;
 pub mod sekai_clock;
 pub mod sekai_device_list;

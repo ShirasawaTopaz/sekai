@@ -968,11 +968,18 @@ fn allowed_task_and_ddl_override_are_forwarded() {
     let chat = ScriptedChat::new(
         vec![
             Ok(tool_response(
-                vec![tool_call(
-                    "call_t",
-                    "worker_task",
-                    r#"{"worker_id":"host-gpio","task":"echo","args":"hello","ddl_ms":5000}"#,
-                )],
+                vec![
+                    tool_call(
+                        "call_t",
+                        "worker_tool",
+                        r#"{"worker_id":"host-gpio","tool":"echo","args":"hello","ddl_ms":5000}"#,
+                    ),
+                    tool_call(
+                        "call_denied_job",
+                        "worker_task",
+                        r#"{"worker_id":"host-gpio","task":"pc.job","args":""}"#,
+                    ),
+                ],
                 usage(1, 1, 2),
             )),
             Ok(text_response("任务返回 hello。", usage(1, 1, 2))),
@@ -990,7 +997,7 @@ fn allowed_task_and_ddl_override_are_forwarded() {
         calls.clone(),
     );
     let policy = Policy {
-        allow_tasks: true,
+        tasks: sekai_router::tools::TaskAccess::from_names(["echo"]),
         ..Policy::default()
     };
     let mut agent = Agent::new(
@@ -1002,6 +1009,11 @@ fn allowed_task_and_ddl_override_are_forwarded() {
     );
     let outcome = agent.run("跑 echo hello").unwrap();
     assert_eq!(outcome.status, AgentStatus::Completed);
+    assert_eq!(outcome.tool_calls.len(), 2);
+    assert_eq!(
+        outcome.tool_calls[1].error_code.as_deref(),
+        Some("policy_denied")
+    );
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].kind, CommandKind::Task);

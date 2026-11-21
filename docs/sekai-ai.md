@@ -300,7 +300,7 @@ HTTPS helper 的行为：
 权限检查顺序（全部通过才会分配 `cmd_id` 并发布）：
 
 1. `--device` 过滤器：目标设备不在过滤器内 → `policy_denied`。
-2. 能力策略：`gpio.config`/`gpio.write` 需要 `--allow-write`；任意 Task 需要 `--allow-tasks`；
+2. 能力策略：`gpio.config`/`gpio.write` 需要 `--allow-write`。Task 可用 `--allow-task NAME` 按名授权，`--allow-tasks` 保留全开语义。
    `sekai.*` 管理工具与其他用户工具需要 `--allow-admin`；只读工具默认允许。
 3. 设备在线/能力/在途校验（§3.4 第 1 步）。
 
@@ -351,7 +351,7 @@ OpenAI 函数名必须匹配 `^[a-zA-Z0-9_-]+$`；设备工具名（`gpio.write`
 | --- | --- | --- |
 | `list_devices` | 无（对象，`additionalProperties=false`） | 返回设备 id、在线、`boot_id`、固件、tools/tasks/active_tasks。应先调用，设备/工具名必须来自结果。 |
 | `device_tool` | `device_id`、`tool`、`args`（必填）；`ddl_ms`（可选，1..=300000） | 在指定设备上调用一个 ToolCall；`args` 是原始 UTF-8 参数文本（`"gpio.info help"`）。 |
-| `device_task` | `device_id`、`task`、`args`（必填）；`ddl_ms`（可选，1..=300000） | 在指定设备上启动 Task；仅 `--allow-tasks` 时服务端放行。 |
+| `device_task` | `device_id`、`task`、`args`（必填）；`ddl_ms`（可选，1..=300000） | 在指定设备上启动 Task。Router 要求该名称已授权，或 Task 策略设为全开。 |
 
 约束：
 
@@ -492,7 +492,8 @@ sekai-agent --dry-run [选项]
 | `--timeout-ms <N>` | 控制端命令超时覆盖（>0）；缺省用 `DDL + 余量`。 |
 | `--wait-device-ms <N>` | 等待设备上线时间，默认 5000。 |
 | `--allow-write` | 允许 `gpio.config`/`gpio.write`。 |
-| `--allow-tasks` | 允许任意设备 Task。 |
+| `--allow-task NAME` | 按完整名称授权 Task，可重复。 |
+| `--allow-tasks` | 全开 Task，与 `--allow-task` 互斥。 |
 | `--allow-admin` | 允许 `sekai.*` 管理工具与其他用户工具。 |
 | `--json` | stdout 输出单个 JSON 结果对象；过程日志仍走 stderr。 |
 | `--dry-run` | 只连接 broker、等待并列出设备，不调用 LLM（不需要 API key）。 |
@@ -584,7 +585,7 @@ cargo run -p sekai-ai --bin sekai-agent -- \
 
 ## 6. 安全
 
-### 6.1 默认最小权限与三个开关
+### 6.1 默认最小权限与按名授权
 
 策略定义在 `tools.rs`，在**发布 Stdin 之前**检查（§3.6）；系统 prompt 只是告知模型，不承担权限控制。
 
@@ -592,12 +593,13 @@ cargo run -p sekai-ai --bin sekai-agent -- \
 | --- | --- | --- |
 | `gpio.info`、`gpio.read`、`sekai.info`、`sekai.time`、`sekai.devices` | 允许 | — |
 | `gpio.config`、`gpio.write` | 拒绝 | `--allow-write` |
-| 任意设备 Task | 拒绝 | `--allow-tasks` |
+| Task | 拒绝 | `--allow-task NAME` 逐个授权，`--allow-tasks` 全开 |
 | `sekai.set_time`、`sekai.devices.set`、`sekai.cancel` 与其他未列入只读/写的用户工具 | 拒绝 | `--allow-admin` |
 | `--device` 过滤范围外的设备 | 拒绝 | 去掉过滤器或换匹配设备 |
 
 - 拒绝时返回 `policy_denied`，**不产生 cmd_id、不发布任何报文**。
-- 三个开关是明确的人类授权：只应在知道自己要做什么时打开。
+- `--allow-task echo --allow-task pc.ask` 只授权这两个名称。REPL 可用 `/policy tasks only echo pc.ask` 替换名单，`/policy tasks off` 清空。serve 可用 `policy.set` 的 `allowed_tasks` 数组替换名单，空数组清空。旧字段 `allow_tasks: true` 仍表示全开。无效更新会保留原策略。
+- `pc.exec` 仍由写权限控制。Worker 通告、`--worker` 过滤和嵌套 `pc.ask` 的防递归规则也继续适用。飞书管理员可在同实例追加授权。见 [飞书权限管理](sekai-feishu.md#62-策略与防递归)。
 - 设备端仍会做硬校验（保留引脚、模式、能力等），服务端策略不是唯一防线。
 
 ### 6.2 `--device` 过滤
@@ -903,7 +905,7 @@ bash .build/check-lib.sh
 
 | tool 结果 `error.code` | 含义与处理 |
 | --- | --- |
-| `policy_denied` | 未开对应开关或设备被 `--device` 过滤；按需加 `--allow-write`/`--allow-tasks`/`--allow-admin`。 |
+| `policy_denied` | 未取得对应权限或目标被 Worker 过滤。按拒绝信息选择写权限、精确 Task 名单或管理权限。 |
 | `not_advertised` | 设备 Hello 未通告该工具/任务；先 `list_devices` 确认能力，勿臆造。 |
 | `device_offline`/`device_not_found` | 设备离线或 id 错误；等待 retained Hello 或核对 id。 |
 | `device_busy` | 该设备已有在途命令（默认 1 条）；稍后重试或等 Task 结束。 |

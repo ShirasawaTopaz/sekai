@@ -275,6 +275,20 @@ fn encode_named(name: &str, args: &[u8]) -> Result<Vec<u8>, ProtocolEncodeError>
 
 /// 解码「名称 + 参数」形式的载荷。
 fn decode_named(payload: &[u8]) -> Result<(String, Vec<u8>), ProtocolError> {
+    let (name, raw_args) = decode_named_ref(payload)?;
+    let mut args = Vec::new();
+    args.try_reserve_exact(raw_args.len())
+        .map_err(|_| ProtocolError::AllocationFailed)?;
+    args.extend_from_slice(raw_args);
+    let mut owned_name = String::new();
+    owned_name
+        .try_reserve_exact(name.len())
+        .map_err(|_| ProtocolError::AllocationFailed)?;
+    owned_name.push_str(name);
+    Ok((owned_name, args))
+}
+
+pub(crate) fn decode_named_ref(payload: &[u8]) -> Result<(&str, &[u8]), ProtocolError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(ProtocolError::PayloadTooLarge {
             len: payload.len(),
@@ -282,15 +296,9 @@ fn decode_named(payload: &[u8]) -> Result<(String, Vec<u8>), ProtocolError> {
         });
     }
     let mut reader = Reader::new(payload);
-    let name = reader.utf8()?;
-    validate_name(&name).map_err(ProtocolError::InvalidField)?;
-    let remaining = reader.remaining();
-    let raw_args = reader.take(remaining)?;
-    let mut args = Vec::new();
-    args.try_reserve_exact(raw_args.len())
-        .map_err(|_| ProtocolError::AllocationFailed)?;
-    args.extend_from_slice(raw_args);
-    Ok((name, args))
+    let name = crate::mqtt::codec::decode_utf8_ref(reader.string_bytes()?)?;
+    validate_name(name).map_err(ProtocolError::InvalidField)?;
+    Ok((name, reader.take(reader.remaining())?))
 }
 
 /// Task 命令载荷。
